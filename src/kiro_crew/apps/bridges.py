@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import sys
 import zipfile
 from contextlib import ExitStack, contextmanager
@@ -25,7 +26,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 from urllib.parse import urlparse, urlunparse
 
-from kiro_crew import platform_compat
+from kiro_crew import pinned_fs, platform_compat
 from kiro_crew.apps import deps_boot as _deps_boot_module
 from kiro_crew.apps.cron_sdk import CronSDK
 from kiro_crew.apps.execution import (
@@ -46,13 +47,13 @@ from kiro_crew.apps.manager import (
     list_apps,
 )
 from kiro_crew.apps.manifest import AppManifest
-from kiro_crew.atomic_write import atomic_write
+from kiro_crew.atomic_write import atomic_write, atomic_write_at
 from kiro_crew.config.loader import (
     config_dir,
     publish_materialized_agents,
     schedule_materialized_agents_refresh,
 )
-from kiro_crew.config.paths import kiro_agents_dir
+from kiro_crew.config.paths import isolated_agents_dir, kiro_agents_dir
 from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable, lookup_cron_folder_id
 from kiro_crew.cron_script import resolve_script_path
 from kiro_crew.env import emit_env
@@ -82,6 +83,97 @@ KIRO_AGENTS_DIR: Path | None = None
 def _kiro_agents_dir() -> Path:
     """The kiro-cli agents directory, resolved against the live data home."""
     return KIRO_AGENTS_DIR if KIRO_AGENTS_DIR is not None else kiro_agents_dir()
+
+
+@contextmanager
+def _held_agent_specs_target() -> Iterator[tuple[Path, int | None] | None]:
+    """Hold the supported private agents directory across one bridge operation.
+
+    The host agent writer owns the authorization primitive and its thread-local
+    descriptor contract. Reuse both here so app-agent reads, locks, writes, and
+    removals are decided from and performed through the same directory inode.
+    Platforms without descriptor-relative walks retain the existing by-name arm.
+    ``None`` means a supported private target could not be pinned and the caller
+    must decline rather than silently fall back to a path walk.
+    """
+    from kiro_crew import agent  # noqa: PLC0415 -- agent imports app siblings lazily too
+
+    agents_dir = _kiro_agents_dir()
+    already_held = agent._held_private_agent_spec_target(agents_dir)
+    if already_held is not None:
+        yield agents_dir, already_held.dir_fd
+        return
+
+    try:
+        dir_fd = agent._open_private_agent_spec_target(agents_dir)
+    except (OSError, RuntimeError, pinned_fs.PinnedPathRefusal) as exc:
+        logger.warning(
+            "Refusing app-agent spec changes in %s because the isolated agents "
+            "directory could not be pinned: %s",
+            agents_dir,
+            exc,
+        )
+        yield None
+        return
+
+    if dir_fd is None:
+        yield agents_dir, None
+        return
+
+    previous = getattr(agent._private_agent_spec_target, "value", None)
+    agent._private_agent_spec_target.value = agent._PinnedPrivateAgentSpecTarget(agents_dir, dir_fd)
+    try:
+        yield agents_dir, dir_fd
+    finally:
+        if previous is None:
+            try:
+                del agent._private_agent_spec_target.value
+            except AttributeError:
+                pass
+        else:
+            agent._private_agent_spec_target.value = previous
+        os.close(dir_fd)
+
+
+def _shared_dir_owned_elsewhere(agents_dir: Path, *, source: str) -> Path | None:
+    """The foreign data home when *agents_dir* is the shared machine-wide directory
+    this instance does not own; ``None`` when app specs may be written there.
+
+    App agents are materialised, pruned and removed under ``kiro_agents_dir()``,
+    the same directory ``agent.rebuild_agent_config`` owns or declines. Under the
+    CLI prologue's ``KIRO_HOME`` export a non-default data home resolves that to
+    its own ``isolated_agents_dir`` and this is ``None``. It answers only when a
+    foreign instance is pointed at the shared directory anyway (the documented
+    ``KIRO_HOME=~/.kiro`` read-only opt-out, or a caller that bypassed the
+    prologue): two instances with different app sets would otherwise prune and
+    re-register each other's specs, and removing an app here would delete the
+    default instance's copies. Ownership is decided in ``kiro_crew.agent``, in
+    one place, for both writers; imported lazily like the module's other reach
+    into ``agent``, which imports this package's siblings at call time as well.
+    """
+    from kiro_crew.agent import foreign_home_targets_shared_agents_dir  # noqa: PLC0415
+
+    foreign = foreign_home_targets_shared_agents_dir(agents_dir)
+    if foreign is not None:
+        # A permission decision on the same shared, security-relevant resource that
+        # ``agent._decline_shared_agent_home`` audits, recorded the same way so every
+        # refusal to touch the machine-wide agent home -- the core spec there or an
+        # app's -- is reconstructible from the audit log alone rather than only from
+        # the process log. ``source`` names the writer that stood down (register,
+        # deregister, prune); whether a warning is worth logging as well is the
+        # caller's call, the audit row is not optional.
+        sel().log_api_access(
+            caller="system",
+            operation="agent_home_write",
+            outcome="denied",
+            source=source,
+            resources=str(agents_dir),
+            error=(
+                f"non-default data home {foreign} refused app-agent write to shared "
+                f"agent home (own specs belong in {isolated_agents_dir(foreign)})"
+            ),
+        )
+    return foreign
 
 
 # Where KiroCrew loads skills from
@@ -725,6 +817,30 @@ def _read_agent_config(path: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def _read_agent_config_at(dir_fd: int, name: str) -> dict[str, Any] | None:
+    """Read one regular agent spec relative to the held agents directory."""
+    existing = pinned_fs.stat_at(dir_fd, name)
+    if existing is None or not stat.S_ISREG(existing.st_mode):
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(name, flags, dir_fd=dir_fd)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    return data if isinstance(data, dict) else None
+
+
 def _preserve_user_agent_edits(
     name: str, prior: dict[str, Any] | None, fresh: dict[str, Any]
 ) -> dict[str, Any]:
@@ -919,6 +1035,7 @@ def _register_agents(
     manifest: AppManifest,
     app_root: Path,
     io_failures: list[str] | None = None,
+    refusals: list[str] | None = None,
 ) -> list[str]:
     """Materialize app agent JSONs into ~/.kiro/agents/ with namespaced names.
 
@@ -928,6 +1045,13 @@ def _register_agents(
     agent name, malformed JSON, an unresolved template placeholder — and retrying those
     never converges. Only the I/O class can succeed on a later attempt, so only it is
     worth reporting to a caller that retries.
+
+    ``refusals``, when supplied, collects the reason when THIS INSTANCE declines to
+    write the agents directory at all -- the pin refusal and the ownership refusal
+    below. Either outcome also registers nothing, but the agent source is healthy
+    and no agent was even looked at, so a caller that reports "declared but zero
+    registered" must not describe it as a source problem. A per-agent skip never
+    lands here.
 
     Written as a COPY, not a symlink, for two reasons:
 
@@ -951,9 +1075,40 @@ def _register_agents(
     # below is a write chokepoint that `test_both_config_writers_run_the_pass` asserts by
     # inspecting THIS function's source. Moving the body elsewhere would keep the
     # behaviour and silently retire the guarantee.
-    with _health_reconcile_guard():
-        agents_dir = _kiro_agents_dir()
-        agents_dir.mkdir(parents=True, exist_ok=True)
+    with _health_reconcile_guard(), _held_agent_specs_target() as target, ExitStack() as stack:
+        if target is None:
+            # The pin refusal is the second outcome that registers nothing while the
+            # source stays healthy (the preceding warning names the cause), so it
+            # lands in the same sink as the ownership refusal below: the caller
+            # must not describe it as a source problem either.
+            if refusals is not None:
+                refusals.append(
+                    f"could not pin the isolated agents directory {_kiro_agents_dir()}; "
+                    "see the preceding warning"
+                )
+            return []
+        agents_dir, dir_fd = target
+        foreign = _shared_dir_owned_elsewhere(agents_dir, source="register_agents")
+        if foreign is not None:
+            logger.warning(
+                "App %s: not writing agent specs into the shared %s from non-default data "
+                "home %s; kiro-cli reads the default instance's specs there and only that "
+                "instance writes them.",
+                app_name,
+                agents_dir,
+                foreign,
+            )
+            if refusals is not None:
+                refusals.append(
+                    f"not writing agent specs into the shared {agents_dir} from non-default "
+                    f"data home {foreign}; only the default instance writes there"
+                )
+            return []
+        if dir_fd is None:
+            agents_dir.mkdir(parents=True, exist_ok=True)
+        from kiro_crew.agent import agents_spec_lock  # noqa: PLC0415
+
+        lock_held = False
         policy = _agent_mcp_policy(app_name)
         own_servers = _own_mcp_servers(app_name)
 
@@ -1014,9 +1169,17 @@ def _register_agents(
             link_name = _safe_link_name(_namespace(app_name, agent_name)) + ".json"
             link_path = agents_dir / link_name
 
-            # Snapshot the user's own edits BEFORE the unlink below — after it there
-            # is nothing left to read (see _preserve_user_agent_edits).
-            prior_on_disk = _read_agent_config(link_path)
+            # Snapshot the user's own edits under the same lock and directory
+            # descriptor used for publication. Acquire lazily so a manifest whose
+            # every agent is rejected creates no inert lock sidecar.
+            if not lock_held:
+                stack.enter_context(agents_spec_lock(agents_dir))
+                lock_held = True
+            prior_on_disk = (
+                _read_agent_config(link_path)
+                if dir_fd is None
+                else _read_agent_config_at(dir_fd, link_name)
+            )
 
             # Drop a legacy SYMLINK from an older Kiro Crew (which pointed at a file
             # inside the app) so the write below lands a real file at this path.
@@ -1070,7 +1233,17 @@ def _register_agents(
                         agent_name,
                         ", ".join(dangling),
                     )
-                atomic_write(link_path, json.dumps(merged, indent=2) + "\n")
+                payload = json.dumps(merged, indent=2) + "\n"
+                if dir_fd is None:
+                    atomic_write(link_path, payload)
+                else:
+                    existing = pinned_fs.stat_at(dir_fd, link_name)
+                    mode = (
+                        stat.S_IMODE(existing.st_mode)
+                        if existing is not None and stat.S_ISREG(existing.st_mode)
+                        else None
+                    )
+                    atomic_write_at(dir_fd, link_name, payload, mode=mode)
                 registered.append(_namespace(app_name, agent_name))
                 # The DECLARED name only — kiro-cli enumerates agents by their
                 # `name` field, so the namespaced filename stem is not a name it
@@ -1104,19 +1277,35 @@ def _register_agents(
 
 
 def _deregister_agents(app_name: str) -> int:
-    """Remove all agent symlinks for an app from ~/.kiro/agents/."""
+    """Remove all materialized agents for an app from the held agents directory."""
     prefix = _safe_link_name(app_name + "/")
     removed = 0
-    agents_dir = _kiro_agents_dir()
-    if not agents_dir.is_dir():
-        return 0
-    for entry in agents_dir.iterdir():
-        if entry.name.startswith(prefix) and entry.name.endswith(".json"):
-            try:
-                entry.unlink()
-                removed += 1
-            except OSError:
-                pass
+    with _held_agent_specs_target() as target:
+        if target is None:
+            return 0
+        agents_dir, dir_fd = target
+        if dir_fd is None and not agents_dir.is_dir():
+            return 0
+        if _shared_dir_owned_elsewhere(agents_dir, source="deregister_agents") is not None:
+            return 0
+        from kiro_crew.agent import agents_spec_lock  # noqa: PLC0415
+
+        with agents_spec_lock(agents_dir):
+            if dir_fd is None:
+                names = [entry.name for entry in agents_dir.iterdir()]
+            else:
+                with os.scandir(dir_fd) as entries:
+                    names = [entry.name for entry in entries]
+            for name in names:
+                if name.startswith(prefix) and name.endswith(".json"):
+                    try:
+                        if dir_fd is None:
+                            (agents_dir / name).unlink()
+                        else:
+                            os.unlink(name, dir_fd=dir_fd)
+                        removed += 1
+                    except OSError:
+                        pass
     if removed:
         logger.info("Deregistered %d agent(s) for app %s", removed, app_name)
         # Drop the removed names from the resolver's snapshot. Without this a
@@ -1870,6 +2059,22 @@ def _mcp_json_path() -> Path:
 _LEGACY_SHARED_MCP_PATH = Path.home() / ".kiro" / "settings" / "mcp.json"
 
 
+def _held_mcp_target() -> tuple[Path, int] | None:
+    """The default MCP config under this thread's held agents directory.
+
+    App-agent and host-agent writers share the target through ``agent``'s
+    thread-local descriptor contract. A helper reached inside that contract
+    must use the held descriptor rather than resolve the agents path again.
+    """
+    from kiro_crew import agent  # noqa: PLC0415 -- agent imports app siblings lazily too
+
+    agents_dir = _kiro_agents_dir()
+    held = agent._held_private_agent_spec_target(agents_dir)
+    if held is None:
+        return None
+    return held.directory / "kirocrew.json", held.dir_fd
+
+
 @contextmanager
 def _mcp_lock(*, exclusive: bool = True, target: Optional[Path] = None) -> Iterator[None]:
     """Acquire a lock on an mcp/config file for the duration of the block.
@@ -1894,19 +2099,33 @@ def _mcp_lock(*, exclusive: bool = True, target: Optional[Path] = None) -> Itera
     BEFORE any lock is attempted; ``platform_compat.file_lock`` bounds the
     acquire itself, so neither failure mode can present as a hang.
     """
-    base = target if target is not None else _mcp_json_path()
+    held_target = _held_mcp_target() if target is None else None
+    base = target if target is not None else (held_target[0] if held_target else _mcp_json_path())
+    dir_fd = held_target[1] if held_target else None
     lock_path = base.with_suffix(".lock")
     with ExitStack() as stack:
         try:
-            base.parent.mkdir(parents=True, exist_ok=True)
-            # ONE create-or-open syscall instead of touch() + open("r+"): it
-            # never truncates, it keeps the fd WRITABLE — Windows
-            # msvcrt.locking fails EACCES on a read-only handle, which
-            # file_lock would swallow, silently degrading this to a no-op and
-            # letting concurrent writers race the atomic mcp.json rename — and
-            # it leaves the unwritable-path refusal ONE place to be reported
-            # from rather than two. See platform_compat.open_lock_file.
-            fd = stack.enter_context(platform_compat.open_lock_file(lock_path))
+            if dir_fd is None:
+                base.parent.mkdir(parents=True, exist_ok=True)
+                # ONE create-or-open syscall instead of touch() + open("r+"): it
+                # never truncates, it keeps the fd WRITABLE — Windows
+                # msvcrt.locking fails EACCES on a read-only handle, which
+                # file_lock would swallow, silently degrading this to a no-op and
+                # letting concurrent writers race the atomic mcp.json rename — and
+                # it leaves the unwritable-path refusal ONE place to be reported
+                # from rather than two. See platform_compat.open_lock_file.
+                fd = stack.enter_context(platform_compat.open_lock_file(lock_path))
+            else:
+                # The sidecar belongs to the same agents directory as kirocrew.json.
+                # Opening it through the held descriptor keeps authorization, lock,
+                # read, and publication on one directory inode across path swaps.
+                fd = os.open(
+                    lock_path.name,
+                    os.O_CREAT | os.O_RDWR,
+                    0o600,
+                    dir_fd=dir_fd,
+                )
+                stack.callback(os.close, fd)
         except OSError as exc:
             # Naming the path AND the errno is the point: "Read-only file
             # system" on this specific path is what tells the operator what to
@@ -1962,11 +2181,28 @@ def _read_mcp_json_unlocked(*, strict: bool = False) -> dict[str, Any]:
     ``strict=True`` a parse/OS error on a PRESENT file propagates so the writer
     aborts without persisting; a genuinely MISSING file is still an empty map.
     Read-only callers keep the lenient default (degrade to ``{}``).
+
+    A held private agents target is read with ``openat(O_NOFOLLOW)``. Platforms
+    without descriptor-relative walks keep the path-based arm.
     """
-    if not _mcp_json_path().is_file():
-        return {}
+    held_target = _held_mcp_target()
     try:
-        return json.loads(_mcp_json_path().read_text(encoding="utf-8"))
+        if held_target is None:
+            path = _mcp_json_path()
+            if not path.is_file():
+                return {}
+            return json.loads(path.read_text(encoding="utf-8"))
+
+        path, dir_fd = held_target
+        existing = pinned_fs.stat_at(dir_fd, path.name)
+        if existing is None:
+            return {}
+        if not stat.S_ISREG(existing.st_mode):
+            raise OSError(f"refusing non-regular MCP config {path}")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(path.name, flags, dir_fd=dir_fd)
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            return json.load(handle)
     except (json.JSONDecodeError, OSError) as exc:
         if strict:
             raise
@@ -1976,8 +2212,22 @@ def _read_mcp_json_unlocked(*, strict: bool = False) -> dict[str, Any]:
 
 def _write_mcp_json_unlocked(data: dict[str, Any]) -> None:
     """Write mcp.json without acquiring a lock (caller must hold lock)."""
-    _mcp_json_path().parent.mkdir(parents=True, exist_ok=True)
-    atomic_write(_mcp_json_path(), json.dumps(data, indent=2) + "\n")
+    payload = json.dumps(data, indent=2) + "\n"
+    held_target = _held_mcp_target()
+    if held_target is None:
+        path = _mcp_json_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(path, payload)
+        return
+
+    path, dir_fd = held_target
+    existing = pinned_fs.stat_at(dir_fd, path.name)
+    mode = (
+        stat.S_IMODE(existing.st_mode)
+        if existing is not None and stat.S_ISREG(existing.st_mode)
+        else None
+    )
+    atomic_write_at(dir_fd, path.name, payload, mode=mode)
 
 
 def _read_mcp_json() -> dict[str, Any]:
@@ -2805,69 +3055,77 @@ def _register_mcp_servers(
     which writes the entry with the correct, reachable port. stdio/command servers (no
     ``url``) are always registered — they have no port to be dead.
     """
-    if not manifest.mcpServers:
-        return []
-    resolved_port = _live_port_for(app_name, live_port)
-    _maybe_provision_backendless_deps(app_name, manifest)
-    registered: list[str] = []
-    skipped: list[str] = []
-    # Reconcile guard OUTSIDE _mcp_lock: that order is fixed everywhere, so a health
-    # transition and a lifecycle registration can never deadlock against each other.
-    with _health_reconcile_guard(), _mcp_lock():
-        mcp_data = _read_mcp_json_unlocked(strict=True)
-        servers = mcp_data.setdefault("mcpServers", {})
-        for server_name, server_config in manifest.mcpServers.items():
-            namespaced = f"{app_name}:{server_name}"
-            cfg = dict(server_config) if isinstance(server_config, dict) else server_config
-            if isinstance(cfg, dict):
-                cfg = _pin_host_cli_command(app_name, cfg)
-            is_http = isinstance(cfg, dict) and bool(cfg.get("url"))
-            if is_http and not resolved_port:
-                # No live backend → registering the manifest's dead default-port URL would
-                # break every kiro session. Skip it AND scrub any stale entry so a prior
-                # (now-dead) registration can't keep poisoning the provider path.
-                servers.pop(namespaced, None)
-                skipped.append(namespaced)
-                continue
-            if is_http:
-                cfg["url"] = _resolve_live_mcp_url(app_name, cfg["url"], live_port=resolved_port)
-                cfg.pop("disabled", None)  # backend is live — ensure enabled
-            else:
-                # A stdio entry: resolve a bare interpreter to an absolute one — the
-                # app's venv python when present, else the running interpreter (see
-                # `resolve_stdio_command`) — and surface an unresolvable command
-                # instead of letting the tools go silently missing.
+    with _held_agent_specs_target() as target:
+        if target is None:
+            return []
+        agents_dir, _ = target
+        if not manifest.mcpServers:
+            return []
+        if _shared_dir_owned_elsewhere(agents_dir, source="register_mcp_servers") is not None:
+            return []
+        resolved_port = _live_port_for(app_name, live_port)
+        _maybe_provision_backendless_deps(app_name, manifest)
+        registered: list[str] = []
+        skipped: list[str] = []
+        # Reconcile guard OUTSIDE _mcp_lock: that order is fixed everywhere, so a health
+        # transition and a lifecycle registration can never deadlock against each other.
+        with _health_reconcile_guard(), _mcp_lock():
+            mcp_data = _read_mcp_json_unlocked(strict=True)
+            servers = mcp_data.setdefault("mcpServers", {})
+            for server_name, server_config in manifest.mcpServers.items():
+                namespaced = f"{app_name}:{server_name}"
+                cfg = dict(server_config) if isinstance(server_config, dict) else server_config
                 if isinstance(cfg, dict):
-                    cfg = resolve_stdio_command(cfg, app_root=app_dir(app_name))
-                    _schedule_unresolvable_warning(app_name, server_name, cfg)
-                    # This file is consumed by kiro-cli, which applies a declared
-                    # env per key — an app manifest naming a PATH fragment would
-                    # hand its server that fragment as the WHOLE PATH. Emit
-                    # through the shared normalization point (env.emit_env).
-                    env = cfg.get("env")
-                    if isinstance(env, dict):
-                        cfg = {**cfg, "env": emit_env(env)}
-            servers[namespaced] = cfg
-            registered.append(namespaced)
-        # LAST governance pass before this map hits disk. This file IS read by
-        # kiro-cli, and an `autoApprove` on an entry here auto-approves that
-        # server locally with NO permission request — so a manifest that ships
-        # `autoApprove` on a governed server would bypass the PreToolUse gate and
-        # the ceiling's denial, the same second route the agent-config writers
-        # already close. Strip a governed grant here too; the tools stay, they
-        # just go through the gate. Idempotent and a no-op on an ungoverned host.
-        mcp_data["mcpServers"] = dict(strip_ungoverned_auto_approve(servers))
-        _write_mcp_json_unlocked(mcp_data)
-    logger.info(
-        "Registered %d MCP server(s) for app %s (live_port=%s); skipped %d HTTP server(s) "
-        "with no live backend: %s",
-        len(registered),
-        app_name,
-        resolved_port,
-        len(skipped),
-        skipped or "none",
-    )
-    return registered
+                    cfg = _pin_host_cli_command(app_name, cfg)
+                is_http = isinstance(cfg, dict) and bool(cfg.get("url"))
+                if is_http and not resolved_port:
+                    # No live backend → registering the manifest's dead default-port URL would
+                    # break every kiro session. Skip it AND scrub any stale entry so a prior
+                    # (now-dead) registration can't keep poisoning the provider path.
+                    servers.pop(namespaced, None)
+                    skipped.append(namespaced)
+                    continue
+                if is_http:
+                    cfg["url"] = _resolve_live_mcp_url(
+                        app_name, cfg["url"], live_port=resolved_port
+                    )
+                    cfg.pop("disabled", None)  # backend is live — ensure enabled
+                else:
+                    # A stdio entry: resolve a bare interpreter to an absolute one — the
+                    # app's venv python when present, else the running interpreter (see
+                    # `resolve_stdio_command`) — and surface an unresolvable command
+                    # instead of letting the tools go silently missing.
+                    if isinstance(cfg, dict):
+                        cfg = resolve_stdio_command(cfg, app_root=app_dir(app_name))
+                        _schedule_unresolvable_warning(app_name, server_name, cfg)
+                        # This file is consumed by kiro-cli, which applies a declared
+                        # env per key — an app manifest naming a PATH fragment would
+                        # hand its server that fragment as the WHOLE PATH. Emit
+                        # through the shared normalization point (env.emit_env).
+                        env = cfg.get("env")
+                        if isinstance(env, dict):
+                            cfg = {**cfg, "env": emit_env(env)}
+                servers[namespaced] = cfg
+                registered.append(namespaced)
+            # LAST governance pass before this map hits disk. This file IS read by
+            # kiro-cli, and an `autoApprove` on an entry here auto-approves that
+            # server locally with NO permission request — so a manifest that ships
+            # `autoApprove` on a governed server would bypass the PreToolUse gate and
+            # the ceiling's denial, the same second route the agent-config writers
+            # already close. Strip a governed grant here too; the tools stay, they
+            # just go through the gate. Idempotent and a no-op on an ungoverned host.
+            mcp_data["mcpServers"] = dict(strip_ungoverned_auto_approve(servers))
+            _write_mcp_json_unlocked(mcp_data)
+        logger.info(
+            "Registered %d MCP server(s) for app %s (live_port=%s); skipped %d HTTP server(s) "
+            "with no live backend: %s",
+            len(registered),
+            app_name,
+            resolved_port,
+            len(skipped),
+            skipped or "none",
+        )
+        return registered
 
 
 def registered_app_mcp_servers() -> dict[str, Any]:
@@ -3037,26 +3295,32 @@ def _scrub_legacy_shared_mcp(app_name: str) -> int:
 
 def _deregister_mcp_servers(app_name: str) -> int:
     """Remove an app's MCP servers from the agent config (and the legacy shared file)."""
-    prefix = f"{app_name}:"
-    with _health_reconcile_guard(), _mcp_lock():
-        mcp_data = _read_mcp_json_unlocked(strict=True)
-        servers = mcp_data.get("mcpServers", {})
-        to_remove = [k for k in servers if k.startswith(prefix)]
-        for k in to_remove:
-            del servers[k]
+    with _held_agent_specs_target() as target:
+        if target is None:
+            return 0
+        agents_dir, _ = target
+        if _shared_dir_owned_elsewhere(agents_dir, source="deregister_mcp_servers") is not None:
+            return 0
+        prefix = f"{app_name}:"
+        with _health_reconcile_guard(), _mcp_lock():
+            mcp_data = _read_mcp_json_unlocked(strict=True)
+            servers = mcp_data.get("mcpServers", {})
+            to_remove = [k for k in servers if k.startswith(prefix)]
+            for k in to_remove:
+                del servers[k]
+            if to_remove:
+                _write_mcp_json_unlocked(mcp_data)
+        # NOT scrubbed here: the legacy shared ~/.kiro/settings/mcp.json is held by
+        # OTHER processes (Kiro IDE, other kiro-cli agents), so its cross-process
+        # flock can block indefinitely. deregister_app() runs synchronously on the
+        # gateway event loop (dashboard disable/update/uninstall), and a stall here
+        # would freeze all chat and heartbeat tasks. The scrub is idempotent and is
+        # performed at boot by reconcile_enabled_app_resources(), which the gateway
+        # already runs off-loop via run_in_executor — so the migration still lands,
+        # just not on this hot path.
         if to_remove:
-            _write_mcp_json_unlocked(mcp_data)
-    # NOT scrubbed here: the legacy shared ~/.kiro/settings/mcp.json is held by
-    # OTHER processes (Kiro IDE, other kiro-cli agents), so its cross-process
-    # flock can block indefinitely. deregister_app() runs synchronously on the
-    # gateway event loop (dashboard disable/update/uninstall), and a stall here
-    # would freeze all chat and heartbeat tasks. The scrub is idempotent and is
-    # performed at boot by reconcile_enabled_app_resources(), which the gateway
-    # already runs off-loop via run_in_executor — so the migration still lands,
-    # just not on this hot path.
-    if to_remove:
-        logger.info("Deregistered %d MCP server(s) for app %s", len(to_remove), app_name)
-    return len(to_remove)
+            logger.info("Deregistered %d MCP server(s) for app %s", len(to_remove), app_name)
+        return len(to_remove)
 
 
 # ---------------------------------------------------------------------------
@@ -3134,35 +3398,64 @@ def _prune_stale_app_resources(app_name: str, manifest: AppManifest, app_root: P
             break
         agent_name = data.get("name", agent_path.stem)
         current_links.add(_safe_link_name(_namespace(app_name, agent_name)) + ".json")
-    agents_dir = _kiro_agents_dir()
-    if current_links is not None and agents_dir.is_dir():
-        prefix = _safe_link_name(app_name + "/")
-        for entry in agents_dir.iterdir():
-            if (
-                entry.name.startswith(prefix)
-                and entry.name.endswith(".json")
-                and entry.name not in current_links
-            ):
-                try:
-                    entry.unlink()
-                    logger.info("Pruned stale app agent %s (absent from manifest)", entry.name)
-                except OSError:
-                    pass
+    with _held_agent_specs_target() as target:
+        # A pinned target governs both resource families. A pin refusal forbids
+        # by-name agent-spec changes, while the MCP prune keeps the path-based
+        # ownership arm as its documented residual. Platforms without dir_fd
+        # also keep that path-based arm. When a descriptor is available, the
+        # MCP lock, read, and write helpers consume it through the shared held
+        # target contract.
+        agents_dir, dir_fd = target if target is not None else (_kiro_agents_dir(), None)
+        shared_dir_owned_elsewhere = _shared_dir_owned_elsewhere(
+            agents_dir, source="prune_stale_app_resources"
+        )
+        if (
+            target is not None
+            and current_links is not None
+            and (dir_fd is not None or agents_dir.is_dir())
+            and shared_dir_owned_elsewhere is None
+        ):
+            prefix = _safe_link_name(app_name + "/")
+            from kiro_crew.agent import agents_spec_lock  # noqa: PLC0415
 
-    # MCP servers: keep only servers the current manifest still declares.
-    current_servers = {f"{app_name}:{srv}" for srv in (manifest.mcpServers or {})}
-    with _mcp_lock():
-        data = _read_mcp_json_unlocked(strict=True)
-        servers = data.get("mcpServers", {})
-        if isinstance(servers, dict):
-            stale = [
-                k for k in servers if k.startswith(f"{app_name}:") and k not in current_servers
-            ]
-            for k in stale:
-                del servers[k]
-            if stale:
-                _write_mcp_json_unlocked(data)
-                logger.info("Pruned %d stale app MCP server(s) for %s", len(stale), app_name)
+            with agents_spec_lock(agents_dir):
+                if dir_fd is None:
+                    names = [entry.name for entry in agents_dir.iterdir()]
+                else:
+                    with os.scandir(dir_fd) as entries:
+                        names = [entry.name for entry in entries]
+                for name in names:
+                    if (
+                        name.startswith(prefix)
+                        and name.endswith(".json")
+                        and name not in current_links
+                    ):
+                        try:
+                            if dir_fd is None:
+                                (agents_dir / name).unlink()
+                            else:
+                                os.unlink(name, dir_fd=dir_fd)
+                            logger.info("Pruned stale app agent %s (absent from manifest)", name)
+                        except OSError:
+                            pass
+
+        # MCP servers: keep only servers the current manifest still declares. The
+        # lock itself creates a sidecar, so the ownership decision must precede it.
+        if shared_dir_owned_elsewhere is not None:
+            return
+        current_servers = {f"{app_name}:{srv}" for srv in (manifest.mcpServers or {})}
+        with _mcp_lock():
+            data = _read_mcp_json_unlocked(strict=True)
+            servers = data.get("mcpServers", {})
+            if isinstance(servers, dict):
+                stale = [
+                    k for k in servers if k.startswith(f"{app_name}:") and k not in current_servers
+                ]
+                for k in stale:
+                    del servers[k]
+                if stale:
+                    _write_mcp_json_unlocked(data)
+                    logger.info("Pruned %d stale app MCP server(s) for %s", len(stale), app_name)
 
 
 def register_app(app_name: str) -> RegistrationResult:
@@ -3228,16 +3521,21 @@ def register_app(app_name: str) -> RegistrationResult:
     except Exception as exc:
         result.errors.append(f"MCP server registration failed: {exc}")
 
+    refusals: list[str] = []
     try:
-        result.agents = _register_agents(app_name, manifest, app_root)
+        result.agents = _register_agents(app_name, manifest, app_root, refusals=refusals)
     except Exception as exc:
         result.errors.append(f"agent registration failed: {exc}")
 
     declared = len(manifest.agents or [])
     if declared and not result.agents:
+        # Zero agents from a manifest that declares some is either a source problem or
+        # this instance standing down from the shared agent home. The second leaves the
+        # source healthy, so the error names the refusal the writer recorded rather than
+        # sending the operator to inspect files that are fine.
+        cause = "; ".join(refusals) or "agent source missing or unreadable"
         result.errors.append(
-            f"registered 0 of {declared} declared agent(s) for {app_name!r} "
-            "-- agent source missing or unreadable"
+            f"registered 0 of {declared} declared agent(s) for {app_name!r} -- {cause}"
         )
 
     try:

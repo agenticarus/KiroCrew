@@ -67,6 +67,7 @@ __all__ = [
     "close_all",
     "copy_file_pinned",
     "create_and_open_dir_pinned",
+    "create_and_open_dir_pinned_deep",
     "dir_flags",
     "drain_verified_chain",
     "fatal_skip_reporter",
@@ -573,12 +574,22 @@ def copy_file_pinned(
     force_mode: int | None = None,
     max_bytes: int | None = None,
     expected_src_ident: "tuple[int, int] | None" = None,
+    allow_multilink_source: bool = False,
     on_skip: SkipReporter = _noop_skip,
+    on_opened: "Callable[[os.stat_result], None] | None" = None,
     on_created: "Callable[[os.stat_result], None] | None" = None,
+    fsync: bool = False,
 ) -> bool:
     """Copy one file's bytes from a descriptor pinned to a validated inode.
 
     Returns True when bytes were copied, False when the source was skipped.
+
+    ``on_opened`` (when given) receives the destination descriptor's ``fstat``
+    immediately after the exclusive create. It is the identity witness a caller
+    needs to clean up only the name this attempt created when a later copy or
+    durability step fails. ``on_created`` remains the success-only witness,
+    called after bytes and metadata are complete. With ``fsync=True`` the
+    destination descriptor is synced before that success callback.
 
     ``skip_unreadable`` tolerates ONE failure: the SOURCE open being refused for
     permission, which is reported as ``SKIP_UNREADABLE_ENTRY`` and returns False.
@@ -597,6 +608,20 @@ def copy_file_pinned(
     OPENED inode, not that it is the inode the caller judged — a hardlink
     swapped in at the name between validation and this open would be a regular
     single-link file the other gates accept.
+
+    ``allow_multilink_source`` relaxes ONE screen, on the SOURCE only: a regular
+    file with more than one hard link is copied instead of reported as
+    ``SKIP_NOT_REGULAR``. The default screen refuses the alias because it is
+    a READ of bytes this call was not pointed at, judged on this function's own
+    first look at the inode. A caller that hands over its own validated
+    descriptor (*src_fd*) has already looked, and when that caller reads the
+    user's own home -- where ``rsnapshot``, ``rsync --link-dest`` and ``cp -al``
+    leave every file with a second name in the snapshot tree -- an alias names
+    bytes that same user can read by either name, so refusing it strands the
+    copy for nothing. The flag therefore requires *src_fd*; the by-name and
+    *dir_fd* forms keep the screen unconditionally. Nothing on the destination
+    side changes: exclusive create, ``O_NOFOLLOW``, ``fsync`` and the identity
+    witnesses are the same with or without it.
 
     ``on_created`` (when given) receives the DESTINATION descriptor's ``fstat``
     at publish time — the identity witness for a caller that must re-open the
@@ -650,6 +675,11 @@ def copy_file_pinned(
     """
     if dst is None and dst_name is None:  # pragma: no cover - caller bug
         raise ValueError("copy_file_pinned needs either dst or dst_name")
+    if allow_multilink_source and src_fd is None:
+        # The relaxed screen is for a caller that has already judged its own
+        # descriptor; on a by-name open THIS call is the first look, so it keeps
+        # the full screen.
+        raise ValueError("allow_multilink_source requires a caller-validated src_fd")
     # O_NONBLOCK is not about performance. Opening a FIFO for reading BLOCKS until a
     # writer appears, so without it a single named pipe -- in an extracted archive, or
     # planted in a staged tree -- hangs the whole snapshot or restore forever with no
@@ -707,10 +737,13 @@ def copy_file_pinned(
             # that omitted a wanted file read as complete and retention pruned on it.
             on_skip(SKIP_IDENTITY_CHANGED, by_name)
             return False
-        if not _stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        if not _stat.S_ISREG(st.st_mode) or (st.st_nlink != 1 and not allow_multilink_source):
             # Reached with a matching identity, or with none supplied: this is the same
             # inode the caller saw, or the first look at it, so a non-regular type or a
-            # hardlink alias here is the design screen and not a swap.
+            # hardlink alias here is the design screen and not a swap. The alias half
+            # is the one screen ``allow_multilink_source`` lifts, for a caller-validated
+            # descriptor on the user's own multiply-linked files; the type half never
+            # lifts.
             on_skip(SKIP_NOT_REGULAR, by_name)
             return False
         if max_bytes is not None and st.st_size > max_bytes:
@@ -771,6 +804,11 @@ def copy_file_pinned(
         # earlier form unlinked first and left the fragment exactly where cleanup was meant
         # to remove it, which my own Windows shard caught.
         try:
+            if on_opened is not None:
+                # Capture the inode while the exclusive-create descriptor is still
+                # open. A caller can later clean up this exact entry without trusting
+                # whichever inode may answer to the name after a failure.
+                on_opened(os.fstat(dst_fd))
             exceeded = False
             with os.fdopen(fd, "rb") as fsrc:
                 fd = -1  # ownership passed to the file object
@@ -816,6 +854,8 @@ def copy_file_pinned(
                 dst_name=dst_name,
                 mode=force_mode,
             )
+            if fsync:
+                os.fsync(dst_fd)
             if on_created is not None:
                 # Through the descriptor we still hold, so the witness is the
                 # published inode itself — never a name re-resolution.
@@ -1117,6 +1157,128 @@ def _apply_metadata(
         os.utime(fallback_path, ns=times)
 
 
+def _create_and_open_dir_at(
+    parent_fd: int,
+    name: str,
+    *,
+    path: Path,
+    what: str,
+    must_create: bool,
+    refusal: type[Exception],
+) -> int:
+    """Run the bounded mkdir/open pair beneath one held parent descriptor."""
+    lost: FileNotFoundError | None = None
+    for _ in range(_CREATE_ATTEMPTS):
+        ours = True
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            if must_create:
+                raise refusal(
+                    f"refusing to use the {what}: {name!r} already exists, and "
+                    "this operation replaces its destination rather than merging into "
+                    "it. Something recreated that directory after it was removed, so "
+                    "staging into it would leave files the archive does not contain "
+                    "while reporting a replacement. Remove it and re-run with the "
+                    "gateway stopped."
+                ) from None
+            ours = False
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                errno.ENOENT,
+                f"the directory holding the {what} was removed, so "
+                f"{name!r} cannot be created in it",
+                str(path),
+            ) from exc
+        try:
+            return os.open(name, dir_flags(), dir_fd=parent_fd)
+        except FileNotFoundError as exc:
+            if not ours:
+                raise FileNotFoundError(
+                    errno.ENOENT,
+                    f"the {what} already existed when this call met it and was "
+                    "removed before it could be opened, so whatever it held is "
+                    "gone; refusing to re-create it empty, because an additive "
+                    "restore would then report success over the loss",
+                    str(path),
+                ) from exc
+            lost = exc
+            continue
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise refusal(
+                    f"refusing to use the {what}: {name!r} is a symbolic link "
+                    "or not a directory, so creating the tree there would write "
+                    "through whatever it points at. Remove it and re-run."
+                ) from exc
+            raise
+    raise FileNotFoundError(
+        errno.ENOENT,
+        f"the {what} {path} was removed between its creation and its open, "
+        f"{_CREATE_ATTEMPTS} attempts in a row",
+        str(path),
+    ) from lost
+
+
+def create_and_open_dir_pinned_deep(
+    root: str | Path,
+    rel_parts: Iterable[str],
+    *,
+    what: str,
+    must_create: bool = False,
+    refusal: type[Exception] = PinnedPathRefusal,
+) -> int:
+    """Create and open a descendant while carrying one descriptor down the tree.
+
+    The lexical root is opened once with its ancestors resolved once. Each relative
+    component is then created and opened beneath the descriptor for its predecessor;
+    no descendant parent is resolved by name. The returned descriptor names the final
+    component and must be closed by the caller.
+
+    ``must_create`` applies to the final component. Intermediate components may exist
+    because they are the path to the requested destination, not the destination itself.
+    """
+    as_given = Path(root)
+    if not as_given.name:
+        raise refusal(f"refusing to open the {what}: empty root name")
+    parts = tuple(str(part) for part in rel_parts)
+    for part in parts:
+        if (
+            not part
+            or part in {".", ".."}
+            or os.sep in part
+            or (os.altsep is not None and os.altsep in part)
+        ):
+            raise refusal(
+                f"refusing to use the {what}: {part!r} is not one relative directory name"
+            )
+
+    resolved_root = Path(os.path.realpath(as_given.parent or Path("."))) / as_given.name
+    current_fd = pin_parent(str(resolved_root), what=what, refusal=refusal)
+    current_path = as_given
+    try:
+        for index, part in enumerate(parts):
+            current_path /= part
+            next_fd = _create_and_open_dir_at(
+                current_fd,
+                part,
+                path=current_path,
+                what=what,
+                must_create=must_create and index == len(parts) - 1,
+                refusal=refusal,
+            )
+            try:
+                os.close(current_fd)
+            except BaseException:
+                os.close(next_fd)
+                raise
+            current_fd = next_fd
+        return current_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
 def create_and_open_dir_pinned(
     path: str | Path,
     *,
@@ -1187,97 +1349,14 @@ def create_and_open_dir_pinned(
         os.path.realpath(as_given.parent or Path(".")), what=what, refusal=refusal
     )
     try:
-        lost: FileNotFoundError | None = None
-        for _ in range(_CREATE_ATTEMPTS):
-            ours = True
-            try:
-                os.mkdir(as_given.name, 0o700, dir_fd=parent_fd)
-            except FileExistsError:
-                if must_create:
-                    raise refusal(
-                        f"refusing to use the {what}: {as_given.name!r} already exists, and "
-                        "this operation replaces its destination rather than merging into "
-                        "it. Something recreated that directory after it was removed, so "
-                        "staging into it would leave files the archive does not contain "
-                        "while reporting a replacement. Remove it and re-run with the "
-                        "gateway stopped."
-                    ) from None
-                ours = False
-            except FileNotFoundError as exc:
-                # The PINNED PARENT is gone, not the directory being created. Nothing
-                # can be made inside an unlinked directory, so every further attempt
-                # would land here too -- reported at once, and with the whole path,
-                # because the errno carries only the relative name the syscall was
-                # given.
-                raise FileNotFoundError(
-                    errno.ENOENT,
-                    f"the directory holding the {what} was removed, so "
-                    f"{as_given.name!r} cannot be created in it",
-                    str(as_given),
-                ) from exc
-            try:
-                return os.open(as_given.name, dir_flags(), dir_fd=parent_fd)
-            except FileNotFoundError as exc:
-                if not ours:
-                    # This call did NOT create the directory: the `mkdir` above met one
-                    # that was already there, holding whatever the caller was about to
-                    # merge into, and it is gone. Re-creating it would hand back an
-                    # EMPTY directory, and a merge (`must_create=False`) would then
-                    # stage the archive into it and report success while the files it
-                    # was merging with are unrecoverably gone. Review caught this as
-                    # the retry's one unsafe case. So it is reported instead -- the
-                    # same outcome the caller got before the retry existed, with the
-                    # path the errno omits and a sentence saying what was lost.
-                    raise FileNotFoundError(
-                        errno.ENOENT,
-                        f"the {what} already existed when this call met it and was "
-                        "removed before it could be opened, so whatever it held is "
-                        "gone; refusing to re-create it empty, because an additive "
-                        "restore would then report success over the loss",
-                        str(as_given),
-                    ) from exc
-                # The directory this attempt CREATED is gone. Nothing of the caller's
-                # was in it -- it was empty and unopened -- so re-running the pair
-                # costs nothing and loses nothing. That is the mirror of the
-                # ``FileExistsError`` tolerated above: a concurrent writer is handled
-                # and, without this, a concurrent REMOVER was not (GH-12043). Both are
-                # the same interleaving seen from opposite sides, and everything here
-                # runs as the same user as the agent, which is the premise the pinning
-                # exists for.
-                #
-                # The pair is run again rather than repaired in place, because no
-                # ordering of two syscalls closes a window between them. Every attempt
-                # goes through the ONE descriptor pinned above this loop, so a retry
-                # cannot be steered: nothing is re-resolved by name, ``must_create``
-                # and this created-it-ourselves test are re-asked on each attempt, and
-                # a link that appears at the name between two attempts is refused by
-                # the ``O_NOFOLLOW`` below exactly as it is on the first.
-                lost = exc
-                continue
-            except OSError as exc:
-                # A link (or a plain file) at the destination's own name. O_NOFOLLOW already
-                # refuses it -- the gap review found was that it escaped as a raw OSError, so
-                # a restore ended in a traceback instead of the refusal every other path on
-                # this surface produces. Translated here so callers have one type to contain.
-                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-                    raise refusal(
-                        f"refusing to use the {what}: {as_given.name!r} is a symbolic link "
-                        "or not a directory, so creating the tree there would write through "
-                        "whatever it points at. Remove it and re-run."
-                    ) from exc
-                raise
-        # Exhaustion is a ``FileNotFoundError``, not a *refusal*: a refusal on this
-        # surface means the destination is a link or an occupied name a caller must
-        # remove, and callers word it that way -- the prompt handler maps one to
-        # "your prompt root is a link". A directory that keeps being removed is an
-        # operational failure, so it stays in the class the kernel reported and gains
-        # the FULL path the kernel could not name.
-        raise FileNotFoundError(
-            errno.ENOENT,
-            f"the {what} {as_given} was removed between its creation and its open, "
-            f"{_CREATE_ATTEMPTS} attempts in a row",
-            str(as_given),
-        ) from lost
+        return _create_and_open_dir_at(
+            parent_fd,
+            as_given.name,
+            path=as_given,
+            what=what,
+            must_create=must_create,
+            refusal=refusal,
+        )
     finally:
         os.close(parent_fd)
 

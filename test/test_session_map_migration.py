@@ -33,9 +33,12 @@ def _make_kiro_session(kiro_dir, sid: str) -> None:
 
 @pytest.fixture()
 def patched(tmp_path, monkeypatch):
+    from kiro_crew import session_map as sm_mod
+
     kiro = tmp_path / "kiro"
     monkeypatch.setattr("kiro_crew.session_map.config_dir", lambda: tmp_path)
     monkeypatch.setattr("kiro_crew.session_map._KIRO_SESSIONS_DIR", kiro)
+    sm_mod._reset_adopted_source_cache()
     return tmp_path, kiro
 
 
@@ -159,6 +162,76 @@ class TestResumeHardGate:
         _write_map(tmp_path, {"1718000000.123456": "sid-live"})
         SessionMap()
         assert (kiro / "sid-live.json").exists()
+
+
+class TestHostPairRetirement:
+    def test_window_append_survives_host_witness_retirement(self, tmp_path, monkeypatch):
+        """A turn appended after revalidation stays recoverable in the host journal."""
+        from kiro_crew import session_map as sm_mod
+
+        source = tmp_path / "host-sessions"
+        source.mkdir()
+        sid = "sid-window"
+        host_json = source / f"{sid}.json"
+        host_jsonl = source / f"{sid}.jsonl"
+        adopted_jsonl = tmp_path / "adopted.jsonl"
+        journal = '{"role":"user","content":"before"}\n'
+        appended = '{"role":"assistant","content":"window append"}\n'
+        host_json.write_text("{}", encoding="utf-8")
+        host_jsonl.write_text(journal, encoding="utf-8")
+        adopted_jsonl.write_text(journal, encoding="utf-8")
+        host_json_stat = host_json.lstat()
+        host_jsonl_stat = host_jsonl.lstat()
+        real_unlink = sm_mod.os.unlink
+
+        def _append_before_witness_unlink(path, *args, **kwargs):
+            if path == host_json:
+                with host_jsonl.open("a", encoding="utf-8") as stream:
+                    stream.write(appended)
+            return real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(sm_mod.os, "unlink", _append_before_witness_unlink)
+
+        assert sm_mod._retire_host_pair(
+            sid,
+            source,
+            host_json,
+            host_jsonl,
+            host_json_stat,
+            host_jsonl_stat,
+        )
+
+        assert not host_json.exists()
+        assert host_jsonl.exists(), "retirement destroyed the journal containing a window append"
+        assert host_jsonl.read_text(encoding="utf-8") == journal + appended
+        assert adopted_jsonl.read_text(encoding="utf-8") == journal
+
+    def test_retirement_removes_only_the_witness_and_converges(self, tmp_path, monkeypatch):
+        """The state witness retires while the inert journal remains recoverable."""
+        from kiro_crew import session_map as sm_mod
+
+        source = tmp_path / "host-sessions"
+        source.mkdir()
+        sid = "sid-converged"
+        host_json = source / f"{sid}.json"
+        host_jsonl = source / f"{sid}.jsonl"
+        host_json.write_text("{}", encoding="utf-8")
+        host_jsonl.write_text('{"role":"user","content":"kept"}\n', encoding="utf-8")
+        monkeypatch.setattr(sm_mod, "_adopted_transcript_source", lambda: source)
+
+        assert sm_mod._retire_host_pair(
+            sid,
+            source,
+            host_json,
+            host_jsonl,
+            host_json.lstat(),
+            host_jsonl.lstat(),
+        )
+
+        assert not host_json.exists()
+        assert host_jsonl.is_file()
+        assert sm_mod.host_transcript_pending(sid) is False
+        assert sm_mod._serve_verdict(sid, sm_mod.MigrationOutcome.MIGRATED) == sid
 
 
 class TestMigrationCollision:

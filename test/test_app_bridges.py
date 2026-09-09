@@ -825,7 +825,9 @@ class TestTopLevel:
         refreshed = refresh_app_agents("test-app")
 
         assert refreshed == []
-        assert not any(app_env["kiro_agents"].iterdir())
+        assert {p.name for p in app_env["kiro_agents"].iterdir()} == {
+            ".kirocrew-agents.lock"
+        }
 
     def test_install_while_execution_denied_registers_nothing(self, tmp_path, app_env, monkeypatch):
         import kiro_crew.apps.execution as execution_mod
@@ -848,7 +850,9 @@ class TestTopLevel:
         assert result.crons == []
         assert result.mcp_servers == []
         assert any("blocked by execution policy" in error for error in result.errors)
-        assert not any(app_env["kiro_agents"].iterdir())
+        assert {p.name for p in app_env["kiro_agents"].iterdir()} == {
+            ".kirocrew-agents.lock"
+        }
         assert not (app_env["home"] / "skills" / "test-app").exists()
         assert load_app_cron_defs("test-app") == []
         assert not (tmp_path / "mcp.json").exists()
