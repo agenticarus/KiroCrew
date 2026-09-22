@@ -4687,6 +4687,23 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             },
             status=400,
         )
+    # The crew name must satisfy the same grammar ``GET /api/members`` applies
+    # when it lists the roster (``members.py`` skips any row failing
+    # ``_AGENT_NAME_RE``). Persisting a name that fails it -- a space, a non-ASCII
+    # letter, a leading dash -- would create a crew no roster surface can show or
+    # open; refused here, once, for every client of this route. Same BOUNDARY
+    # as the credential rule above: names already stored are not renamed.
+    if not _AGENT_NAME_RE.match(name):
+        return web.json_response(
+            {
+                "error": (
+                    "Agent name must use letters, digits, '-' or '_' only, "
+                    "start and end with a letter or digit, and be at most 64 characters."
+                ),
+                "code": "invalid_agent_name",
+            },
+            status=400,
+        )
     # The template pointer must be EXPLICIT. Defaulting it to "kirocrew" would
     # make every crew created without naming a template an alias for the DEFAULT
     # agent: dispatch flattens an alias to its `kiro_agent`
