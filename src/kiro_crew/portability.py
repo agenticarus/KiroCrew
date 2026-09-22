@@ -62,8 +62,8 @@ EXPORT_EXCLUDE = frozenset(
         # skills/ trees, so an entry here would silently drop any USER file that
         # happens to share the name. They need no entry: root-level export is a
         # hard-coded allowlist (config.json, hooks.json, crons.json,
-        # notifications.jsonl, project_dir, workspace_dir), so a root beacon file is
-        # never selected in the first place.
+        # notifications.jsonl, project_dir, workspace_dir, crew-teams/teams.json), so a
+        # root beacon file is never selected in the first place.
         "session_map.json",
         "kiro_session_pids.txt",
         "kiro_pids.txt",
@@ -448,6 +448,14 @@ def create_export_zip() -> tuple[bytes, dict]:
             if src.is_file() and not src.is_symlink():
                 zf.write(str(src), f"{prefix}/{fname}")
                 contents_summary[fname] = src.stat().st_size
+
+        # The crewmate team list: one document in its own directory. Written by name like
+        # the core files above -- the directory holds nothing else that rides (its lock
+        # file is this host's runtime state), so the pinned tree walk below is not needed.
+        teams_src = mc / "crew-teams" / "teams.json"
+        if teams_src.is_file() and not teams_src.is_symlink():
+            zf.write(str(teams_src), f"{prefix}/crew-teams/teams.json")
+            contents_summary["crew-teams/teams.json"] = teams_src.stat().st_size
 
         # SQLite databases via backup API
         for db_name in ("memory.db", "memory_index.db"):
@@ -896,8 +904,11 @@ def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:
         # would otherwise install a torn `memory_stores/<name>/memory.db` verbatim, and
         # the member fails at its next open with the archive long gone. Refused here,
         # nothing has been written; the exception reaches the handler as a refusal.
+        # `crew-teams` rides the same check: replace copies the tree whole through
+        # `_do_replace`, merge copies the document where the destination has none, and
+        # both would otherwise install a document the team store's reader refuses.
         _refuse_corrupt_source_databases(
-            snap, ["memory"], mc_for_merge=None if mode == "replace" else mc
+            snap, ["memory", "crew-teams"], mc_for_merge=None if mode == "replace" else mc
         )
 
         if mode == "replace":
@@ -949,6 +960,14 @@ def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:
                 else:
                     shutil.copy2(str(snap / "crons.json"), str(mc / "crons.json"))
                     summary["items"].append("crons (copied)")
+
+            # The team list, like hooks.json: installed only where the destination has
+            # none. Validated above by the team store's own reader, before anything moved.
+            teams_snap = snap / "crew-teams" / "teams.json"
+            if teams_snap.is_file() and not (mc / "crew-teams" / "teams.json").is_file():
+                (mc / "crew-teams").mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(teams_snap), str(mc / "crew-teams" / "teams.json"))
+                summary["items"].append("crew-teams (copied)")
 
             if (snap / "hooks.json").is_file():
                 if not (mc / "hooks.json").is_file():

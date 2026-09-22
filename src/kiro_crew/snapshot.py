@@ -77,6 +77,18 @@ _TELEMETRY_SALT_BYTES = 32
 # id-cloning hazard is closed by that non-selection, not by a basename filter.
 NEVER_SNAPSHOT_FILES: frozenset = frozenset({"sel_hmac.key"})
 
+#: Data-home-relative paths, besides the host-local half of ``memory_stores/``, that no
+#: bundle carries in either direction. ``crew-teams/.lock`` is the advisory lock file
+#: `crew_teams.document_lock` opens around every write: empty, this host's runtime state,
+#: and recreated by the first locked write on the restoring host. Matched by POSITION, not
+#: by name -- ``.lock`` is a name an operator's workspace can easily hold.
+_HOST_LOCAL_PATHS: frozenset[tuple[str, ...]] = frozenset({("crew-teams", ".lock")})
+
+
+def _is_host_local(rel_parts: tuple[str, ...]) -> bool:
+    """Is the data-home-relative path *rel_parts* this host's own runtime state?"""
+    return tuple(rel_parts) in _HOST_LOCAL_PATHS or is_host_local_store_state(rel_parts)
+
 
 def _never_ships(member_name: str) -> bool:
     """Is this archive member one no bundle carries in EITHER direction?
@@ -94,7 +106,7 @@ def _never_ships(member_name: str) -> bool:
     parts = PurePosixPath(member_name).parts
     if parts and parts[-1] in NEVER_SNAPSHOT_FILES:
         return True
-    return is_host_local_store_state(parts[1:])
+    return _is_host_local(parts[1:])
 
 
 def _tree_roots_replace_clears() -> frozenset[str]:
@@ -394,6 +406,16 @@ COMPONENTS: dict[str, ComponentSpec] = {
         help="skills/ directory",
         trees=("skills",),
     ),
+    # The crewmate team list: `crew_teams.TEAMS_DIR_NAME` / `TEAMS_FILE_NAME`, one JSON
+    # document naming crews that live in config.json. A tree rather than a flat file so the
+    # restore paths that already exist for a whole tree carry it; the directory's lock
+    # file is host-local and never rides (`_HOST_LOCAL_PATHS`). Team names are the
+    # operator's, so UNRESOLVED like every other component.
+    "crew-teams": ComponentSpec(
+        policy=SecretPolicy.UNRESOLVED,
+        help="crew-teams/ directory (teams.json, the crewmate team list)",
+        trees=("crew-teams",),
+    ),
     "workspace": ComponentSpec(
         policy=SecretPolicy.UNRESOLVED,
         help="workspace/, plan_memory/ directories",
@@ -523,6 +545,34 @@ _JSON_OBJECT_LISTS: dict[str, tuple[str, ...]] = {
     "crons.json": ("jobs",),
 }
 
+#: The one document a component TREE carries whose reader REFUSES a damaged file rather
+#: than reading it empty: `crew_teams.read_teams` raises on anything its parser rejects,
+#: which fails every team route and refuses every crew create with no in-product repair.
+#: So a restore validates it with THAT parser (`crew_teams.read_document`), not with the
+#: flat files' shape check -- a document the shape check admits and the parser refuses
+#: (a bad id, an over-cap name, a newer version) would otherwise install and report success.
+_TREE_DOCUMENT_VALIDATORS: tuple[tuple[str, str, str], ...] = (
+    ("crew-teams", "crew-teams/teams.json", "crew_teams"),
+)
+
+
+def _refuse_unless_valid_tree_document(src: Path, label: str, validator: str) -> None:
+    """Raise `SourceComponentUnsound` unless *src* passes its own consumer's reader."""
+    if validator == "crew_teams":
+        from kiro_crew import crew_teams  # a store module; imported on first use only
+
+        try:
+            crew_teams.read_document(src)
+        except crew_teams.TeamsUnreadable as e:
+            raise SourceComponentUnsound(
+                f"{label} in this snapshot would be refused by its reader ({e}).\n"
+                "   Refusing to restore it: an installed document the team store cannot "
+                "read fails every team route and refuses every crew create."
+            ) from e
+        return
+    raise AssertionError(f"no validator named {validator!r}")
+
+
 # The tree counterpart of CORE_FILES. Derived from the same specs so a component that
 # gains a tree is covered by everything keyed on this without a second edit.
 COMPONENT_TREES: dict[str, tuple[str, ...]] = {
@@ -547,7 +597,13 @@ _CORE_FILE_COMPONENTS: tuple[str, ...] = (
 #: Components restored as whole trees: replace removes the live tree and writes the
 #: archive's, merge copies in without overwriting. Every member declares trees ONLY -- a
 #: component with a flat file belongs above, where a file is moved aside and replaced.
-_WHOLE_TREE_COMPONENTS: tuple[str, ...] = ("workspace", "skills", "artifacts", "uploads")
+_WHOLE_TREE_COMPONENTS: tuple[str, ...] = (
+    "workspace",
+    "skills",
+    "crew-teams",
+    "artifacts",
+    "uploads",
+)
 
 #: Components a MERGE does not restore, so it says so rather than importing them by halves.
 #: The reason is the DATA's shape, not unfinished work, and :func:`_do_merge` states it at
@@ -1480,7 +1536,7 @@ def _staging_ignore(tree: str, root: Path) -> Callable[[str, list[str]], set[str
         rel = os.path.relpath(directory, root_str)
         below = () if rel == os.curdir else Path(rel).parts
         for name in contents:
-            if is_host_local_store_state((*tree_parts, *below, name)):
+            if _is_host_local((*tree_parts, *below, name)):
                 skipped.add(name)
         return skipped
 
@@ -4033,6 +4089,19 @@ def _refuse_corrupt_source_databases(
                 # schedule silently gone, nothing raised, nothing retried.
                 will_install = mc_for_merge is None or not (mc_for_merge / name).is_file()
                 _refuse_unless_json_object(src, name, installed=will_install)
+
+    # A document inside a component tree is validated by ITS OWN reader. The tree is copied
+    # wholesale on replace and file-by-file where the destination lacks the file on merge,
+    # so "installed" is the same question as for a flat file; only an installed document
+    # is checked, because only an installed one reaches the reader.
+    for component, rel, validator in _TREE_DOCUMENT_VALIDATORS:
+        if not _want(components, component):
+            continue
+        src = snap / rel
+        if not src.is_file() or platform_compat.is_link_or_junction(src):
+            continue
+        if mc_for_merge is None or not (mc_for_merge / rel).is_file():
+            _refuse_unless_valid_tree_document(src, rel, validator)
 
     # Component TREES carry databases too, and a tree is copied wholesale: the knowledge
     # store lives at `workspace/knowledge/knowledge.db`, inside a tree the memory
