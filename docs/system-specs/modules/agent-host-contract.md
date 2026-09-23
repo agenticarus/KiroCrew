@@ -547,10 +547,32 @@ kirocrew config set agent.acp_backend kas   # then: kirocrew restart
 kirocrew config set agent.acp_backend ""     # back to kiro-cli; restart
 ```
 
-Three KAS parity items are deferred: hooks are not wired for it, `/clear` maps to
-a `kiro-cli`-only notification and so is a no-op there (a local reset is the
-intended fix), and an alternative transport mode is out of scope pending its own
-design and review.
+Three KAS parity items are deferred: hook EXECUTION is not wired for it, `/clear`
+maps to a `kiro-cli`-only notification and so is a no-op there (a local reset is
+the intended fix), and an alternative transport mode is out of scope pending its
+own design and review.
+
+Hook LISTING is served, and unannounced. `acp/kas_wire.py` builds the answers to
+`_kiro/hooks/list` and `_kiro/hooks/sessionStart` from Kiro Crew's own script-hook
+store, and `AcpSessionHandle` routes both. Three properties hold the surface shut:
+
+- the handshake does not carry `hooks: {enabled: true}` in `KAS_CLIENT_CAPABILITIES`,
+  which is the capability that makes the agent route hook extraction to its client
+  at all, so the agent asks neither method and keeps loading its own hooks;
+- `_kiro/hooks/executeHook` — the method that spawns a command — has no handler, so
+  it is classified as an unknown server request and answered `-32601`. No command
+  runs from this path;
+- `ListedHookStore` records which hook ids were listed, keyed by the session the
+  handle owns rather than by the `sessionId` in the request. A hit is a NECESSARY
+  condition for a future execute path and never a sufficient one: the hook's
+  current command and `enabled` state belong to the live store, and the record is
+  dropped when the session is unregistered.
+
+Listing consults the `capabilities.script_hooks` governance gate and audits the
+decision, because listing is the step that makes a hook reachable. The question is
+asked on an empty session key — an `AcpSessionHandle` holds no Kiro Crew session
+key — so a denial scoped to a Kiro Crew session is not reachable from this surface
+and the capability gate's own flag is.
 
 ## Seam status today
 

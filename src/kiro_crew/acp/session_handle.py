@@ -100,6 +100,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
+    ACP_BACKENDS_HOOKS_LIST,
     ACP_BACKENDS_INLINE_COMPACTION,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
@@ -169,6 +170,12 @@ from kiro_crew.sel import sel
 from kiro_crew.validation import MAX_ACP_SESSION_ID_LEN
 
 logger = logging.getLogger(__name__)
+
+#: The backend's read-only hooks requests, answered by
+#: :meth:`AcpSessionHandle._answer_kas_hooks_request`. A frozenset so the
+#: dispatch test is one membership check rather than two comparisons, and so
+#: the executable third method of that surface is visibly absent from it.
+_KAS_HOOKS_METHODS = frozenset({kas_wire.METHOD_HOOKS_LIST, kas_wire.METHOD_HOOKS_SESSION_START})
 
 # ── Constants ──
 
@@ -3637,6 +3644,22 @@ class AcpSessionHandle:
                         logger.debug("Dropping stray response frame id=%s (no waiter)", msg.id)
                     continue
 
+                # The backend's two READ-ONLY hooks requests, answered here rather
+                # than through the shared classifier: that classifier is also read
+                # by the single-session client, which serves no hooks surface, and
+                # naming an action there that only this loop handles would leave
+                # the request unanswered on that path instead of refused.
+                #
+                # Gated on the capability set, not on the method name alone. This
+                # loop is shared by every backend the runtime demuxes, and only one
+                # of them defines this channel -- the answers carry
+                # operator-authored hook commands, so a backend that never asked for
+                # the surface is answered -32601 like any other method it does not
+                # serve.
+                if self._is_kas_hooks_request(msg):
+                    await self._answer_kas_hooks_request(msg)
+                    continue
+
                 # Dispatch by method
                 action = self._classify(msg)
 
@@ -4539,6 +4562,54 @@ class AcpSessionHandle:
     def _classify(self, msg: JsonRpcMessage) -> str:
         """Classify a notification message into an action string."""
         return classify_notification(msg)
+
+    def _is_kas_hooks_request(self, msg: JsonRpcMessage) -> bool:
+        """Whether this frame is a hooks request THIS session may answer.
+
+        A named predicate rather than an inline condition, so the backend clause
+        has a test that fails when it is removed: asserting the membership set's
+        contents cannot catch a deleted membership CHECK, and the check is the part
+        that keeps operator-authored hook commands away from a backend that never
+        defined the channel.
+
+        Three conditions, all required: the frame is a request (it carries an id and
+        so needs a response), the method is one of the two read-only ones, and this
+        session's backend is in the capability set.
+        """
+        return (
+            msg.id is not None
+            and msg.method in _KAS_HOOKS_METHODS
+            and self._runtime.acp_backend in ACP_BACKENDS_HOOKS_LIST
+        )
+
+    async def _answer_kas_hooks_request(self, msg: JsonRpcMessage) -> None:
+        """Answer one read-only hooks request from the backend.
+
+        Both answers are built in :mod:`kiro_crew.acp.kas_wire`, which owns the
+        shapes; this is the route that carries them. Neither runs a command: the
+        method that would is not served at all, so it arrives as an unknown
+        server request and is refused.
+
+        The list answer goes through a thread. The hook store itself is an
+        in-memory dict, but the answer also consults the governance capability
+        that forbids script hooks, and resolving that fingerprints and may reload
+        profiles from disk -- a filesystem walk on the loop that demuxes every
+        multiplexed session's frames. The session-start answer reads nothing and
+        stays inline.
+
+        The record of what was listed is keyed by the session THIS handle owns,
+        not by the ``sessionId`` the request carries: the id in the frame is
+        host-supplied, and it decides which session's executable set a later
+        request can name.
+        """
+        params = msg.params if isinstance(msg.params, dict) else {}
+        if msg.method == kas_wire.METHOD_HOOKS_LIST:
+            result = await asyncio.to_thread(
+                kas_wire.hooks_list_response, params, session_id=self._session_id
+            )
+        else:
+            result = kas_wire.hooks_session_start_response(params)
+        await self._runtime.send_response(msg.id, result)
 
     def _build_permission_event(self, msg: JsonRpcMessage) -> AcpEvent:
         """Build an AcpEvent for a permission request via the shared parser.

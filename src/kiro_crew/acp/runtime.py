@@ -71,6 +71,7 @@ from kiro_crew.acp.kas_transport import (
     KAS_AUTH_CALLBACK_ERROR_CODE,
     METHOD_KAS_AUTH_GET_ACCESS_TOKEN,
 )
+from kiro_crew.acp.kas_wire import listed_hooks
 from kiro_crew.acp.mcp_ref_guard import warn_unresolved_server_refs
 from kiro_crew.acp.mcp_session_report import (
     active_custom_agent,
@@ -4818,6 +4819,11 @@ class AcpRuntime:
     def unregister_session(self, session_id: str) -> None:
         """Unregister a session queue (called by AcpSessionHandle.destroy)."""
         self._session_queues.pop(session_id, None)
+        # The departing session also takes the record of which hook ids were
+        # listed to it. The record is bounded anyway, but dropping it here is what
+        # makes a reused session id start with nothing executable rather than
+        # inheriting the previous occupant's set.
+        listed_hooks().forget(session_id)
         # Clean up any pending routed requests for this session
         stale = [k for k, v in self._routed_requests.items() if v == session_id]
         for k in stale:
