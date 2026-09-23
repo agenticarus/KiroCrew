@@ -6877,6 +6877,7 @@
           "keep_awake": true
         },
         "restore_sessions": false,
+        "crewmate_threads": false,
         "qr_session_until_restart": true,
         "qr_session_persist_across_restart": false,
         "restore_window_minutes": 30,
@@ -7090,6 +7091,20 @@
       "enumValues": null,
       "defaultValue": false,
       "requiresRestart": true
+    },
+    {
+      "path": "dashboard.crewmate_threads",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Reply threads on crewmate chat messages",
+      "help": "Let any message in a crewmate's chat carry its own reply thread, opened in the side panel while the main chat stays visible. Off by default: the thread routes answer not-found, no thread frame is sent, and the dashboard draws no Reply in thread control. Takes effect on the next request; no restart.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
     },
     {
       "path": "dashboard.qr_session_until_restart",
