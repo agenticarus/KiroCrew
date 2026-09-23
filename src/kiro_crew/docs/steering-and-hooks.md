@@ -260,6 +260,38 @@ by command and matcher. A command must be an absolute path to an existing file
 outside sensitive locations, and only `command` and `matcher` are kept — extra
 keys are stripped.
 
+`kiro_hooks` also accepts the array of hook documents a kiro-agent profile uses,
+so a spec written for either tool loads here:
+
+```json
+{"agent": {"kiro_hooks": [
+  {"name": "guard", "trigger": "PreToolUse", "matcher": "*",
+   "action": {"type": "command", "command": "/path/to/hook.sh"}}
+]}}
+```
+
+Both shapes are held to the same bar: same command and matcher rules, same
+dedup, same per-event and total caps. Eleven triggers are accepted, in
+kiro-agent's own PascalCase or the IDE camelCase spelling. Five of them map onto
+the five kiro-cli event names — `PreToolUse` to `preToolUse`, `PostToolUse` to
+`postToolUse`, `UserPromptSubmit` to `userPromptSubmit`, `SessionStart` to
+`agentSpawn`, `Stop` to `stop` — so only those five reach kiro-cli; a hook on
+`PreTaskExec`,
+`PostTaskExec`, `PostFileCreate`, `PostFileSave`, `PostFileDelete` or `Manual`
+stays in your config and does not run there. An `action` of type `agent` has no
+kiro-cli slot either, so it does not run there. Same for the per-hook `name`,
+`description` and `timeout`: kiro-cli is handed the command and the matcher, and
+the rest stays in your config.
+
+`enabled` and `confirm` are the two that change what runs, so they are not
+dropped. `enabled: false` means the hook is off, and `confirm: true` asks you
+first — a kiro-cli hook cannot ask. Either one keeps the hook out of the kiro-cli
+spec entirely, with a warning saying which, rather than handing over a command
+that runs unconditionally.
+
+The standalone hook-file wrapper `{"version": "v1", "hooks": [...]}` is a file
+format, not a spec value, and is rejected.
+
 ## `register_hook` is a different thing
 
 The `register_hook` MCP tool is **not** a lifecycle hook, despite the name. It

@@ -4727,6 +4727,53 @@ User-defined kiro-cli hooks that persist across `kirocrew update`. Follows the
 {"agent": {"kiro_hooks": {"preToolUse": [{"matcher": "*", "command": "/path/to/hook.sh"}]}}}
 ```
 
+**Two accepted shapes.** The object above, and the array of hook documents a
+kiro-agent profile carries:
+
+```json
+{"agent": {"kiro_hooks": [
+  {"name": "guard", "trigger": "PreToolUse", "matcher": "*",
+   "action": {"type": "command", "command": "/path/to/hook.sh"}}
+]}}
+```
+
+Each shape has exactly one reader. `normalize_spec_hooks()` in `agent.py` reads
+the array and returns the internal list of hook documents, and
+`hook_documents_to_object_form()` derives the object form handed to kiro-cli. The
+object form is read only by `_merge_kiro_hooks()`, which owns its validation and
+its audit, so its serialized bytes and its error path are unchanged by the array
+form's arrival — re-deriving it from documents would move both. Anything that is
+not an array, an object included, is warned about and SEL-audited by
+`normalize_spec_hooks()`, and the one caller sends an object straight to the
+merge instead of here. So a value that is neither shape is audited rather than
+dropped in silence. The standalone hook-file wrapper
+`{"version": "v1", "hooks": [...]}` is a file format, not a spec value: it is an
+object, so the merge sees `version`/`hooks` as unknown event keys and rejects it.
+
+Array-form rules (implemented in `normalize_spec_hooks()`):
+- `trigger` accepts eleven kiro-agent names, in kiro-agent's PascalCase or the
+  IDE camelCase spelling, keyed case-insensitively
+- `action` is `{"type": "command", "command": ...}` or
+  `{"type": "agent", "prompt": ...}`; the type must be a string and the payload a
+  non-empty string within `_MAX_HOOK_PAYLOAD_LEN`
+- `name` and `description` are bounded by `_MAX_HOOK_NAME_LEN` and
+  `_MAX_HOOK_DESCRIPTION_LEN`, `timeout` must be a positive integer, `enabled` and
+  `confirm` must be booleans, and `matcher` follows the object form's rules
+- at most `_MAX_SPEC_HOOK_DOCUMENTS` documents are read from one field
+- a rejected document is warned about and SEL-audited; the documents beside it
+  still load
+- documents are then projected onto the object form and merged by
+  `_merge_kiro_hooks()`, so both shapes meet the same command, matcher, dedup and
+  cap rules
+
+Left out of the kiro-cli emission, kept in the stored spec: an `action` of type
+`agent`, the six triggers kiro-cli has no event name for (`PreTaskExec`,
+`PostTaskExec`, `PostFileCreate`, `PostFileSave`, `PostFileDelete`, `Manual`), and
+the per-hook `name`, `description` and `timeout`. `enabled: false` and
+`confirm: true` are NOT in that class: each grants less execution than the object
+form can express, so either one keeps the hook out of the kiro-cli spec entirely,
+with a warning and a SEL audit naming which.
+
 Merge rules (implemented in `_merge_kiro_hooks()` in `agent.py`):
 - Bundled hooks from `config/defaults.json` are always present and always first
 - User hooks are appended per event type after bundled hooks

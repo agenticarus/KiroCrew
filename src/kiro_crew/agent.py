@@ -38,7 +38,7 @@ import sys
 import tempfile
 import threading
 import uuid
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -2017,6 +2017,333 @@ _HOOK_EVENT_CANONICAL = {
     "stop": "stop",
 }
 
+
+# A spec's ``hooks`` field accepts two shapes, and each has exactly one reader.
+# Crew's own shape is an object keyed by kiro-cli event name, each value a list of
+# ``{command, matcher?}`` entries; it is read by ``_merge_kiro_hooks``, which owns
+# every rule about a command, a matcher, dedup and the caps. KAS (kiro-agent)
+# writes a list of hook documents: ``{name, description?, trigger, matcher?,
+# action, timeout?, enabled?, confirm?}``; the ARRAY form normalizes to the
+# document list and is then projected onto the object form kiro-cli is handed.
+# ``normalize_spec_hooks`` reads the array only, so routing an object form through
+# it rejects every entry. The standalone hook FILE wrapper
+# ``{"version": "v1", "hooks": [...]}`` is not a spec shape: it is an object, so
+# the merge sees ``version``/``hooks`` as unknown event names and rejects it.
+#
+# Canonical KAS trigger for every spelling a spec may carry: KAS's own
+# PascalCase names, the IDE camelCase aliases, and Crew's five kiro-cli event
+# names. Keys are lowercased so a spec's casing does not matter, the same way
+# ``_HOOK_EVENT_CANONICAL`` treats a script header.
+_KAS_TRIGGER_CANONICAL = {
+    "pretooluse": "PreToolUse",
+    "posttooluse": "PostToolUse",
+    "userpromptsubmit": "UserPromptSubmit",
+    "sessionstart": "SessionStart",
+    "agentspawn": "SessionStart",
+    "stop": "Stop",
+    "pretaskexec": "PreTaskExec",
+    "pretaskexecution": "PreTaskExec",
+    "posttaskexec": "PostTaskExec",
+    "posttaskexecution": "PostTaskExec",
+    "postfilecreate": "PostFileCreate",
+    "filecreated": "PostFileCreate",
+    "postfilesave": "PostFileSave",
+    "fileedited": "PostFileSave",
+    "postfiledelete": "PostFileDelete",
+    "filedeleted": "PostFileDelete",
+    "manual": "Manual",
+    "usertriggered": "Manual",
+}
+
+# The KAS triggers a kiro-cli hook event can express. The other six
+# (``PreTaskExec``, ``PostTaskExec``, ``PostFileCreate``, ``PostFileSave``,
+# ``PostFileDelete``, ``Manual``) have no kiro-cli event name, so a document
+# carrying one stays in Crew's stored spec and is left out of the kiro-cli
+# emission.
+_KAS_TRIGGER_TO_EVENT = {
+    "PreToolUse": "preToolUse",
+    "PostToolUse": "postToolUse",
+    "UserPromptSubmit": "userPromptSubmit",
+    "SessionStart": "agentSpawn",
+    "Stop": "stop",
+}
+
+# Action types in a KAS hook document. Only ``command`` is expressible as a
+# kiro-cli hook entry; an ``agent`` action (a prompt handed back to the model)
+# has no kiro-cli equivalent and is dropped on the emission path only.
+_KAS_ACTION_TYPES = frozenset({"command", "agent"})
+
+# Bound on the documents taken from one ``hooks`` field. ``_merge_kiro_hooks``
+# caps what reaches kiro-cli; this caps the work done to get there, so a spec
+# carrying a huge list cannot spend the whole install pass on it.
+_MAX_SPEC_HOOK_DOCUMENTS = 200
+
+# A document count alone bounds nothing if each document may carry strings of
+# any size, so every string a document RETAINS carries its own limit. The
+# command still has to resolve to an existing absolute path, and the matcher
+# still has :data:`_MAX_MATCHER_LEN`; these cover the fields those checks do not
+# reach.
+_MAX_HOOK_NAME_LEN = 200
+_MAX_HOOK_DESCRIPTION_LEN = 1000
+_MAX_HOOK_PAYLOAD_LEN = 4096
+
+# Per-document fields whose type is checked before the document is accepted.
+_KAS_DOCUMENT_FIELD_TYPES: tuple[tuple[str, type | tuple[type, ...]], ...] = (
+    ("name", str),
+    ("description", str),
+    ("enabled", bool),
+    ("confirm", bool),
+)
+
+# Per-document string fields and the length each one is held to.
+_KAS_DOCUMENT_FIELD_LIMITS: tuple[tuple[str, int], ...] = (
+    ("name", _MAX_HOOK_NAME_LEN),
+    ("description", _MAX_HOOK_DESCRIPTION_LEN),
+)
+
+
+# Every value below that reaches a log line or a SEL audit came out of an
+# LLM-writable config, so it can carry a credential. Two rules hold for all of
+# them: a logged value goes through ``redact`` first, because ``gateway.log``
+# persists and rotates rather than expires; and a SEL value is passed WHOLE,
+# because :func:`_sel_hook_rejected` redacts before it truncates and a caller
+# that pre-slices hands the redactors a value already cut at an arbitrary
+# boundary.
+def _hook_diagnostic(value: object) -> str:
+    """Redact a config-supplied value for a log line."""
+    return redact(str(value))
+
+
+def _hook_matcher_ok(matcher: object) -> bool:
+    """Whether a present ``matcher`` passes the object form's rules.
+
+    Same three rules ``_merge_kiro_hooks`` applies to an object-form entry: a
+    string, within :data:`_MAX_MATCHER_LEN`, and inside
+    :data:`_SAFE_MATCHER_RE`.
+    """
+    return (
+        isinstance(matcher, str)
+        and len(matcher) <= _MAX_MATCHER_LEN
+        and bool(_SAFE_MATCHER_RE.match(matcher))
+    )
+
+
+def _event_for_hook_trigger(trigger: object) -> str | None:
+    """kiro-cli event name a document's trigger can be emitted as, or None."""
+    if not isinstance(trigger, str):
+        return None
+    return _KAS_TRIGGER_TO_EVENT.get(trigger)
+
+
+def _hook_document_action(action: object, *, index: int, source: str) -> dict | None:
+    """Validate a document's ``action``, returning the normalized copy or None."""
+    if not isinstance(action, dict):
+        logger.warning("kiro_hooks[%d]: action is not an object, skipping", index)
+        _sel_hook_rejected(source, str(action), "action is not an object")
+        return None
+    action_type = action.get("type")
+    # The membership test runs against a frozenset, so an unhashable value
+    # (a list, a dict) would raise out of a normalizer whose contract is to
+    # warn and skip. Screen the type first.
+    if not isinstance(action_type, str) or action_type not in _KAS_ACTION_TYPES:
+        logger.warning(
+            "kiro_hooks[%d]: unknown action type %s, skipping",
+            index,
+            _hook_diagnostic(action_type),
+        )
+        _sel_hook_rejected(source, str(action_type), "unknown action type")
+        return None
+    payload_key = "command" if action_type == "command" else "prompt"
+    payload = action.get(payload_key)
+    if not isinstance(payload, str) or not payload:
+        logger.warning(
+            "kiro_hooks[%d]: %s action needs a non-empty %s, skipping",
+            index,
+            action_type,
+            payload_key,
+        )
+        _sel_hook_rejected(source, str(payload), f"{action_type} action without {payload_key}")
+        return None
+    if len(payload) > _MAX_HOOK_PAYLOAD_LEN:
+        logger.warning(
+            "kiro_hooks[%d]: %s is longer than %d characters, skipping",
+            index,
+            payload_key,
+            _MAX_HOOK_PAYLOAD_LEN,
+        )
+        _sel_hook_rejected(source, payload, f"{payload_key} too long")
+        return None
+    return {"type": action_type, payload_key: payload}
+
+
+def _hook_document_from_document(entry: object, *, index: int, source: str) -> dict | None:
+    """Validate one KAS hook document, returning the normalized copy or None."""
+    if not isinstance(entry, dict):
+        logger.warning("kiro_hooks[%d]: hook document is not an object, skipping", index)
+        _sel_hook_rejected(source, str(entry), "hook document is not an object")
+        return None
+    # ``"matcher": null`` is how JSON spells an optional the author left out, so
+    # a null reads as absent. Without this it is a present value of the wrong
+    # type, and the whole document is lost over a field that says nothing.
+    entry = {key: value for key, value in entry.items() if value is not None}
+    trigger_raw = entry.get("trigger")
+    trigger = (
+        _KAS_TRIGGER_CANONICAL.get(trigger_raw.lower()) if isinstance(trigger_raw, str) else None
+    )
+    if trigger is None:
+        logger.warning(
+            "kiro_hooks[%d]: unknown trigger %s, skipping", index, _hook_diagnostic(trigger_raw)
+        )
+        _sel_hook_rejected(source, str(trigger_raw), "unknown trigger")
+        return None
+    action = _hook_document_action(entry.get("action"), index=index, source=source)
+    if action is None:
+        return None
+    for field, expected in _KAS_DOCUMENT_FIELD_TYPES:
+        if field in entry and not isinstance(entry[field], expected):
+            logger.warning("kiro_hooks[%d]: %s has the wrong type, skipping", index, field)
+            _sel_hook_rejected(source, str(entry.get(field)), f"{field} has the wrong type")
+            return None
+    if "timeout" in entry and (
+        not isinstance(entry["timeout"], int)
+        or isinstance(entry["timeout"], bool)
+        or entry["timeout"] <= 0
+    ):
+        logger.warning("kiro_hooks[%d]: timeout must be a positive integer, skipping", index)
+        _sel_hook_rejected(source, str(entry.get("timeout")), "timeout not a positive integer")
+        return None
+    for field, limit in _KAS_DOCUMENT_FIELD_LIMITS:
+        value = entry.get(field)
+        if isinstance(value, str) and len(value) > limit:
+            logger.warning(
+                "kiro_hooks[%d]: %s is longer than %d characters, skipping", index, field, limit
+            )
+            _sel_hook_rejected(source, value, f"{field} too long")
+            return None
+    name = entry.get("name")
+    if name is not None and not name:
+        logger.warning("kiro_hooks[%d]: name is empty, skipping", index)
+        _sel_hook_rejected(source, "", "name is empty")
+        return None
+    if "matcher" in entry and not _hook_matcher_ok(entry["matcher"]):
+        logger.warning(
+            "kiro_hooks[%d]: matcher contains disallowed characters or is too long, skipping", index
+        )
+        _sel_hook_rejected(source, str(entry.get("matcher")), "invalid matcher")
+        return None
+    doc: dict = {
+        "name": name if isinstance(name, str) else f"{trigger}-{index}",
+        "trigger": trigger,
+        "action": action,
+    }
+    if "matcher" in entry:
+        doc["matcher"] = entry["matcher"]
+    for field, _expected in _KAS_DOCUMENT_FIELD_TYPES:
+        if field in entry and field != "name":
+            doc[field] = entry[field]
+    if "timeout" in entry:
+        doc["timeout"] = entry["timeout"]
+    return doc
+
+
+def _hook_documents_from_array_form(hooks: list, *, source: str) -> list[dict]:
+    """Normalize a KAS array of hook documents to the document list."""
+    if len(hooks) > _MAX_SPEC_HOOK_DOCUMENTS:
+        logger.warning(
+            "kiro_hooks: %d documents exceeds the limit of %d, ignoring the remainder",
+            len(hooks),
+            _MAX_SPEC_HOOK_DOCUMENTS,
+        )
+        _sel_hook_rejected(source, str(len(hooks)), "document limit exceeded")
+    docs: list[dict] = []
+    for index, entry in enumerate(hooks[:_MAX_SPEC_HOOK_DOCUMENTS]):
+        doc = _hook_document_from_document(entry, index=index, source=source)
+        if doc is not None:
+            docs.append(doc)
+    return docs
+
+
+def normalize_spec_hooks(value: object, *, source: str = "kiro_hooks") -> list[dict]:
+    """Normalize a KAS array of hook documents to the internal document list.
+
+    A rejected element is warned about and SEL-audited rather than raising, which
+    is how a spec's ``hooks`` has always treated bad input.
+
+    Crew's object-of-arrays is NOT read here. It goes to ``_merge_kiro_hooks`` as
+    it was read, because that merge is the object form's own validator and
+    auditor: every rule about a command, a matcher, dedup and the caps lives
+    there, and re-deriving the object form from documents would move its error
+    path and the bytes kiro-cli receives. So anything that is not an array —
+    an object included — is rejected here, and the one caller sends an object
+    straight to that merge instead.
+    """
+    if isinstance(value, list):
+        return _hook_documents_from_array_form(value, source=source)
+    logger.warning("kiro_hooks is not an array of hook documents, ignoring")
+    _sel_hook_rejected(source, str(value), "hooks is not an array of hook documents")
+    return []
+
+
+def hook_documents_to_object_form(docs: Sequence[dict]) -> dict[str, list[dict]]:
+    """Derive the kiro-cli object form from normalized hook documents.
+
+    Only a ``command`` action on one of the five triggers kiro-cli names is
+    expressible. An ``agent`` action, one of the six triggers kiro-cli has no
+    name for, and the per-document ``name``, ``description`` and ``timeout`` have
+    no object-form slot, so they are dropped HERE, on the emission path, and kept
+    in Crew's stored spec.
+
+    ``enabled`` and ``confirm`` are not dropped that way. Each grants LESS
+    execution than the object form can express, so an entry emitted without them
+    would run unconditionally and unprompted: ``enabled: false`` and
+    ``confirm: true`` keep the whole hook out of the emission instead.
+    """
+    result: dict[str, list[dict]] = {}
+    for doc in docs:
+        raw_action = doc.get("action")
+        action: dict = raw_action if isinstance(raw_action, dict) else {}
+        event = _event_for_hook_trigger(doc.get("trigger"))
+        command = action.get("command")
+        # ``enabled`` and ``confirm`` each grant LESS execution than the object
+        # form can express, so neither may be dropped the way a label is: an
+        # entry emitted without them runs unconditionally and unprompted. A hook
+        # the author switched off, or asked to be prompted for, is left out.
+        if doc.get("enabled") is False:
+            logger.warning(
+                "kiro_hooks: hook %s is disabled, leaving it out of the kiro-cli spec",
+                _hook_diagnostic(doc.get("name")),
+            )
+            _sel_hook_rejected(str(doc.get("trigger")), str(command), "hook is disabled")
+            continue
+        if doc.get("confirm") is True:
+            logger.warning(
+                "kiro_hooks: hook %s asks to be confirmed, which a kiro-cli hook cannot do, "
+                "leaving it out of the kiro-cli spec",
+                _hook_diagnostic(doc.get("name")),
+            )
+            _sel_hook_rejected(str(doc.get("trigger")), str(command), "hook asks to be confirmed")
+            continue
+        if event is None or action.get("type") != "command" or not isinstance(command, str):
+            logger.warning(
+                "kiro_hooks: hook %s has trigger %s and action type %s, which no kiro-cli hook "
+                "event can express, so it does not run there",
+                _hook_diagnostic(doc.get("name")),
+                _hook_diagnostic(doc.get("trigger")),
+                _hook_diagnostic(action.get("type")),
+            )
+            _sel_hook_rejected(
+                str(doc.get("trigger")),
+                str(command),
+                "no kiro-cli hook event can express this hook",
+            )
+            continue
+        entry: dict[str, str] = {"command": command}
+        if isinstance(doc.get("matcher"), str):
+            entry["matcher"] = doc["matcher"]
+        result.setdefault(event, []).append(entry)
+    return result
+
+
 # Default hooks directory matches kiro-cli's discovery path.
 _DEFAULT_KIRO_HOOKS_DIR = Path.home() / ".kiro" / "hooks"
 
@@ -2460,7 +2787,25 @@ def _apply_user_kiro_hooks(config: dict, mc_cfg: dict) -> None:
                 # check we just performed.
                 hooks_dir = resolved
 
-    explicit_hooks: dict = user_hooks if isinstance(user_hooks, dict) and user_hooks else {}
+    # Both spec shapes are accepted. The object form goes to the merge below
+    # exactly as it is read: that merge is the object form's own validator and
+    # auditor, and routing it through the document form instead would move its
+    # error path and could perturb the bytes kiro-cli receives. The array form is
+    # normalized to hook documents and then projected onto the object form, so
+    # command validation, matcher rules, dedup and the caps hold both shapes to
+    # one bar.
+    explicit_hooks: dict
+    if isinstance(user_hooks, dict):
+        explicit_hooks = user_hooks
+    elif user_hooks is not None:
+        # Every other value, a list included, goes through the normalizer, so a
+        # ``hooks`` that is neither shape is audited rather than dropped in
+        # silence.
+        explicit_hooks = hook_documents_to_object_form(
+            normalize_spec_hooks(user_hooks, source="kiro_hooks")
+        )
+    else:
+        explicit_hooks = {}
     has_explicit = bool(explicit_hooks)
     if not has_explicit and not autoimport_enabled:
         return
