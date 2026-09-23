@@ -130,6 +130,12 @@ abandon costs a public comment and a label churn on someone else's issue.
   A wrong fix to a misdiagnosed report is worse than a question.
 - **It needs a product, design or naming decision.** Publish the question and move
   on (below).
+- **It asks to change something the team already decided.** Where the repository
+  keeps a decision record (in Kiro Crew, `docs/decisions/`), grep it for the label,
+  control or behaviour the issue names before you investigate; a match means the
+  issue is a re-litigation, not a bug. Say so in one comment that links the entry,
+  pass with `skip_scope: needs-decision`, and put the entry path in `why`. Only a
+  maintainer writing a superseding entry reopens it.
 - **It is an architecture change.** Moving a responsibility from one module to
   another, changing how two components talk to each other, adding or removing a
   layer: the code can be perfectly straightforward while the question of whether

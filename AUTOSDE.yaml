@@ -571,6 +571,52 @@ custom-rules:
       - Porting an already-written section verbatim between main and a release
         branch, where the diff adds a section and removes nothing.
 
+  - id: recorded-decisions-are-not-regressions
+    blocking: true
+    file-patterns:
+      - "docs/decisions/**"
+      - "website/src/**"
+      - "src/kiro_crew/**"
+    rule: |
+      docs/decisions/ is the team's record of product and design decisions a
+      person made: one immutable file per decision, indexed by its README. The
+      rules are in docs/decisions/README.md. This rule exists because a
+      recorded decision was reversed by a pull request that read as an ordinary
+      fix: a single nightly friction row asked for a longer button label, the
+      PR changed it, and nothing in review knew the short label had been chosen
+      on purpose. A decision that has to be re-made every time a report
+      disagrees with it was never recorded at all.
+
+      - FLAG any diff that EDITS, RENAMES or DELETES an existing file under
+        docs/decisions/ other than README.md. An entry is written once. A
+        change of mind is a NEW entry carrying a `Supersedes:` line that names
+        the old one, and the old file stays byte-identical.
+        `scripts/check_decisions_history.py` refuses this mechanically in Fast
+        Gate, so spend your attention on the next two points; report it only
+        if the gate somehow did not.
+      - FLAG a change to a user-facing label, wording, placement or behaviour
+        that an entry under docs/decisions/ records, when the PR adds no
+        superseding entry. Grep the directory for the control, key or
+        behaviour the diff touches. That the change closes an issue, answers a
+        friction report, satisfies a review finding or makes a test read
+        better is not a reason: an entry outranks all of those, and the right
+        response to a collision is to close the report as decided and link
+        the entry. Treat the reversal as a regression, whatever the PR title
+        says.
+      - FLAG a new entry, superseding or not, that quotes no human decision.
+        An agent may write an entry only when it records a decision a person
+        made in the conversation, pull request or issue it cites, and the
+        entry names that person. An entry that decides on the agent's own
+        authority is refused.
+
+      Allowed (do NOT flag):
+      - Adding a new entry that names the person who decided and links the
+        evidence, with the matching index row in docs/decisions/README.md.
+      - Adding a superseding entry a maintainer wrote or is quoted in, in the
+        SAME PR as the change it authorizes.
+      - Editing docs/decisions/README.md itself (index rows, rule wording).
+      - A change to a label, placement or behaviour that no entry records.
+
   - id: recurring-defect-patterns
     blocking: false
     file-patterns:

@@ -81,7 +81,7 @@ def schemas() -> list[dict[str, Any]]:
                     },
                     "verdict": {
                         "type": "string",
-                        "description": "bug | feature | question | duplicate | needs-info",
+                        "description": "bug | feature | question | duplicate | needs-info | decided",
                     },
                     "root_cause": {
                         "type": "string",
