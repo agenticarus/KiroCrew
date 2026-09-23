@@ -303,7 +303,7 @@ attracts a repair closer.
 |---|---|---|---|---|
 | `turn` | int | required | Turn ordinal. | |
 | `actor` | string | required | Who caused the turn. Same folding as `turn/started`. | `user`, `app`, `crew`, `cron`, `autonudge`, `subagent`, `gateway`, `other` |
-| `reason` | string | required | Which gate refused. The writer records the caller's value without constraining it. | `not_authorized`, `gateway_closing`, `stopped_before_dispatch`, `replay_superseded_before_dispatch`, `blocked`, `too_large` |
+| `reason` | string | required | Which gate refused. The writer records the caller's value without constraining it. | `not_authorized`, `gateway_closing`, `stopped_before_dispatch`, `replay_superseded_before_dispatch`, `blocked`, `too_large`, `jev_window_refusal_unrecovered` |
 | `depth` | int | required | Prompt depth. | |
 
 **Invariants** — No `turn/completed` follows it for that ordinal.

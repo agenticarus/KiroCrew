@@ -4118,6 +4118,15 @@ class _ChatSlot:
             entry_expired=context_entry_expired,
         )
 
+    def restore_pending_context(self, entries: list[dict[str, Any]]) -> None:
+        """Re-queue context a turn drained but never sent, ahead of newer arrivals."""
+        self._buffers.restore_pending_context(
+            self,
+            entries,
+            max_pending_context=_MAX_PENDING_CONTEXT,
+            entry_expired=context_entry_expired,
+        )
+
     def drop_foreign_authorized_notes(self) -> int:
         """Drop note content whose authorization belongs to another session."""
         return self._buffers.drop_foreign_authorized_notes(

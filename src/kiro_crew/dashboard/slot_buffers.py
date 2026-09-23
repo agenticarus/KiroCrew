@@ -660,6 +660,32 @@ class SlotBufferCoordinator:
         slot._pending_context.append(entry)
 
     @staticmethod
+    def restore_pending_context(
+        slot: Any,
+        entries: list[dict[str, Any]],
+        *,
+        max_pending_context: int,
+        entry_expired: Callable[[dict[str, Any], float], bool],
+    ) -> None:
+        """Put *entries* back at the FRONT of the queue, then prune and cap ONCE.
+
+        For a turn that drained the queue and was then not sent. The restored
+        entries are OLDER than anything queued while that turn ran, so they belong
+        ahead of it -- and the cap has to be applied to the COMBINED queue in one
+        step. Restoring them through ``append_pending_context`` instead would run
+        that writer's FIFO eviction once per entry, and each eviction takes the
+        oldest, which by then is one of the newer arrivals this is meant to keep.
+        """
+        if not entries:
+            return
+        now = time.time()
+        merged = [
+            entry for entry in [*entries, *slot._pending_context] if not entry_expired(entry, now)
+        ]
+        # Same direction the writer's eviction takes: over the cap, the oldest go.
+        slot._pending_context[:] = merged[-max_pending_context:]
+
+    @staticmethod
     def drop_foreign_authorized_notes(
         slot: Any,
         *,

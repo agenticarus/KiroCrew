@@ -742,3 +742,801 @@ class TestASwitchThatDoesNotTake:
         assert row["model_chosen"] == "model-c"
         assert row["applied"] is False
         assert row["model_used"] == "model-b"
+
+
+# ---------------------------------------------------------------------------
+# The two window rules, driven through the real hook
+# ---------------------------------------------------------------------------
+
+#: What the registry KNOWS about the three test ids. The ``simple`` pin is the
+#: small one, which is the shape the rules exist for: the cheap tier is also the
+#: one whose model has the least room to work in.
+WINDOWS = {"model-a": 200_000, "model-b": 1_000_000, "model-c": 1_000_000}
+
+
+@pytest.fixture
+def windows(monkeypatch):
+    """Pin the registry's window answers, as a MUTABLE ``{id: window}`` map.
+
+    An id a test removes is one the registry has not met, which is the state both
+    rules have to refuse nothing on.
+    """
+    from kiro_crew import model_registry
+
+    live = dict(WINDOWS)
+    monkeypatch.setattr(model_registry, "has_known_window", lambda name: name in live)
+    monkeypatch.setattr(model_registry, "model_window", lambda name, **_kw: live.get(name))
+    return live
+
+
+@pytest.fixture
+def answered(monkeypatch):
+    """An oracle answering a chosen tier at a chosen probability."""
+    import kiro_crew.decisions.impl_jev as impl_mod
+
+    held = {"tier": "simple", "p": 0.41}
+
+    class _Oracle:
+        async def ask(self, _state, questions):
+            return {q.id: Answer(id=q.id, value=held["tier"], p=held["p"]) for q in questions}
+
+    monkeypatch.setattr(impl_mod, "JevOracle", lambda provider: _Oracle())
+
+    def _set(tier: str, p: float) -> None:
+        held.update(tier=tier, p=p)
+
+    return _set
+
+
+def _wired(
+    tmp_path,
+    *,
+    serves: str,
+    used: int = 0,
+    limit: float = 70.0,
+    served_window: int = 0,
+    usage_unknown: bool = False,
+):
+    """``(state, client)`` for a session on *serves* with a context reading.
+
+    The served model FOLLOWS ``set_model`` here, which the fixed-attribute double
+    above cannot show: a refusal that lands somewhere is only observable as the
+    model the next turn starts on.
+    """
+    state, client = _runner_state(tmp_path)
+    client.available_models = MagicMock(return_value=[{"modelId": n} for n in ADVERTISED])
+    client.served_model = serves
+    client.context_used_tokens = MagicMock(return_value=used)
+    # 0 is "this provider reports no window", which is what falls back to the
+    # registry. A test with a live reading passes its own.
+    client.context_window_tokens = MagicMock(return_value=served_window)
+    # What the provider VOUCHES for: False means a 0 reading is a real empty
+    # history rather than one nothing has measured.
+    client.context_usage_unknown = MagicMock(return_value=usage_unknown)
+    state.sessions.effective_autocompact_pct = MagicMock(return_value=limit)
+
+    async def _set_model(name: str) -> None:
+        client.served_model = name
+
+    client.set_model = AsyncMock(side_effect=_set_model)
+
+    async def _stream(*_args, **_kwargs):
+        yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="an answer")
+        yield LLMEvent(kind=EVENT_COMPLETE, stop_reason="end_turn")
+
+    client.stream = MagicMock(side_effect=lambda *a, **k: _stream())
+    return state, client
+
+
+async def _turn(state, slot, message: str = "please rename this variable") -> None:
+    with _quiet_sel():
+        await chat_runner._run_chat(state, slot, message, _directive_user_origin=True)
+    await _settle(slot)
+
+
+def _crew_log_calls(monkeypatch) -> list[str]:
+    """Record which turn-level crew-log entries a turn writes, in order.
+
+    The real writers still run: what is under test is WHICH of them a refusing gate
+    reaches, and the log is append-only, so the order is the contract.
+    """
+    seen: list[str] = []
+
+    def _spy(name: str) -> None:
+        real = getattr(chat_runner.crew_log_emit, name)
+
+        def _wrapped(*args, **kwargs):
+            seen.append(name)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(chat_runner.crew_log_emit, name, _wrapped)
+
+    for name in ("on_message_received", "on_turn_refused", "on_turn_started"):
+        _spy(name)
+    return seen
+
+
+def _refusals(tmp_path) -> list[dict]:
+    return [row for row in _rows(tmp_path) if row.get("error") == mr.ERROR_WINDOW_REFUSED]
+
+
+class TestALowAnswerDoesNotShrinkTheWindow:
+    @pytest.mark.asyncio
+    async def test_a_low_probability_downgrade_lands_on_the_medium_pin(
+        self, tmp_path, answered, windows
+    ):
+        """One gear up rather than at the top: a probability under the floor says the
+        tier is not settled, not that the turn is hard."""
+        answered("simple", 0.41)
+        slot = _routed_slot("chat-window-1")
+        state, client = _wired(tmp_path, serves="model-c")
+        await _turn(state, slot)
+
+        assert _switched_to(client) == ["model-b"]
+        row = _refusals(tmp_path)[0]
+        assert row["tier"] == "simple"
+        assert row["p"] == 0.41
+        assert "model_used" not in row and "applied" not in row
+
+    @pytest.mark.asyncio
+    async def test_the_same_downgrade_applies_when_the_answer_carries_it(
+        self, tmp_path, answered, windows
+    ):
+        """MUTATION -- the probability. A hook refusing every downgrade passes the
+        test above and fails this one: at the floor the tier IS applied."""
+        answered("simple", 0.86)
+        slot = _routed_slot("chat-window-2")
+        state, client = _wired(tmp_path, serves="model-c")
+        await _turn(state, slot)
+
+        assert _switched_to(client) == ["model-a"]
+        assert _refusals(tmp_path) == []
+
+    @pytest.mark.asyncio
+    async def test_the_same_window_is_not_a_downgrade(self, tmp_path, answered, windows):
+        """Room that does not shrink changes nothing about what fits, so the
+        probability is not asked to carry the move."""
+        answered("complex", 0.41)
+        slot = _routed_slot("chat-window-3")
+        state, client = _wired(tmp_path, serves="model-b")
+        await _turn(state, slot, "redesign the scheduler")
+
+        assert _switched_to(client) == ["model-c"]
+        assert _refusals(tmp_path) == []
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_window_refuses_nothing(self, tmp_path, answered, windows):
+        """Refusing on an unknown window would make routing inert on exactly the
+        models nothing is known about."""
+        answered("simple", 0.41)
+        del windows["model-a"]
+        slot = _routed_slot("chat-window-4")
+        state, client = _wired(tmp_path, serves="model-c")
+        await _turn(state, slot)
+
+        assert _switched_to(client) == ["model-a"]
+        assert _refusals(tmp_path) == []
+
+
+class TestAHistoryThatWouldNotFit:
+    @pytest.mark.asyncio
+    async def test_a_confident_downgrade_is_refused_when_the_history_would_not_fit(
+        self, tmp_path, answered, windows
+    ):
+        """The meter is a percentage of the SERVED window: 150k tokens sit at 15% of
+        the large one and at 75% of the small one, above this session's compaction
+        threshold. That turn would end by handing the backend a history it replaces
+        with a summary, and no later switch back recovers it."""
+        answered("simple", 0.95)
+        slot = _routed_slot("chat-fit-1")
+        state, client = _wired(tmp_path, serves="model-c", used=150_000, limit=70.0)
+        await _turn(state, slot)
+
+        assert _switched_to(client) == ["model-b"]
+        assert _refusals(tmp_path)[0]["p"] == 0.95
+
+    @pytest.mark.asyncio
+    async def test_a_history_that_fits_is_applied(self, tmp_path, answered, windows):
+        """MUTATION -- the reading. A hook refusing every confident downgrade passes
+        the test above and fails this one."""
+        answered("simple", 0.95)
+        slot = _routed_slot("chat-fit-2")
+        state, client = _wired(tmp_path, serves="model-c", used=10_000, limit=70.0)
+        await _turn(state, slot)
+
+        assert _switched_to(client) == ["model-a"]
+        assert _refusals(tmp_path) == []
+
+    @pytest.mark.asyncio
+    async def test_a_large_message_over_a_small_history_is_refused(
+        self, tmp_path, answered, windows
+    ):
+        """The meter answers for the history the session ALREADY holds. 100k held is
+        50% of the 200k target and clears the threshold on its own; the 200k-character
+        message this turn sends is another ~50k tokens, and the turn would end at 75%
+        -- the compaction these rules exist to prevent. A fit test taken on the meter
+        alone passes exactly that turn."""
+        answered("simple", 0.95)
+        slot = _routed_slot("chat-fit-prompt")
+        state, client = _wired(tmp_path, serves="model-c", used=100_000, limit=70.0)
+        await _turn(state, slot, "x" * 200_000)
+
+        assert _switched_to(client) == ["model-b"]
+        assert _refusals(tmp_path)[0]["p"] == 0.95
+
+
+class TestTheFitReadingSizesTheAssembledPrompt:
+    def test_the_rule_sizes_the_prompt_it_is_given(self, windows):
+        """100k held is 50% of the 200k target and clears on its own. A short prompt
+        keeps it there; the assembled one that a long session actually sends pushes the
+        END of the turn over the threshold, which is what the rule is for."""
+        client = MagicMock()
+        client.context_window_tokens = MagicMock(return_value=1_000_000)
+        client.context_used_tokens = MagicMock(return_value=100_000)
+        client.context_usage_unknown = MagicMock(return_value=False)
+        state = MagicMock()
+        state.sessions.effective_autocompact_pct = MagicMock(return_value=70.0)
+        sized = dict(current_window=1_000_000, target="model-a", p=0.95)
+
+        assert (
+            chat_runner._jev_downgrade_refused(
+                state, client, "chat-1", mr, prompt="please rename this", **sized
+            )
+            is False
+        )
+        assert (
+            chat_runner._jev_downgrade_refused(
+                state, client, "chat-1", mr, prompt="x" * 200_000, **sized
+            )
+            is True
+        )
+
+    def test_both_threshold_readers_in_a_turn_adopt_a_published_change(self, monkeypatch):
+        """The end-of-turn ladder adopts a newly published threshold before it reads,
+        and the fit rule reads the same threshold BEFORE the turn. A read that skipped
+        the sync would measure one turn against two different numbers, and the rule
+        would clear a shrink the ladder then compacts on. Asked of the ANSWER each
+        reader gives, so a reader that stops syncing fails here."""
+        from kiro_crew import session as session_mod
+        from kiro_crew.session import SessionManager
+
+        monkeypatch.setattr(session_mod, "published_autocompact_pct", lambda: 55.0)
+
+        def _owner():
+            """A manager holding a STALE threshold, and a delegate that reports it."""
+            held = SimpleNamespace(
+                _adopted_autocompact_pct=70.0,
+                _cfg=SimpleNamespace(session=SimpleNamespace(autocompact_pct=70.0)),
+            )
+            held._compaction = SimpleNamespace(
+                effective_autocompact_pct=lambda _key: held._cfg.session.autocompact_pct,
+                _compaction_gate_decision=lambda _k, _p, _pct: held._cfg.session.autocompact_pct,
+            )
+            # The real sync, so what is under test is the reader's call to it.
+            held._sync_autocompact_pct = lambda: SessionManager._sync_autocompact_pct(held)
+            return held
+
+        assert SessionManager.effective_autocompact_pct(_owner(), "chat-1") == 55.0
+        assert (
+            SessionManager._compaction_gate_decision(_owner(), "chat-1", MagicMock(), 99.0) == 55.0
+        )
+
+    def test_an_unmeasurable_reading_refuses_and_a_vouched_for_zero_does_not(self, windows):
+        """The guard PERMITS only on a reading that confirms the target holds this turn.
+
+        A meter the provider itself calls unknown is the post-compaction and resumed
+        state -- the history is real and unread -- so nothing confirms it and the turn
+        keeps its window. A 0 the provider vouches for is a KNOWN small history, so a
+        fresh session still downgrades: the two readings are identical on the wire and
+        only this flag tells them apart."""
+        state = MagicMock()
+        state.sessions.effective_autocompact_pct = MagicMock(return_value=70.0)
+        sized = dict(current_window=1_000_000, target="model-a", p=0.95)
+
+        def _client(unknown: bool):
+            client = MagicMock()
+            client.context_window_tokens = MagicMock(return_value=1_000_000)
+            client.context_used_tokens = MagicMock(return_value=0)
+            client.context_usage_unknown = MagicMock(return_value=unknown)
+            return client
+
+        assert (
+            chat_runner._jev_downgrade_refused(
+                state, _client(True), "chat-1", mr, prompt="please rename this", **sized
+            )
+            is True
+        )
+        assert (
+            chat_runner._jev_downgrade_refused(
+                state, _client(False), "chat-1", mr, prompt="please rename this", **sized
+            )
+            is False
+        )
+
+    def test_a_reading_that_cannot_be_reached_refuses(self, windows):
+        """A provider with no meter confirms nothing either, and a rule that permits
+        only on a confirmation has to treat that the same way."""
+        client = MagicMock()
+        client.context_window_tokens = MagicMock(return_value=1_000_000)
+        client.context_usage_unknown = MagicMock(side_effect=AttributeError("no meter"))
+        state = MagicMock()
+        state.sessions.effective_autocompact_pct = MagicMock(return_value=70.0)
+
+        assert (
+            chat_runner._jev_downgrade_refused(
+                state,
+                client,
+                "chat-1",
+                mr,
+                current_window=1_000_000,
+                target="model-a",
+                p=0.95,
+                prompt="please rename this",
+            )
+            is True
+        )
+
+    def test_a_prompt_that_alone_will_not_fit_is_refused_on_a_fresh_session(self, windows):
+        """An unmeasured meter says nothing about the HISTORY and nothing about the
+        prompt, which is in hand either way. Exempting the unmeasured case would exempt
+        exactly the prompt that fills the small window on its own."""
+        client = MagicMock()
+        client.context_window_tokens = MagicMock(return_value=1_000_000)
+        client.context_used_tokens = MagicMock(return_value=0)
+        client.context_usage_unknown = MagicMock(return_value=False)
+        state = MagicMock()
+        state.sessions.effective_autocompact_pct = MagicMock(return_value=70.0)
+        sized = dict(current_window=1_000_000, target="model-a", p=0.95)
+
+        assert (
+            chat_runner._jev_downgrade_refused(
+                state, client, "chat-1", mr, prompt="please rename this", **sized
+            )
+            is False
+        )
+        assert (
+            chat_runner._jev_downgrade_refused(
+                state, client, "chat-1", mr, prompt="x" * 600_000, **sized
+            )
+            is True
+        )
+
+    def test_a_token_dense_prompt_of_the_same_length_is_refused(self, windows):
+        """Same character COUNT, different token count. The rule sizes tokens, so a CJK
+        prompt that fills the small window is refused where Latin text of that length
+        sits well inside it -- the estimate the rule is handed has to say so, or the
+        shrink is cleared on ordinary input."""
+        client = MagicMock()
+        client.context_window_tokens = MagicMock(return_value=1_000_000)
+        client.context_used_tokens = MagicMock(return_value=0)
+        client.context_usage_unknown = MagicMock(return_value=False)
+        state = MagicMock()
+        state.sessions.effective_autocompact_pct = MagicMock(return_value=70.0)
+        # ``model-a`` is 200k and the threshold is 70%, so the bar is 140k tokens.
+        sized = dict(current_window=1_000_000, target="model-a", p=0.95)
+
+        assert (
+            chat_runner._jev_downgrade_refused(
+                state, client, "chat-1", mr, prompt="x" * 150_000, **sized
+            )
+            is False
+        ), "37.5k tokens of Latin text fits"
+        assert (
+            chat_runner._jev_downgrade_refused(
+                state, client, "chat-1", mr, prompt="\u4ea4" * 150_000, **sized
+            )
+            is True
+        ), "150k tokens of CJK does not"
+
+    def test_the_hook_is_handed_the_prompt_the_turn_sends(self):
+        """Two texts reach this hook and only one of them is what the turn sends. The
+        person's words are what the tier is classified from; ``full_message`` carries
+        the request prefix, the replayed history and the hook context. A call site
+        handing the typed text to both reads as correct and undercounts every injected
+        prefix, so the pair is asserted here rather than left to two variable names."""
+        import inspect
+
+        packed = "".join(inspect.getsource(chat_runner._run_chat).split())
+        assert "state,slot,client,_jev_route_text,session_key,prompt=full_message" in packed
+
+
+class TestTheWindowTheSwitchActuallyLandedOn:
+    @pytest.mark.asyncio
+    async def test_a_substituted_served_model_is_put_back(self, tmp_path, answered, windows):
+        """The rules size the id that was ASKED for. A backend answering a tier-policy
+        substitution leaves the turn on a different model, and its id can still read as
+        the requested one -- only the meter, rebased to what serves, says otherwise. So
+        the turn is put back on the window it had rather than streaming into one the
+        rules never authorised.
+
+        `model-b` passes the pre-switch rules (1M, same as the session) and serves 200k
+        once switched, with 150k held: 75% of the small window, over this session's
+        threshold."""
+        served_windows = {"model-c": 1_000_000, "model-b": 200_000}
+        answered("medium", 0.95)
+        slot = _routed_slot("chat-served-substitution")
+        state, client = _wired(tmp_path, serves="model-c", used=150_000, limit=70.0)
+        client.context_window_tokens = MagicMock(
+            side_effect=lambda: served_windows.get(client.served_model, 1_000_000)
+        )
+        await _turn(state, slot)
+
+        assert _switched_to(client) == ["model-b", "model-c"], "the room goes back"
+        assert client.served_model == "model-c"
+        row = _refusals(tmp_path)[0]
+        assert row["tier"] == "medium"
+        assert "applied" not in row and "model_used" not in row
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_with_nothing_to_go_back_to_does_not_send_the_turn(
+        self, tmp_path, answered, windows, monkeypatch
+    ):
+        """A refusal is only carried out once the turn is OFF the rejected window, and
+        a session the backend named no model for has no id to ask for: the restore is
+        the same no-op every unexpressable restore is. So the turn is dropped instead,
+        because the harm the rules exist for is in the SENDING -- the meter is a
+        percentage of the served window, and this turn would end by handing the backend
+        a history it replaces with a summary."""
+        served_windows = {"": 1_000_000, "model-b": 200_000}
+        answered("medium", 0.95)
+        slot = _routed_slot("chat-no-way-back")
+        state, client = _wired(tmp_path, serves="", used=150_000, limit=70.0)
+        client.context_window_tokens = MagicMock(
+            side_effect=lambda: served_windows.get(client.served_model, 1_000_000)
+        )
+        entries = _crew_log_calls(monkeypatch)
+        await _turn(state, slot)
+
+        assert client.stream.call_count == 0, "the turn is not sent"
+        assert _switched_to(client) == ["model-b"], "nothing to ask the provider for"
+        assert _refusals(tmp_path)[0]["tier"] == "medium"
+        assert any(
+            row.get("role") == "notice" and "not sent" in row.get("content", "")
+            for row in slot.messages
+        ), "the owner is told, and told what to do"
+        # The append-only log carries the accepted input BEFORE the refusal, and no
+        # ``turn/started`` -- that entry asserts the turn ran. A gate that returned
+        # above the normal emit block without this pair would leave the input with no
+        # entry at all, and nothing later supplies it.
+        assert entries == ["on_message_received", "on_turn_refused"]
+
+    @pytest.mark.asyncio
+    async def test_a_served_window_that_holds_is_left_alone(self, tmp_path, answered, windows):
+        """MUTATION -- the re-check. A hook that put every switch back passes the test
+        above and fails this one: when the served window is the one that was asked for,
+        the turn stays on it and the receipt is written."""
+        answered("medium", 0.95)
+        slot = _routed_slot("chat-served-holds")
+        state, client = _wired(
+            tmp_path, serves="model-c", used=150_000, limit=70.0, served_window=1_000_000
+        )
+        await _turn(state, slot)
+
+        assert _switched_to(client) == ["model-b"]
+        assert _refusals(tmp_path) == []
+
+
+class TestAnUnmeasurableReadingKeepsTheWindow:
+    @pytest.mark.asyncio
+    async def test_a_downgrade_is_refused_while_the_meter_is_unknown(
+        self, tmp_path, answered, windows
+    ):
+        """A resumed session's history is real and unread, so a confident tier is still
+        refused and the turn lands one gear up rather than shrinking on a reading nobody
+        has."""
+        answered("simple", 0.95)
+        slot = _routed_slot("chat-usage-unknown")
+        state, client = _wired(tmp_path, serves="model-c", used=0, usage_unknown=True)
+        await _turn(state, slot)
+
+        assert _switched_to(client) == ["model-b"]
+        assert _refusals(tmp_path)[0]["p"] == 0.95
+
+
+class TestWhereARefusedTurnLands:
+    @pytest.mark.asyncio
+    async def test_an_unpinned_medium_lands_on_the_pre_route_baseline(
+        self, tmp_path, answered, windows, monkeypatch
+    ):
+        """Two turns. Turn one moves the session off the owner's model; turn two's
+        refused downgrade goes back to it rather than staying on turn one's pick."""
+        monkeypatch.setattr(
+            gate_mod,
+            "_snapshot",
+            lambda: SimpleNamespace(
+                decisions=DecisionsConfig(
+                    model_route={"simple": "model-a", "medium": "", "complex": "model-c"}
+                )
+            ),
+        )
+        slot = _routed_slot("chat-land-1")
+        state, client = _wired(tmp_path, serves="model-b")
+
+        answered("complex", 0.90)
+        await _turn(state, slot, "redesign the scheduler")
+        assert client.served_model == "model-c"
+
+        answered("simple", 0.41)
+        await _turn(state, slot)
+
+        assert _switched_to(client) == ["model-c", "model-b"]
+        assert client.served_model == "model-b"
+        assert len(_refusals(tmp_path)) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_landing_smaller_than_the_captured_model_is_not_undone(
+        self, tmp_path, answered, windows, monkeypatch
+    ):
+        """MUTATION -- the re-check's scope. The landing IS smaller than the model the
+        session was captured on, which is the whole point of going back to it: the
+        owner's own 200k model. A re-check that judged the landing rather than a
+        backend substitution refuses it for exactly that and puts the session back on
+        the pin it was captured by, every turn, forever."""
+        monkeypatch.setattr(
+            gate_mod,
+            "_snapshot",
+            lambda: SimpleNamespace(
+                decisions=DecisionsConfig(
+                    model_route={"simple": "model-a", "medium": "", "complex": "model-c"}
+                )
+            ),
+        )
+        slot = _routed_slot("chat-land-small")
+        state, client = _wired(tmp_path, serves="model-a")
+
+        answered("complex", 0.90)
+        await _turn(state, slot, "redesign the scheduler")
+        assert client.served_model == "model-c", "the 1M pin captures the session"
+
+        answered("simple", 0.41)
+        await _turn(state, slot)
+
+        assert _switched_to(client) == ["model-c", "model-a"], "the landing stands"
+        assert client.served_model == "model-a"
+        assert len(_refusals(tmp_path)) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_landing_switch_that_raises_still_sends_the_turn(
+        self, tmp_path, answered, windows, monkeypatch
+    ):
+        """A refusal whose LANDING cannot be reached leaves the turn on the model it
+        started on -- a window these rules read and accepted -- so it runs. Only a
+        failed RESTORE leaves the turn on the window that was refused."""
+        monkeypatch.setattr(
+            gate_mod,
+            "_snapshot",
+            lambda: SimpleNamespace(
+                decisions=DecisionsConfig(
+                    model_route={"simple": "model-a", "medium": "", "complex": "model-c"}
+                )
+            ),
+        )
+        slot = _routed_slot("chat-land-raises")
+        state, client = _wired(tmp_path, serves="model-a")
+
+        answered("complex", 0.90)
+        await _turn(state, slot, "redesign the scheduler")
+        assert client.served_model == "model-c"
+
+        _landed = getattr(client.set_model, "side_effect")
+
+        async def _refuse_the_landing(name: str) -> None:
+            if name == "model-a":
+                raise RuntimeError("the provider will not take it")
+            await _landed(name)
+
+        client.set_model = AsyncMock(side_effect=_refuse_the_landing)
+        client.stream.reset_mock()
+        answered("simple", 0.41)
+        await _turn(state, slot)
+
+        assert client.stream.call_count == 1, "the turn is sent"
+        assert client.served_model == "model-c", "left where it was"
+        assert len(_refusals(tmp_path)) == 1
+        assert not any(
+            "not sent" in row.get("content", "") for row in slot.messages
+        ), "nothing was dropped"
+
+
+class TestRestoringContextADroppedTurnDrained:
+    """A turn the window rules refuse is not sent, and its prompt was assembled from
+    a ONE-SHOT queue nothing persists -- so the entries go back. What goes back has
+    to survive whatever arrived while that turn ran."""
+
+    @staticmethod
+    def _slot_with(entries):
+        slot = _slot("chat-restore-1")
+        for entry in entries:
+            slot._pending_context.append(entry)
+        return slot
+
+    @staticmethod
+    def _note(name: str, **extra):
+        return {"content": name, "source": "app", **extra}
+
+    def test_restored_entries_go_ahead_of_what_arrived_during_the_turn(self):
+        """They are OLDER, so they belong in front -- a reader of the queue takes its
+        order as the order the material was produced in."""
+        slot = self._slot_with([self._note("arrived while the turn ran")])
+        slot.restore_pending_context([self._note("drained"), self._note("drained too")])
+
+        assert [e["content"] for e in slot._pending_context] == [
+            "drained",
+            "drained too",
+            "arrived while the turn ran",
+        ]
+
+    def test_a_full_queue_keeps_the_newest_and_never_drops_a_new_arrival_first(self):
+        """MUTATION -- one append per entry. That writer evicts the OLDEST once per
+        call, and by restore time the oldest is the new arrival this exists to keep,
+        so a per-entry restore deletes exactly what a combined cap preserves."""
+        from kiro_crew.dashboard.state import _MAX_PENDING_CONTEXT
+
+        fresh = self._note("arrived while the turn ran")
+        slot = self._slot_with([fresh])
+        slot.restore_pending_context([self._note(f"drained-{i}") for i in range(200)])
+
+        held = [e["content"] for e in slot._pending_context]
+        assert len(held) == _MAX_PENDING_CONTEXT, "the cap is applied once, to the whole"
+        assert "arrived while the turn ran" in held, "the new arrival is not evicted"
+        assert held[-1] == "arrived while the turn ran", "and it is still the newest"
+
+    def test_an_entry_that_expired_while_the_turn_ran_is_not_put_back(self):
+        """The drain discards expired entries, so a restore that resurrected them
+        would put back material the queue had already let go."""
+        slot = self._slot_with([])
+        slot.restore_pending_context(
+            [self._note("stale", ts=0.0, maxAge=1), self._note("still good")]
+        )
+
+        assert [e["content"] for e in slot._pending_context] == ["still good"]
+
+    def test_restoring_nothing_leaves_the_queue_alone(self):
+        """The common case: a refused turn that drained an empty queue."""
+        slot = self._slot_with([self._note("arrived while the turn ran")])
+        slot.restore_pending_context([])
+
+        assert [e["content"] for e in slot._pending_context] == ["arrived while the turn ran"]
+
+
+class TestARefusalNothingActedOn:
+    @pytest.mark.asyncio
+    async def test_a_pick_landing_during_the_await_leaves_no_refusal_row(
+        self, tmp_path, windows, monkeypatch
+    ):
+        """The locked re-pick guard drops the whole answer, and the rows are durable
+        and never rewritten -- so a refusal recorded before that guard describes a
+        decision nothing acted on and nobody can clear. Driven through the oracle,
+        which is the only place inside the await window."""
+        import kiro_crew.decisions.impl_jev as impl_mod
+
+        slot = _routed_slot("chat-repick-refused")
+        state, client = _wired(tmp_path, serves="model-c")
+
+        class _PickingOracle:
+            async def ask(self, _state, questions):
+                slot.served_model = "model-a"
+                return {q.id: Answer(id=q.id, value="simple", p=0.41) for q in questions}
+
+        monkeypatch.setattr(impl_mod, "JevOracle", lambda provider: _PickingOracle())
+        await _turn(state, slot)
+
+        assert _switched_to(client) == []
+        assert _refusals(tmp_path) == []
+
+    @pytest.mark.asyncio
+    async def test_an_empty_landing_writes_no_row_when_a_pick_landed(
+        self, tmp_path, answered, windows, monkeypatch
+    ):
+        """The exit with NOWHERE to land returns before the locks, so the in-lock guard
+        never runs for it. Without its own reading of the premise that exit persists a
+        routed answer a pick has already superseded, and the row is durable."""
+        monkeypatch.setattr(
+            gate_mod,
+            "_snapshot",
+            lambda: SimpleNamespace(
+                decisions=DecisionsConfig(
+                    model_route={"simple": "model-a", "medium": "", "complex": "model-c"}
+                )
+            ),
+        )
+        import kiro_crew.decisions.impl_jev as impl_mod
+
+        slot = _routed_slot("chat-empty-landing-repick")
+        state, client = _wired(tmp_path, serves="model-c")
+
+        class _PickingOracle:
+            async def ask(self, _state, questions):
+                slot.served_model = "model-b"
+                return {q.id: Answer(id=q.id, value="simple", p=0.41) for q in questions}
+
+        monkeypatch.setattr(impl_mod, "JevOracle", lambda provider: _PickingOracle())
+        await _turn(state, slot)
+
+        assert _switched_to(client) == []
+        assert _refusals(tmp_path) == []
+
+
+class TestARefusalUnderTheFallbackLadder:
+    @pytest.mark.asyncio
+    async def test_a_refused_pin_never_attempts_the_failed_primary(
+        self, tmp_path, answered, windows, monkeypatch
+    ):
+        """While the ladder holds the session the baseline NAMES the primary it walked
+        away from, and the restore target is zeroed for exactly that reason. The
+        landing reads that zeroed value, so a refused pin with no usable medium keeps
+        the substitute rather than asking for the model that just failed.
+
+        The primary is still refused here, which is what keeps the fallback active
+        across the turn: the probe's own attempt is the ONE call that belongs to the
+        primary, and a second would be the routing hook's."""
+        monkeypatch.setattr(
+            gate_mod,
+            "_snapshot",
+            lambda: SimpleNamespace(
+                decisions=DecisionsConfig(
+                    model_route={"simple": "model-a", "medium": "", "complex": "model-c"}
+                )
+            ),
+        )
+        answered("simple", 0.41)
+        slot = _routed_slot("chat-fallback-refused")
+        slot._active_fallback_model = "model-c"
+        slot._fallback_primary_model = "model-b"
+        state, client = _wired(tmp_path, serves="model-c")
+
+        async def _refuse_the_primary(name: str) -> None:
+            if name == "model-b":
+                raise RuntimeError("the primary is still throttled")
+            client.served_model = name
+
+        client.set_model = AsyncMock(side_effect=_refuse_the_primary)
+        await _turn(state, slot)
+
+        assert _switched_to(client) == ["model-b"], "the routing hook must attempt nothing"
+        assert client.served_model == "model-c", "the ladder keeps its substitute"
+        assert len(_refusals(tmp_path)) == 1
+
+
+class TestTheWindowTheSessionIsServedOn:
+    @pytest.mark.asyncio
+    async def test_a_registry_entry_that_lags_the_served_window_still_refuses(
+        self, tmp_path, answered, windows
+    ):
+        """The meter's percentage is denominated in the SERVED window. With the
+        registry naming 200k for the current model and the provider reporting 1M, the
+        registry alone reads the move to a 200k target as no shrink at all -- and the
+        150k transcript would then be compacted at the end of that turn."""
+        answered("simple", 0.95)
+        windows["model-c"] = 200_000
+        slot = _routed_slot("chat-served-window")
+        state, client = _wired(
+            tmp_path, serves="model-c", used=150_000, limit=70.0, served_window=1_000_000
+        )
+        await _turn(state, slot)
+
+        assert _switched_to(client) == ["model-b"]
+        assert _refusals(tmp_path)[0]["p"] == 0.95
+
+    @pytest.mark.asyncio
+    async def test_the_landing_is_sized_by_the_same_reading_the_rules_refused_on(
+        self, tmp_path, answered, windows
+    ):
+        """One reading, or the refusal hands the turn the window it just refused.
+
+        The registry reads 200k for every id here while the provider serves 1M. Sized
+        by the registry the medium pin looks like no shrink at all, so a refused tier
+        would land on the very 200k window the fit rule computed as over this
+        session's threshold -- and the row would say refused for a shrink that
+        happened."""
+        answered("simple", 0.95)
+        windows["model-b"] = 200_000
+        windows["model-c"] = 200_000
+        slot = _routed_slot("chat-one-reading")
+        state, client = _wired(
+            tmp_path, serves="model-c", used=150_000, limit=70.0, served_window=1_000_000
+        )
+        await _turn(state, slot)
+
+        assert _switched_to(client) == [], "the medium pin is the refused window"
+        assert len(_refusals(tmp_path)) == 1
