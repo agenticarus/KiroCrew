@@ -212,7 +212,10 @@ review-ready work; only explicit ship intent permits prepare-pr's auto-merge pat
 
 Keep scratch, PR bodies, logs and QA media under `$KIROCREW_SCRATCH`, not the
 worktree. Capture scripts' gitignored `temp-screenshots/` is also permitted;
-evidence is uploaded as attachments, never committed. Before ending:
+evidence is uploaded as attachments, never committed — with write access, which
+this agent has. (A fork contributor, whose `--attach` upload GitHub refuses, may
+instead `git add -f` the media there; see prepare-pr's *Screenshots*.) Before
+ending:
 
 ```bash
 git status --porcelain

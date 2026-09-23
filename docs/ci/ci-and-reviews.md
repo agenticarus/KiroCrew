@@ -1723,7 +1723,8 @@ It runs only when the diff touches `website/`, `temp-screenshots/**` or
 `.github/screenshots/**` (the last two are gitignored, so in practice `website/` is the
 trigger). A backend, CI or docs PR skips it with no model call and no comment churn,
 and the check passes. Review evidence is uploaded as a GitHub attachment, not
-committed: the author writes local paths in the PR body and runs
+committed -- except by a fork contributor, whom the upload endpoint refuses (see the
+fork lane below): the author writes local paths in the PR body and runs
 `gh pr create|edit --attach <path>`, which rewrites each into a permanent
 `https://github.com/user-attachments/assets/...` URL (dragging the file into the
 description in the web UI yields the same URL). The lane reads the body from the API when
@@ -1857,15 +1858,36 @@ description from the API and downloads the allowlisted `user-attachments` URLs o
 the runner (the job's egress allowlist names the two hosts a download touches,
 `github.com` and the `github-production-user-asset-6210df.s3.amazonaws.com` bucket
 its 302 points at), so the reviewer
-opens the same images a same-repo review would. An image a fork PR *commits* is not
-on disk -- the fork head is never checked out -- so a control shown only there is an
-evidence gap, which is a `BLOCK` (`cannot evaluate`) the author closes by attaching
-the image to the description. A control the attachments *do* show but no blind
-reader has read caps the fork PR at `CONCERNS`: that is the lane's limitation, not
-the author's gap, so it does not block. A maintainer who wants
-the blind read pushes the branch to this repository. A fork contributor without push
-access cannot run `gh --attach`; dragging the file into the PR description in the web
-UI yields the same `user-attachments` URL.
+opens the same images a same-repo review would. Media the fork PR *commits* under
+`temp-screenshots/` or `.github/screenshots/` is read too, by
+`.github/scripts/pr-committed-evidence.sh`: the blobs come out of the object store
+the authentic-diff step already fetched, typed by their bytes and copied under the
+same index names, so the fork head is still never checked out as files. That matters
+because `gh --attach` is *unavailable* to a fork contributor -- its upload endpoint
+answers read permission with a 404 ([cli/cli#14302](https://github.com/cli/cli/issues/14302))
+-- leaving them the web-UI drag and the committed path. A control no supplied
+screenshot shows is still an evidence gap, a `BLOCK` (`cannot evaluate`) the author
+closes by attaching *or* committing the image. A control the evidence *does* show but
+no blind reader has read caps the fork PR at `CONCERNS`: that is the lane's
+limitation, not the author's gap, so it does not block. A maintainer who wants the
+blind read pushes the branch to this repository.
+
+**What happens to committed evidence at merge.** It merges. The squash lands the
+`temp-screenshots/` files on `main` as tracked files (the ignore rule stops mattering
+once a path is tracked) and their blobs in history, and it never does so silently:
+they are in the diff the maintainer merges. The merging maintainer then removes them
+from the tip in a follow-up `chore(evidence): drop the committed review media of #<n>`
+PR (`git rm -r temp-screenshots/<topic>`), so review media does not accumulate on
+`main` the way it did before the sweep that emptied the directory. That removal is
+the reversible half. The blobs are the irreversible half: a deletion commit leaves
+them in every clone's pack, and only a history rewrite -- which that sweep deferred to
+a separate, maintainer-approved change -- takes them out. This cost is accepted
+because it is bounded: fork PRs are the minority, `pr-committed-evidence.sh` refuses a
+file over its size ceiling, and the guidance asks for two or three shots. The
+evidence stays readable at the squash commit
+(`https://github.com/<owner>/<repo>/blob/<sha>/temp-screenshots/...`) after the
+removal, so the removal PR names that SHA. The why lives with the rule it excepts, in
+prepare-pr's `references/rationale.md`.
 
 The PR identity (number, repository, shas, data-file paths) is passed to both passes
 in `--append-system-prompt`, not in `prompt:`. GitHub rejects a workflow file

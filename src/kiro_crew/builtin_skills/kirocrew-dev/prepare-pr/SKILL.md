@@ -675,7 +675,7 @@ absent. Phase 1.5 checks them against the diff.
 4. **Backwards compatibility** — `Compatible:` or `Breaking:`. A diff that tightens a contract (new required field, a validator that raises on input the base accepts, narrowed type, removed kind, renamed key) cannot be `Compatible:`; it takes `Breaking:` plus a writer sweep re-run on FRESH `origin/<base>` before the final push, with that sha in the body.
 5. **Tests** — what was added/updated and what each locks in.
 6. **Manual verification** — steps done/needed, or "N/A — unit coverage sufficient" with a one-line why.
-7. **Screenshots / video — MANDATORY for any user-visible UI change**, uploaded as GitHub attachments with `gh ... --attach`, never committed. See below.
+7. **Screenshots / video — MANDATORY for any user-visible UI change**, uploaded as GitHub attachments with `gh ... --attach`, never committed, bar one scoped exception. See below.
 8. **Issue link** — a real closing keyword. See below.
 
 Omit a section only when truly not applicable, and say so.
@@ -734,7 +734,9 @@ vs populated), **by looking at the change yourself** via the `web-verify` skill 
 PR's evidence is then the same evidence you used to verify.
 
 Evidence is **uploaded as a GitHub attachment, never committed** — no path in the
-repository is a place for review media (why: `references/rationale.md`).
+repository is a place for review media (why: `references/rationale.md`). The one
+exception is a contributor with no write access, whose upload GitHub refuses; the
+last bullet below is their path.
 
 - **Capture into a local scratch dir** — `$KIROCREW_SCRATCH/evidence/`, or the gitignored `temp-screenshots/<feature>/` the capture scripts already write to. Neither reaches the commit.
 - **Write ordinary local paths in the body file**, relative to the directory you run `gh` from: `![Settings page, empty state](./evidence/after.png)`. A video MUST stand alone in its own paragraph — `![](./evidence/demo.mp4)` with a blank line above and below — to render as an inline player; inside a sentence it renders as a link.
@@ -751,8 +753,8 @@ repository is a place for review media (why: `references/rationale.md`).
 - **Verify the body carries the URLs:** `gh api repos/<owner>/<repo>/pulls/<n> --jq .body | grep -c user-attachments` MUST print the number of files you attached. `0` means the body was posted without `--attach` — post it again with the flags.
 - **Nothing is ever re-pinned.** The URL is tied to no commit and no branch, so an amend, a squash, a force-push, branch deletion and the merge all leave it valid. When a later round regenerates the body, carry the published `user-attachments` URLs over verbatim; attach a fresh capture only when the pixels themselves changed.
 - **Limits and formats:** PNG, JPEG, GIF, WebP, SVG, MP4, MOV, WebM; 10 MB per image or GIF, 100 MB per video; no PDF or docx; not available on GitHub Enterprise Server.
-- **Non-media evidence is not attached with `--attach`, and not committed either.** Text -- a provenance JSON, a perf baseline, an assertion dump -- goes in a fenced code block in a PR comment (GitHub caps a comment at 65,536 characters; split a larger dump across comments, each named in the first). A document -- a PDF, a docx, a zip -- is dragged into a PR comment in the web UI, which accepts those up to 25 MB and yields a permanent `https://github.com/user-attachments/files/<id>/<name>` URL that `gh --attach` cannot produce. Either way, link the comment's permalink (`https://github.com/<owner>/<repo>/pull/<n>#issuecomment-<id>`) from a spec that cites the evidence as provenance.
-- **Push access is required.** `--attach` uploads with your normal gh token and needs push access to the target repository. A fork contributor without it drags the file into the description box in the web UI, which yields the same `user-attachments` URL; the review lanes read both alike.
+- **Non-media evidence is not attached with `--attach`, and not committed either.** Text -- a provenance JSON, a perf baseline, an assertion dump -- goes in a fenced code block in a PR comment (65,536-character cap; split a larger dump across comments, each named in the first). A document -- a PDF, a docx, a zip -- is dragged into a PR comment in the web UI, which takes those up to 25 MB and yields a permanent `https://github.com/user-attachments/files/<id>/<name>` URL that `gh --attach` cannot produce. Either way, link the comment's permalink (`https://github.com/<owner>/<repo>/pull/<n>#issuecomment-<id>`) from a spec that cites the evidence as provenance.
+- **Push access is required; without it, commit the evidence.** `--attach` uploads through an endpoint that 404s on read permission (cli/cli#14302), so a fork contributor has none. They either drag the file into the description in the web UI (same `user-attachments` URL, same limits) or `git add -f temp-screenshots/<topic>/after.png` and reference the path; the fork lanes read the committed bytes from the object store, 10 MB per file, video included; a bigger recording is dragged in, not committed. All three count as evidence. Once merged, the blob is in `main`'s history for good (the maintainer drops it from the tip); why: `references/rationale.md`.
 - Two or three most telling shots inline; fold full-page context into `<details>`.
 - The UX Review lane's blind read downloads the attachment URLs from the PR body (a committed image is still read), and the screenshot-evidence gate accepts them as evidence — the body, not the diff, is where the evidence lives.
 
