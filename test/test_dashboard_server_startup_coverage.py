@@ -427,6 +427,24 @@ async def _cancel_stray_tasks() -> None:
         await asyncio.gather(*stray, return_exceptions=True)
 
 
+def _host_has_ipv6_loopback() -> bool:
+    """Whether a plain socket can bind ``::1`` on this host (not whether the
+    Python build supports IPv6). Any failure other than "no such address" is a
+    real error and propagates."""
+    if not (socket.has_ipv6 and hasattr(socket, "IPPROTO_IPV6")):
+        return False
+    probe = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    try:
+        probe.bind(("::1", 0))
+    except OSError as exc:
+        if exc.errno != errno.EADDRNOTAVAIL:
+            raise
+        return False
+    finally:
+        probe.close()
+    return True
+
+
 class TestReserveDashboardPort:
     @staticmethod
     def _assert_kernel_confirms_listening(sock: socket.socket) -> None:
@@ -469,7 +487,11 @@ class TestReserveDashboardPort:
                 # (macOS) report the option's bitmask value, not 1.
                 assert ipv4_sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) != 0
 
-            if socket.has_ipv6 and hasattr(socket, "IPPROTO_IPV6"):
+            # ``socket.has_ipv6`` says the build supports IPv6, not that this host
+            # has a ``::1`` loopback (a hosted CI runner with IPv6 disabled does
+            # not). Probe that with a plain socket, SEPARATELY from the code under
+            # test, so a ``_bind_once`` regression on a capable host still raises.
+            if _host_has_ipv6_loopback():
                 ipv6_sock = srv._bind_once("::1", 0)
                 assert ipv6_sock.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) != 0
 
