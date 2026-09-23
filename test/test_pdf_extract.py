@@ -69,6 +69,18 @@ class TestBound:
         ``error: memory`` line and :data:`EXIT_FAILED`, not a kill and not a
         traceback -- the child survived its own refused allocation long enough to
         say what happened.
+
+        WHICH ceiling fires is the platform's and not this test's to choose, and
+        ``detail`` names it: Linux refuses the inflate through the profile's
+        ``RLIMIT_AS``, so the exception comes back up out of pdfminer, while macOS
+        accepts ``RLIMIT_AS`` and does not enforce it, leaving the child's own
+        peak-RSS watchdog. Either name is the same reported ``memory`` failure, so
+        asserting one of them on both platforms asserts an implementation detail
+        the module documents as varying. The watchdog has its own end-to-end
+        coverage on every platform in
+        ``test_the_child_polices_its_own_rss_where_the_kernel_has_no_ceiling``,
+        which is why this test reaches for neither a second ceiling nor a second
+        bomb: it takes the module-scoped one.
         """
         proc = sandbox.popen_limited(
             pdf_extract._child_argv(400_001, 10),
@@ -80,7 +92,8 @@ class TestBound:
         out, _err = proc.communicate(bomb, timeout=_FAR)
         assert proc.returncode == pdf_extract_child.EXIT_FAILED
         lines = [json.loads(line) for line in out.decode().splitlines() if line]
-        assert lines == [{"error": "memory", "detail": "PdfminerException"}]
+        expected_detail = "rss" if sys.platform == "darwin" else "PdfminerException"
+        assert lines == [{"error": "memory", "detail": expected_detail}]
 
     def test_the_extractor_profile_is_a_fixed_address_space_ceiling(self):
         spec = sandbox._rlimit_spec(sandbox.RLIMIT_PROFILE_EXTRACTOR)
