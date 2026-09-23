@@ -9225,6 +9225,36 @@ async def _run_chat(
         slot._refusal_retry_text = ""
         slot._refusal_replay_queue_id = ""
         slot._refusal_fallback_attempted = False
+    # Is this turn the empty ladder's OWN continuation? That is what makes the
+    # episode flag at the give-up rung THIS turn's evidence rather than some
+    # other episode's: a discarded continuation takes its turn with it, so no
+    # bookkeeping at the several discard sites is needed for the flag to stay
+    # honest.
+    #
+    # Identity is the queue entry's structural payload marker AND the body, the
+    # same conjunction `HOOK_CONTINUATION_RECOVERY_PREFIX` is matched with below.
+    # The marker alone is too wide -- every recovery family carries one, so a
+    # promise-only continuation would answer for this ladder. The body alone is
+    # not identity at all: these are fixed runner-authored strings a user can
+    # type or paste, and user text carries no marker.
+    #
+    # Captured HERE because `message` is re-prefixed further down (context,
+    # preamble, hook blocks), so the give-up rung cannot recognize it by then.
+    _is_empty_ladder_continuation = _synthetic_payload and message in (
+        _ACTIVITY_NO_REPLY_CONTINUE_MSG,
+        _EMPTY_AUTO_CONTINUE_MSG,
+    )
+    # Any turn that is NOT this ladder's continuation ends whatever episode was
+    # in progress, so the evidence goes now rather than being guarded later. This
+    # is what makes the flag independent of the several controls that discard a
+    # queued continuation without landing a turn (the hard-kill Stop's queue
+    # clear, a plan Cancel's owner-scoped discard, a rewind commit's rebuild):
+    # none of them resets the recovery counter, so a spent counter can still
+    # route a LATER turn into rung 2 and give it a continuation of its own --
+    # which would otherwise satisfy the identity above and collect an earlier
+    # episode's productive wording.
+    if not _is_empty_ladder_continuation:
+        slot._empty_episode_productive = False
     # tool_call_id -> DISPLAY TITLE (LLM-authored prose for shell tools; used
     # only for PostToolUse hook name-matching — NOT trustworthy for security).
     _pending_tools: dict[str, str] = {}
@@ -15748,6 +15778,7 @@ async def _run_chat(
                 _max_continues = _empty_max_auto_continues()
                 if _empty_activity.productive:
                     slot._empty_response_retries = max(slot._empty_response_retries + 1, 2)
+                    slot._empty_episode_productive = True
                 else:
                     slot._empty_response_retries += 1
                 # Ordinal of THIS continuation (1-based): the counter minus the
@@ -15815,7 +15846,9 @@ async def _run_chat(
                 # turn's continuation reaches it at two with no verbatim
                 # retry), so the non-zero clause claims only that automatic
                 # recovery was attempted.
-                if _empty_activity.productive:
+                if _empty_activity.productive or (
+                    _is_empty_ladder_continuation and slot._empty_episode_productive
+                ):
                     _empty_msg = (
                         "ℹ️ The turn ended without a closing reply. Send a "
                         "message to continue from where it stopped — completed "
@@ -16472,6 +16505,7 @@ async def _run_chat(
                 if slot._tool_stall_retries > 0 and not slot._tool_stall_exhausted_emitted:
                     _emit_recovery_outcome("tool_stall", "recovered", slot._tool_stall_retries)
             slot._empty_response_retries = 0
+            slot._empty_episode_productive = False
             slot._prompt_busy_retries = 0
             slot._acp_pipe_death_retries = 0
             slot._stale_recovery_retries = 0
