@@ -483,7 +483,7 @@ version derivation and `uses:` calls.
    `*-mac.zip`, and submits it to CDSigner with a manifest generated at sign
    time from the actual bundle contents by
    `packaging/signing/generate-manifest.py`. `packaging/signing/sign.sh` polls
-   every 30s with a 15-minute ceiling. `awscurl` is installed **before** AWS
+   every 30s with a 45-minute ceiling. `awscurl` is installed **before** AWS
    credentials are configured, so a drifted release of it can never observe the
    signing credentials.
 2. **notarize** (macos-15). `packaging/signing/notarize.sh` submits and polls
