@@ -803,6 +803,111 @@ Settings content — the built-from template, wake sources and schedules, the
 memory binding, cloud — lives only on the crew editor / detail page.
 Operator-facing memory diagnostics never render in the panel.
 
+## One-time prune of sync-generated crewmates (startup migration)
+
+Older dashboards called `POST /api/agents/sync` on every chat mount, and that
+sync enrolled every user-authored spec under `~/.kiro/agents` as a crewmate — a
+`config.agents` row with no `member_id`, on the shared `default` memory store,
+bound to the spec by name. An existing install therefore carries one crewmate
+per custom agent, most never opened. `crewmate_prune_migration.py` runs once at
+gateway startup (`start_dashboard`, after the listener binds — off the boot
+path — and before the slot restores, off-loop) and settles that without any UI
+— removal only; nothing is created or rebound:
+
+- **Candidate** = a row that is exactly what the sync wrote: its name is its
+  `kiro_agent`; that spec is on disk, user-authored (`source == "builtin"`),
+  not the runtime's own (`kirocrew_owned`) and not a crew's private copy
+  (`private_to`); and every field other than `description` is at its default
+  — no `member_id`, the `default` store, no model, effort, triggers, colour,
+  star, avatar or workspace, and no key the record does not declare
+  (`_is_fresh_sync_shape`, tested on the raw row as `config.json` holds it; a
+  missing declared key reads as its default). Both config layers are read: a
+  name that `config.local.json` mentions in its own `agents` section — a
+  `kirocrew config set --local agents.<name>.…` leaf, the capability writer's
+  overlay binding — is never a candidate, whatever the leaf says, because
+  deleting the base row would leave the overlay leaf as a crewmate bound to
+  nothing. A row the owner touched in any of those ways is the owner's and is
+  never a candidate. A hand-made crewmate has a `member_id`; a package's spec
+  has another source; a row whose spec is gone is left alone. No memory
+  directory is inspected.
+- **Chatted** = any of three: a session's metadata line names it as the
+  agent; its member activity log holds a session pointer for it (the
+  `activity/record` event `record_activity` appends once per session a chat
+  runs as that member — carrying the exact name, since slugs collide — in the
+  member event log or, on an install that has not folded it yet, the legacy
+  `activity.jsonl` / `activity.jsonl.1` in the member directory); or its DM
+  thread was opened (its binding file exists and its `member` is the row's
+  exact name — the thread route writes that file on first open). The metadata
+  `agent` is slot-owned and rewritten when the slot switches agents, so it
+  names only the last agent a session ran as; the activity record is what
+  survives a switch. All three are read strictly by the migration itself,
+  never through the roster's total-by-contract readers (`read_dm_binding`,
+  `read_activity`, `list_sessions`), which answer "absent" for a damaged
+  directory, an unreadable file or a malformed payload — a removal must not
+  mistake any of those for "never". Nothing is created or folded by the read.
+  Only a file that does not exist reads as no record; a session whose first
+  line is not a metadata record names nobody.
+- **Never chatted → removed** (`remove_never_chatted`): the row is deleted
+  through a delta mutate under the base config lock and, nested inside it, the
+  overlay's own lock, and only while the base row on disk still has the same
+  `kiro_agent` and the fresh-sync shape AND `config.local.json` still does not
+  name it. The fence is identity and shape, not equality with a default-filled
+  snapshot, so a row written by a build whose record had fewer keys is still
+  recognised. A row that changed meanwhile — or gained an overlay leaf — is
+  **refused**: a refusal is not a commit, so the pass writes no marker, logs
+  the names, and the next boot re-judges them. Only the base row moves; the
+  overlay is never written.
+- **Chatted → untouched.** A kept crewmate stays exactly as it is: on the
+  shared `default` store, with no `member_id`. A memory binding is identity and
+  is chosen only at creation; an existing member retains its exact V1 binding
+  ([memory-skills-hooks](memory-skills-hooks.md#member-memory-experience-and-lifecycle)),
+  and no startup pass rewrites it.
+- **Kept on doubt; the pass always finishes.** Evidence the pass cannot read
+  counts FOR the crewmate, never against it, and never stops the pass: a
+  candidate whose activity log or binding cannot be resolved, read or parsed
+  (a trust-root containment refusal included) is kept and listed under
+  `doubted` with the reason; one session file that cannot be statted, read or
+  parsed keeps every candidate, because it could have named any of them; no
+  conversation log keeps every candidate. The pass still completes and writes
+  the marker, so a bad file costs at most one boot's judgement and never a
+  prune that re-runs — and holds every write — on every later boot. One
+  WARNING line names the kept-on-doubt crewmates and why.
+- **Serialized.** `DashboardState.crewmate_prune_settled` is cleared BEFORE
+  the listener binds (`_register_crewmate_prune_gate`, installed next to the
+  workflow gate) and set after the pass (in `finally`). That function's
+  middleware holds every request whose method is not `GET`, `HEAD` or
+  `OPTIONS` — on any path, so the route table never has to be mirrored — until
+  the event is set (bounded at 60 s, then 503 `prune_in_progress`). Every
+  writer that can bind an agent to a session while the gateway is up is such a
+  request (chat send, slot create, slot agent switch, member thread, channel
+  add, session import under `/api/`, and `POST /v1/chat/completions`), so no
+  session can bind an agent and no DM binding can appear between the history
+  snapshot and a candidate's delete; the cron scheduler, the Slack socket and
+  the channel relaunches start only after `start_dashboard` returns, and the
+  pass completes inside it. The pass runs immediately after `_start_site`, so
+  the hold is the pass itself (one marker stat on every boot but the first),
+  never the rest of startup. The fast path is one `is_set()` read per mutating
+  request. Each candidate's check runs immediately before its own removal,
+  never once for the whole list.
+- **Marker.** A completed pass (a no-op included) writes
+  `<config dir>/crewmate_prune_migrated.json` with `{migrated_at, removed,
+  kept, doubted}` — the same marker-file seam the config loader's one-shot migrations
+  use (`connections_ui_migrated.json`); later boots return at once. One INFO
+  line records the removal: `removed N unused auto-generated crewmates:
+  <names>`.
+
+Removed rows do not come back: since #12224 the dashboard pickers read
+`GET /api/agents/catalog` and nothing calls `POST /api/agents/sync`, so the rows
+this pass removes were written by builds before that change. The sync route's
+own contract is unchanged.
+
+The RFC's original screen 03 ("a user with custom agents but no crewmates is
+offered to add them") is superseded: #12224 ended the enrol-on-mount behaviour,
+and the Crewmates page's empty state with **New crewmate** (#12924) is the path
+from a custom agent to a crewmate. What an existing user actually has is the
+opposite problem — the crewmates that sync already made — and that is what this
+migration settles.
+
 ## Selection: the `select_crew` contract
 
 Discovery importing a provider template as a configured member does not rebind
