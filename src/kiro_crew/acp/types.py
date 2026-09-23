@@ -696,10 +696,29 @@ def _command_from_tool_params(params: dict) -> str | None:
             parts.append(f"--region {region}")
         parameters = params.get("parameters")
         if isinstance(parameters, dict) and parameters:
-            try:
-                parts.append(json.dumps(parameters, sort_keys=True))
-            except (TypeError, ValueError):
-                parts.append(str(parameters))
+            # The backend chooses this shape, so the encoder can be pushed past
+            # its recursion ceiling, and ``RecursionError`` is a
+            # ``RuntimeError``: unguarded it escapes into the hook gate and the
+            # skill-read note, which read this property while the turn runs, and
+            # kills the turn. The helper carries the unencodable-value arm
+            # verbatim: a value whose repr still holds the real bytes stays
+            # scannable. Imported here rather than at module scope because
+            # ``_dispatch`` imports THIS module.
+            from kiro_crew.acp._dispatch import (
+                UNSERIALISABLE_SIBLING_VALUE,
+                _dumps_degraded,
+            )
+
+            rendered = _dumps_degraded(parameters, sort_keys=True)
+            # A refusal leaves a placeholder where the payload was, and the
+            # parameters tail is the only place a smuggled command
+            # (``ssm send-command`` and its ``commands``) appears. Returning the
+            # command without it would hand the security checks a string that
+            # reads as complete, so fail closed instead: no command means the
+            # caller's deny-by-default arm refuses the call.
+            if rendered == UNSERIALISABLE_SIBLING_VALUE:
+                return None
+            parts.append(rendered)
         positional = params.get("positional_args")
         if isinstance(positional, list) and positional:
             parts.append(" ".join(str(p) for p in positional))
