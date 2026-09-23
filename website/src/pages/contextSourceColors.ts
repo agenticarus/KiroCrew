@@ -45,3 +45,17 @@ export function sourceFill(label: string): string {
 export function sourceFg(): string {
   return 'var(--text-strong, var(--text))'
 }
+
+/**
+ * Fills for the Context Breakdown chart's five plain-language categories (see
+ * `--ctx-cat-*` in index.css). The user's message rides the accent, memory
+ * shares the source hue above so the tree and the chart agree, and the rest are
+ * category hues mixed into the surface the same way.
+ */
+export const CATEGORY_FILL: Readonly<Record<'message' | 'memory' | 'rules' | 'skills' | 'other', string>> = {
+  message: 'var(--ctx-cat-message)',
+  memory: 'var(--ctx-cat-memory)',
+  rules: 'var(--ctx-cat-rules)',
+  skills: 'var(--ctx-cat-skills)',
+  other: 'var(--ctx-cat-other)',
+}

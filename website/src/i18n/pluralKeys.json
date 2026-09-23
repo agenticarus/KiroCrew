@@ -213,5 +213,8 @@
   "pages.overview.agentTemplatesTab.crewmates_count",
   "pages.overview.agentTemplatesTab.affects_crewmates",
   "pages.overview.agentTemplatesTab.chars_count",
-  "hooks.useNativeNotification.new_notifications"
+  "hooks.useNativeNotification.new_notifications",
+  "pages.contextBreakdown.scope_turns",
+  "pages.contextBreakdown.earlier_hidden",
+  "pages.contextBreakdown.scope_all_turns"
 ]

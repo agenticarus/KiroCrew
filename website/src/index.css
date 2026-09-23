@@ -450,6 +450,15 @@ html:lang(ko) {
   --ctx-src-skillidx:color-mix(in srgb, #8f7bff 74%, var(--card));
   --ctx-src-tool:color-mix(in srgb, #b98cff 74%, var(--card));
   --ctx-src-mute:color-mix(in srgb, var(--text) 30%, var(--card));
+  /* The Context Breakdown chart stacks five plain-language categories; the
+     user's message rides the accent, memory reuses its source hue so the tree
+     and the chart agree, and rules / skills get hues of their own, mixed into
+     the surface like the sources above. */
+  --ctx-cat-message:var(--accent);
+  --ctx-cat-memory:var(--ctx-src-memory);
+  --ctx-cat-rules:color-mix(in srgb, #9266cc 74%, var(--card));
+  --ctx-cat-skills:color-mix(in srgb, #d9a12b 74%, var(--card));
+  --ctx-cat-other:var(--ctx-src-mute);
   /* Terminal ANSI hues with no semantic equivalent. The other fourteen entries
      are derived from --bg / --text / --danger / --ok / --warn / --info, which
      every theme already defines; only magenta and cyan need a value of their

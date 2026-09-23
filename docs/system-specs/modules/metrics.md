@@ -1024,25 +1024,48 @@ shard-fingerprint + 30s-TTL cache, same contract as `_parse_token_history`), and
 imports nothing from `dashboard.handlers`, so there is no cycle to dodge).
 `usage.context_trace(slot, days)` is the per-session drill-down: it returns each
 turn's `ctx_blocks` in chronological order plus per-block `totals`,
-`injected_chars`, `user_chars` (the `your_message` label) and
-`estimated_other_chars` — the un-instrumented remainder of the window: kiro-cli's
-own base prompt + tool catalogue + steering AND the conversation transcript and
-tool output accumulated over the session (occupancy is cumulative, `injected` is
-only this turn's injection). It is expressed in characters via
-`_EST_CHARS_PER_TOKEN` (≈4) and clamped to `0` when occupancy is unknown or the
-subtraction would go negative. Because it mixes fixed kiro overhead with the
-growing conversation it is surfaced as **"Not measured"** (never "Kiro built-in")
-and always tagged an estimate — it is not a claim that the bytes are Kiro's or
-unremovable. Rows
+`injected_chars`, `user_chars` (the `your_message` label), and the occupancy
+pair `peak_context_used` (largest `context_used` across the turns, in TOKENS)
+and `context_window` (newest non-zero window size), which the Session Breakdown
+tree turns into a fill ratio. Block sizes are characters and occupancy is tokens;
+the trace carries both as recorded and derives nothing across that unit
+boundary — there is no chars-per-token estimate of the un-instrumented remainder
+on the wire, because a number that mixed fixed kiro-cli overhead with the growing
+conversation had no honest reader. Rows
 predating the field carry no `ctx_blocks` and are skipped, not zero-filled, so
-the trace starts where the recording does. Each turn also carries the row's
-`credits` and `duration_ms` when the shard recorded usable numbers (same
-drop-the-field-not-the-row rule as `TURN_USAGE_FIELDS`): injection and billing
-live on the same shard row, so the trace returns both in one walk rather than
-making the panel re-join through the usage-turns reader what was never apart.
-The chat Activity panel renders them as a per-turn credits column that appears
-only when at least one traced turn carries billing — pre-recorder history stays
-three columns instead of growing an all-dash one.
+the trace starts where the recording does. Billing is not on this payload:
+`slot_turn_usage` (below) is the per-turn reader for `credits` / `duration_ms`,
+and a trace row carries only what was injected.
+
+**How the panel draws it.** The chat Activity panel's Context Breakdown tab
+(`website/src/pages/ContextBreakdownPanel.tsx`) is a **stacked-area chart of what
+each turn sent**: x = turns in order (newest right, at most the newest 30 with an
+"N earlier turns not shown" line beyond that), y = characters, five bands bottom
+to top — *your message*, *memory about you*, *rules you set*, *skill guides*,
+*everything else*. A `session_start` turn is excluded from the chart's x-series
+and y-domain and listed instead as a compact selectable row above it ("Turn 1 ·
+session start · N characters"): it is many times the size of any later turn and
+would pin a linear axis, flattening the rest. X-axis labels are strided from the
+measured plot width (`axisLabelIndices`: every k-th turn plus the selected and the
+last, minus a strided neighbour that would overprint either) so thirty turns in a
+320px side panel still read; when a per-turn hit column falls under 12px, one
+plot-wide pointer surface maps the click to the nearest turn while the per-turn
+buttons keep the keyboard and assistive-tech path. The band a block label lands in is the panel's one
+exported `CATEGORY_OF` table (`your_message`; the three memory labels;
+`lessons` / `critical_rules` / `agent_instructions` / `response_preferences`;
+`skill_index` / `skill_hint` / `loaded_skill`); every other label, including
+the every-turn members and `unclassified`, is *other*, so an unrecognised block
+is never dropped from a turn's total. Each turn is a real button laid over its
+column (arrow keys move the selection, `aria-pressed` marks it); the newest turn
+is selected by default, and the detail below the chart shows the selected turn's
+total, its delta against the previous turn (muted text, both directions), and one
+disclosure row per non-empty band that expands to the raw block labels. The
+panel reads only each turn's `phase`, `blocks` and `total_chars`; the payload
+carries neither billing nor a whole-window estimate, because a per-turn "what was
+sent" view mixed with cumulative window occupancy and billing read as one quantity
+when it was three. Fills come from the
+`--ctx-cat-*` theme tokens (`website/src/index.css`), so the bands stay legible
+in light and dark themes alike.
 `handlers/telemetry.py::api_context_trace`
 serves it as `GET /api/telemetry/context-trace?slot=<session key>` (`400` when
 `slot` is missing or blank), independent of the `telemetry.enabled` switch since
