@@ -5792,7 +5792,25 @@ async def api_file_diff(request: web.Request) -> web.Response:
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError, UnicodeDecodeError):
             return {"diff": "", "original": "", "status": "error"}
 
-    result = await asyncio.to_thread(_run)
+    def _run_redacted() -> dict:
+        # Both text fields carry file content, so they pass through the same
+        # redactor ``api_file_read`` applies to the panel's buffer. The panel's
+        # diff view compares that redacted buffer against this ``original``, so
+        # leaving one side raw makes an unchanged credential line render as a
+        # hunk, and serves a secret committed in HEAD that ``/api/file-read``
+        # masks. Redacting the assembled result covers every branch, including
+        # ones added later, and runs in this worker thread rather than on the
+        # event loop because the input is caller-sized.
+        result = _run()
+        # Deliberately NOT truncated first: slicing before the pass can cut a
+        # credential's regex-required tail, and the surviving prefix is then
+        # served as real bytes. Redacting whole text costs an unbounded scan,
+        # which is why it runs here rather than on the event loop.
+        result["original"] = redact(result.get("original", ""))
+        result["diff"] = redact(result.get("diff", ""))
+        return result
+
+    result = await asyncio.to_thread(_run_redacted)
     _sel().log_api_access(caller=request.get("user", "dashboard"), operation="file_diff", outcome="allowed", resources=f"path={raw_path}")
     return web.json_response(result)
 
