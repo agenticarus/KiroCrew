@@ -89,6 +89,11 @@ class _FakeRequest(dict):
         # same way ``request.json()`` does. A real ``web.Request`` always
         # exposes it (None when the Content-Type declares no charset).
         self.charset: str | None = None
+        # Same reason as ``charset``: a real ``web.Request`` always exposes both,
+        # and ``read_bounded_json`` reads them to decide whether a body is present
+        # and whether it declares JSON (415 when it does not).
+        self.can_read_body = bool(self.content_length)
+        self.content_type = "application/json"
         self.app = app if app is not None else {"allowed_origins": {"http://localhost:5476"}}
 
 

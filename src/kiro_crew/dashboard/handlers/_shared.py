@@ -131,6 +131,55 @@ SESSION_SEARCH_TEXT_FIELDS: tuple[str, ...] = ("title", "snippet")
 _MAX_BODY_BYTES = 64 * 1024
 
 
+def _declares_json(content_type: str) -> bool:
+    """Is *content_type* a media type whose payload is a JSON document?
+
+    ``application/json`` and the ``+json`` structured-suffix family
+    (``application/merge-patch+json``, ``application/ld+json``) only. The suffix
+    family is in because the app SDK already lets a caller send one -- a scoped
+    API test pins ``application/merge-patch+json`` reaching the gateway -- so
+    refusing it would break a shape the product ships.
+
+    Everything else is out, including ``text/plain`` and an ABSENT header, which
+    aiohttp reports as ``application/octet-stream``. Absent and ``text/plain``
+    are the two spellings that matter: both are CORS *simple* request types, so a
+    cross-origin page sends them with no preflight, and a plain HTML form can
+    emit either. ``application/json`` is not simple, so requiring it means the
+    browser must ask permission before the body is ever delivered.
+    """
+    ct = content_type.strip().lower()
+    return ct == "application/json" or (ct.startswith("application/") and ct.endswith("+json"))
+
+
+def _json_content_type_error(request: web.Request) -> web.Response | None:
+    """415 unless a request that HAS a body declares a JSON content type.
+
+    Checked only when a body is actually present. An empty body carries no JSON
+    document to be misread, so gating it would change the status of a bodiless
+    POST (today a 400 ``invalid_json``, or ``{}`` under ``allow_absent``) while
+    removing no attack primitive.
+
+    415 rather than 400: the body may be perfectly well-formed JSON, and what is
+    refused is the media type the client declared for it.
+
+    Runs AFTER the capped path's Content-Length precheck, so a caller who
+    declared too many bytes still gets 413 rather than being told about its
+    header instead. Both refuse before anything is read, so the order is about
+    which fact the client is told, not about work done.
+    """
+    if not request.can_read_body:
+        return None
+    if _declares_json(request.content_type or ""):
+        return None
+    return web.json_response(
+        {
+            "error": "JSON body requires Content-Type: application/json",
+            "code": "unsupported_media_type",
+        },
+        status=415,
+    )
+
+
 async def read_bounded_json(
     request: web.Request,
     max_bytes: int | None = _MAX_BODY_BYTES,
@@ -145,6 +194,26 @@ async def read_bounded_json(
     list, string, or number for a body that is valid JSON but not an object, and
     a handler that then calls ``.get()`` on the result turns a client mistake
     into a 500.
+
+    A request that HAS a body must also DECLARE a JSON content type, or it is
+    refused 415 ``unsupported_media_type`` before the body is read -- see
+    :func:`_json_content_type_error`. Parsing a ``text/plain`` or
+    content-type-less body as JSON is what lets a cross-origin page deliver a
+    JSON command to a local endpoint with no CORS preflight; requiring the
+    header puts the preflight back. In-tree callers are unaffected: every client
+    that sends a body already sets ``application/json`` (the frontend
+    ``post``/``put``/``patch``/``del`` helpers, ``mcp_core``, ``cron_script``,
+    ``cli_*``, ``pod.runtime``, ``remote_relay``), and the bodiless requests
+    (``app_lifecycle_client``, ``cron_trigger``) are not checked.
+
+    ONE caller is not ours: ``POST /api/messaging/teams``, where Microsoft's Bot
+    Framework Connector posts activities. Its protocol sends
+    ``application/json``, so it is unaffected, and it is the route that most
+    wants the gate: it is the single entry in
+    ``token_auth.CSRF_EXEMPT_EXACT_METHODS``, so the Origin barrier deliberately
+    does not stand in front of it. The other self-authenticating webhook,
+    ``POST /api/hooks/agent``, reads through ``handlers/hooks.py::_json_object``
+    and is untouched by this.
 
     NOT yet the dashboard's only such guard. Four siblings survive and diverge:
     ``handlers_channel._json_object`` (same ``invalid_json``/``body_not_object``
@@ -199,6 +268,16 @@ async def read_bounded_json(
     """
     if allow_absent and not request.can_read_body:
         return {}, None
+    # A DECLARED oversize keeps its 413, which is the actionable answer for a
+    # caller sending too much and was this helper's answer before the media-type
+    # gate existed. The gate runs next, still before a single byte is read.
+    if max_bytes is not None and request.content_length and request.content_length > max_bytes:
+        return None, web.json_response(
+            {"error": "payload too large", "code": "payload_too_large"}, status=413
+        )
+    ct_error = _json_content_type_error(request)
+    if ct_error is not None:
+        return None, ct_error
     if max_bytes is None:
         try:
             body = await request.json()
@@ -207,10 +286,6 @@ async def read_bounded_json(
                 {"error": "invalid JSON", "code": "invalid_json"}, status=400
             )
     else:
-        if request.content_length and request.content_length > max_bytes:
-            return None, web.json_response(
-                {"error": "payload too large", "code": "payload_too_large"}, status=413
-            )
         chunks: list[bytes] = []
         received = 0
         async for chunk in request.content.iter_chunked(8192):
