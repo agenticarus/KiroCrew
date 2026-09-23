@@ -324,6 +324,7 @@ from kiro_crew.security import (
     redact_and_truncate,
     redact_credentials,
     redact_exfiltration_urls,
+    redact_exfiltration_urls_with_records,
     sanitized_oauth_endpoint,
 )
 from kiro_crew.security.readonly_bash import is_read_only_bash, unsafe_bash_reason
@@ -4768,6 +4769,23 @@ def _log_glued_footer_text(slot: Any, glued: list[str]) -> None:
     )
 
 
+def _segment_row_meta(slot: _ChatSlot, blocked_links: list[dict]) -> dict | None:
+    """The assistant row's ``meta``: the decision strip plus blocked-link records.
+
+    One function because both fields have to reach ``slot.append`` in the same
+    dict -- that call broadcasts the live frame from inside itself, so a field
+    written onto the row afterwards would persist but be missing from the frame
+    an open tab renders. Returns None when there is nothing to carry, which is
+    what ``slot.append`` expects for a row with no meta.
+    """
+    meta = _decisions_strip_meta(slot)
+    if not blocked_links:
+        return meta
+    out = dict(meta) if meta else {}
+    out["blocked_links"] = blocked_links
+    return out
+
+
 def _flush_segment(
     state: DashboardState,
     slot: _ChatSlot,
@@ -4843,8 +4861,11 @@ def _flush_segment(
     # is labelled as the assistant's own output and the event is audited: a
     # model that later re-reads the line must not take it for an instruction.
     assistant_text = _reflow_label_and_audit(slot, assistant_text)
-    # Redact the accumulated text
-    redacted, exfil_warnings = redact_exfiltration_urls(assistant_text)
+    # Redact the accumulated text. The records come out of this SAME pass because
+    # this is the last moment the URL exists: what `slot.append` stores is the
+    # placeholder, so a later scan of the row can only find that placeholder and
+    # would describe nothing. The chip's detail has to be born here or not at all.
+    redacted, exfil_warnings, blocked_links = redact_exfiltration_urls_with_records(assistant_text)
     for w in exfil_warnings:
         logger.warning("Exfiltration URL redacted in chat segment: %s", w)
     redacted, cred_warnings = redact_credentials(redacted)
@@ -4859,10 +4880,11 @@ def _flush_segment(
         redacted,
         "msg msg-a",
         broadcast=not quiet_persist,
-        # The decision strip, when this turn made one. Passed here rather than
-        # written onto the row afterwards so the frame this call broadcasts
-        # carries it too -- see _decisions_strip_meta.
-        meta=_decisions_strip_meta(slot),
+        # The decision strip, when this turn made one, and the blocked-link records
+        # from the redaction above. Passed here rather than written onto the row
+        # afterwards so the frame this call broadcasts carries them too -- see
+        # _decisions_strip_meta for why that matters.
+        meta=_segment_row_meta(slot, blocked_links),
     )
     # The append-only log's copy of the same body. Written here rather than at the
     # turn's terminal event because a turn produces SEVERAL assistant messages --
@@ -4880,15 +4902,26 @@ def _flush_segment(
     last_msg: dict = slot.messages[-1]
     # If a regenerate is pending, attach the stashed variants to this fresh assistant message.
     if slot._pending_variants:
-        pending_list = [
-            {
-                **v,
-                "content": redact_credentials(redact_exfiltration_urls(v.get("content", ""))[0])[0],
-            }
-            for v in slot._pending_variants
-            if isinstance(v, dict)
-        ]
-        pending_list.append({"content": redacted, "ts": last_msg.get("ts", "")})
+        pending_list = []
+        for v in slot._pending_variants:
+            if not isinstance(v, dict):
+                continue
+            # A stashed variant's text is ALREADY redacted, so its records are
+            # carried rather than derived: the URL they describe is gone from that
+            # text and a rescan of it would return nothing, which would destroy
+            # the only explanation the reader can switch back to. Records are
+            # derived exactly once, at the redaction that writes the placeholder.
+            # The removers still run -- they are idempotent, and a variant that
+            # reached here unredacted must not be stored that way.
+            v_text, _ = redact_exfiltration_urls(v.get("content", ""))
+            entry = {**v, "content": redact_credentials(v_text)[0]}
+            if not entry.get("blocked_links"):
+                entry.pop("blocked_links", None)
+            pending_list.append(entry)
+        newest: dict = {"content": redacted, "ts": last_msg.get("ts", "")}
+        if blocked_links:
+            newest["blocked_links"] = blocked_links
+        pending_list.append(newest)
         last_msg["variants"] = pending_list
         last_msg["variant_idx"] = len(pending_list) - 1
         slot._pending_variants = []

@@ -5,7 +5,7 @@ import React, { createContext, useContext, memo, useEffect, useMemo, useRef, use
 import Clickable from './Clickable'
 import { HOVER_NONE_ACTIONS_ROW_CLS } from '../utils/touchActions'
 import { getImageDims, rememberImageDims } from '../utils/imageDims'
-import { X, Download, Loader2, MoreHorizontal, Plus, Minus, Search, Folder, Maximize2, Check, FileCode, FileSpreadsheet, Copy, Image as ImageIcon, ImageOff, Film, Volume2, GitPullRequest, MessageSquare, ExternalLink } from 'lucide-react'
+import { X, Download, Loader2, MoreHorizontal, Plus, Minus, Search, Folder, Maximize2, Check, FileCode, FileSpreadsheet, Copy, Image as ImageIcon, ImageOff, EyeOff, Film, Volume2, GitPullRequest, MessageSquare, ExternalLink } from 'lucide-react'
 import { copyCode, copyToClipboard } from '../utils/clipboard'
 import { capWhitespaceRuns, remarkBoundDepth, rehypeBoundRawDepth } from '../utils/markdownDepthBound'
 import { hastTableToCsv, hastTableToMarkdown } from '../utils/tableClipboard'
@@ -2050,7 +2050,258 @@ function MarkdownTable({ node, children }: { node?: HastElement; children?: Reac
   )
 }
 
-const MD_COMPONENTS: Components = {
+/**
+ * One redacted suspicious-URL record, as it rides on a persisted assistant
+ * message's `meta.blocked_links`. Step 3 keeps STRUCTURE ONLY: the query VALUE
+ * is never stored, `query_chars` is just its length. The backend re-validates
+ * every field on the way out (the `_redact_meta_for_role` carve-out), and this
+ * is the render-side shape.
+ */
+interface BlockedLink {
+  domain: string
+  rule: string
+  path: string | null
+  query_chars: number
+}
+
+/** Strict host shape and rule-id shape, mirroring the backend carve-out's
+ *  gates so the render side never trusts a value the backend would reject. */
+const BLOCKED_LINK_HOST_RE = /^[a-z0-9.-]+$/i
+const BLOCKED_LINK_RULE_RE = /^[a-z0-9_]+$/
+const BLOCKED_LINK_KEYS = ['domain', 'rule', 'path', 'query_chars']
+
+/**
+ * Keep only well-formed records, dropping a malformed one individually rather
+ * than failing the whole message. The list arrives from a JSONL meta line that
+ * is attacker-writable at rest, so a record whose keys are not exactly the
+ * known set, whose domain or rule is off-shape, or whose `query_chars` is not a
+ * non-negative integer is discarded — the same disposition the backend
+ * carve-out takes.
+ */
+function normalizeBlockedLinks(raw: unknown): BlockedLink[] {
+  if (!Array.isArray(raw)) return []
+  const out: BlockedLink[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+    const r = item as Record<string, unknown>
+    const keys = Object.keys(r)
+    if (keys.length !== BLOCKED_LINK_KEYS.length || !BLOCKED_LINK_KEYS.every(k => k in r)) continue
+    const { domain, rule, path, query_chars: qc } = r
+    if (typeof domain !== 'string' || !BLOCKED_LINK_HOST_RE.test(domain)) continue
+    if (typeof rule !== 'string' || !BLOCKED_LINK_RULE_RE.test(rule)) continue
+    if (typeof qc !== 'number' || !Number.isInteger(qc) || qc < 0) continue
+    if (path !== null && typeof path !== 'string') continue
+    out.push({ domain, rule, path: path as string | null, query_chars: qc })
+  }
+  return out
+}
+
+/**
+ * The redacted records for the message being rendered.
+ *
+ * A context because `MD_COMPONENTS` is module-level, so `BlockedLinkChip`
+ * cannot receive the records as props — the same reason the path and session
+ * chips read theirs from context. The placeholder text carries ONLY the domain,
+ * so the chip pairs by domain against this list (see `BlockedLinkChip`).
+ */
+const BlockedLinksCtx = createContext<readonly BlockedLink[]>([])
+
+/** Records sharing a domain, in first-appearance order. */
+function blockedLinksForDomain(records: readonly BlockedLink[], domain: string): BlockedLink[] {
+  return records.filter(r => r.domain === domain)
+}
+
+/** Collapse byte-identical records, preserving first-appearance order — two
+ *  impressions of the SAME redacted URL are one record for pairing. */
+function distinctBlockedLinks(group: readonly BlockedLink[]): BlockedLink[] {
+  const seen = new Set<string>()
+  const out: BlockedLink[] = []
+  for (const r of group) {
+    const sig = JSON.stringify([r.domain, r.rule, r.path, r.query_chars])
+    if (seen.has(sig)) continue
+    seen.add(sig)
+    out.push(r)
+  }
+  return out
+}
+
+/** The plain-language reason for a rule id (see security/exfil.py). The raw id
+ *  is shown beside it; this only picks the sentence. */
+/**
+ * One sentence per reason the redactor can give, keyed on the rule ids it emits
+ * (`exfil.py`'s `trace()` calls). The encoding rules get their OWN sentence
+ * rather than the credential one: a long run of escaped characters is how data
+ * is smuggled out, but it is also what an ordinary title in a non-Latin script
+ * turns into, so telling that reader their link "carried a secret" is a false
+ * accusation about the most common false positive this gate has.
+ */
+function blockedLinkReason(rule: string): string {
+  if (rule === 'exfil_query_length' || rule === 'exfil_query_pattern') {
+    return i18nT('components.markdownRenderer.blocked_link_reason_query')
+  }
+  if (rule === 'exfil_percent_encoding' || rule === 'exfil_decode_saturated') {
+    return i18nT('components.markdownRenderer.blocked_link_reason_encoding')
+  }
+  if (rule.includes('credential')) {
+    return i18nT('components.markdownRenderer.blocked_link_reason_credential')
+  }
+  return i18nT('components.markdownRenderer.blocked_link_reason_generic')
+}
+
+// `cursor-default` because the chip body is not a target: only the disclosure
+// inside it is interactive, and a chip that looks clickable sends the reader
+// hunting for a click that does nothing. The disclosure sets its own pointer.
+const BLOCKED_LINK_CHIP_CLASS =
+  'inline-flex max-w-full flex-wrap items-center gap-x-2 gap-y-1 rounded-md cursor-default'
+  + ' border border-dashed border-warn/60 bg-warn-subtle px-2 py-1 text-sm text-text align-baseline'
+
+/**
+ * The blocked-link chip: replaces a `[REDACTED: suspicious URL to <domain>]`
+ * placeholder that step 3 leaves in the saved transcript.
+ *
+ * Visually distinct from the remote-media chip on purpose: that one is a BUTTON
+ * with a solid hairline border because pressing it loads the media; this one is
+ * NOT a button, NEVER navigates, and carries a DASHED warning-token border
+ * because the link is GONE, not loadable.
+ *
+ * The placeholder carries only the domain, so the record is paired by domain
+ * from `BlockedLinksCtx` — two different URLs on one domain collapse to the same
+ * placeholder, so a positional index could cross one link's path onto another,
+ * which is exactly why the collector stores no index. One record (or several
+ * byte-identical ones) shows full detail; several DIFFERING records show domain
+ * and reason only. Every retained string is agent-written and rendered as TEXT,
+ * never injected as HTML.
+ */
+function BlockedLinkChip({ node }: { node?: HastElement }) {
+  useLanguageGeneration() // memo() up the tree bails out of the provider repaint
+  const records = useContext(BlockedLinksCtx)
+  const [open, setOpen] = useState(false)
+  const panelId = useId()
+  const domain = typeof node?.properties?.domain === 'string' ? node.properties.domain : ''
+  const group = blockedLinksForDomain(records, domain)
+  // No record for this domain — an older message, or a placeholder whose domain
+  // the backend never redacted. Leave the placeholder as the plain text it was.
+  if (group.length === 0) return <>{`[REDACTED: suspicious URL to ${domain}]`}</>
+  const distinct = distinctBlockedLinks(group)
+  const full = distinct.length === 1
+  const rec = distinct[0]
+  const path = full ? rec.path : null
+  const queryChars = full ? rec.query_chars : 0
+  // Degraded (differing records for one domain): the reason stays unambiguous
+  // only while every record shares a rule; otherwise fall back to the generic.
+  const rule = full || distinct.every(r => r.rule === rec.rule) ? rec.rule : 'exfil_unknown'
+  return (
+    <span className={BLOCKED_LINK_CHIP_CLASS} data-testid="blocked-link-chip">
+      <EyeOff size={14} aria-hidden="true" className="shrink-0 text-warn" />
+      <span className="font-semibold">{i18nT('components.markdownRenderer.blocked_link_label')}</span>
+      <span className="min-w-0 break-all font-mono text-[13px]" data-testid="blocked-link-target">{path != null ? `${domain}${path}` : domain}</span>
+      {queryChars > 0 && (
+        <span className="text-[11px] text-muted" data-testid="blocked-link-query">
+          {i18nT('components.markdownRenderer.blocked_link_query_chars', { chars: queryChars })}
+        </span>
+      )}
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls={panelId}
+        onClick={() => setOpen(v => !v)}
+        className="cursor-pointer border-none bg-transparent p-0 text-[12px] font-medium text-text transition-colors hover:text-accent"
+        data-testid="blocked-link-inspect"
+      >
+        {i18nT('components.markdownRenderer.blocked_link_why')}
+      </button>
+      {open && (
+        <span id={panelId} className="block basis-full text-start text-[11px] leading-relaxed text-muted" data-testid="blocked-link-inspect-panel">
+          {/* Three separate facts, so three lines: run together they read as one
+              sentence that trails off into an identifier. */}
+          <span className="block">{blockedLinkReason(rule)}</span>
+          <span className="block">
+            {i18nT('components.markdownRenderer.blocked_link_query_not_kept')}
+          </span>
+          <span className="block">
+            <Trans
+              i18nKey="components.markdownRenderer.blocked_link_rule"
+              components={{ rule: <span className="font-mono text-[11px] text-text">{rule}</span> }}
+            />
+          </span>
+        </span>
+      )}
+    </span>
+  )
+}
+
+/** Match a persisted suspicious-URL placeholder, capturing its domain — which
+ *  is `match.group(1)` on the backend and so never carries a `]`. */
+const BLOCKED_LINK_PLACEHOLDER_RE = /\[REDACTED: suspicious URL to ([^\]]+)\]/g
+const BLOCKED_LINK_PLACEHOLDER_PREFIX = '[REDACTED: suspicious URL to '
+
+/** Split a text value at every placeholder whose domain has a record, or null
+ *  when none matches. */
+function splitBlockedLinkPlaceholders(
+  value: string,
+  domains: ReadonlySet<string>,
+): Array<HastElement | HastText> | null {
+  if (!value.includes(BLOCKED_LINK_PLACEHOLDER_PREFIX)) return null
+  const pieces: Array<HastElement | HastText> = []
+  let last = 0
+  let matched = false
+  BLOCKED_LINK_PLACEHOLDER_RE.lastIndex = 0
+  let m: RegExpExecArray | null
+  while ((m = BLOCKED_LINK_PLACEHOLDER_RE.exec(value)) !== null) {
+    if (!domains.has(m[1])) continue
+    matched = true
+    if (m.index > last) pieces.push({ type: 'text', value: value.slice(last, m.index) })
+    pieces.push({ type: 'element', tagName: 'blocked-link', properties: { domain: m[1] }, children: [] })
+    last = m.index + m[0].length
+  }
+  if (!matched) return null
+  if (last < value.length) pieces.push({ type: 'text', value: value.slice(last) })
+  return pieces
+}
+
+/**
+ * Replace each `[REDACTED: suspicious URL to <domain>]` placeholder whose
+ * domain has a record with a `<blocked-link>` element the component renders.
+ *
+ * Runs AFTER `rehypeSanitize` — like the streaming plugins — so the injected
+ * element (a tag the sanitizer's allowlist does not carry) is not escaped;
+ * an agent that writes the literal tag in prose is still escaped by the
+ * sanitizer that ran before this. The placeholder is plain settled text, so a
+ * hast text-node transform is the right seam: it needs none of the source-offset
+ * alignment `remarkLatexDelimiters` pays for over decoded mdast values, and
+ * unlike a component override react-markdown offers no text-node hook. Text
+ * inside `code`/`pre` is left alone.
+ */
+function rehypeBlockedLinkChips(options: { domains: ReadonlySet<string> }) {
+  const { domains } = options
+  const walk = (parent: HastParent, noChip: boolean) => {
+    const children = parent.children
+    for (let i = 0; i < children.length; i++) {
+      const child = children[i]
+      if (child.type === 'text') {
+        if (noChip) continue
+        const repl = splitBlockedLinkPlaceholders(child.value, domains)
+        if (repl) {
+          spliceChildren(parent, i, repl)
+          i += repl.length - 1
+        }
+        continue
+      }
+      if (child.type === 'element') {
+        // `a` joins `code`/`pre` as a region the chip may not enter. The chip
+        // carries a control, and a control inside an anchor is a control that
+        // navigates: clicking the disclosure would follow the anchor's own
+        // destination, which is agent-authored and is the thing under suspicion.
+        // Inside an anchor the placeholder stays plain text, which explains
+        // nothing but takes the reader nowhere.
+        walk(child, noChip || child.tagName === 'code' || child.tagName === 'pre' || child.tagName === 'a')
+      }
+    }
+  }
+  return (tree: HastRoot) => walk(tree, false)
+}
+
+const MD_COMPONENTS = {
   code({ className, children, ...props }) {
     // Only a <code> inside a <pre> may render a block-level component here
     // (CodeBlock / MermaidBlock / ExcalidrawBlock are each rooted in a <div>).
@@ -2173,7 +2424,12 @@ const MD_COMPONENTS: Components = {
   video({ node, children }) { return <DeferredMedia tag="video" node={node}>{children}</DeferredMedia> },
   audio({ node, children }) { return <DeferredMedia tag="audio" node={node}>{children}</DeferredMedia> },
   source: MdSourceEl,
-}
+  // A custom element name the `rehypeBlockedLinkChips` pass injects after
+  // sanitize. `Components` is keyed by the intrinsic HTML tags, so the custom
+  // key is added through the assertion below rather than inline — react-markdown
+  // resolves the component by tag name at runtime regardless of the static type.
+  'blocked-link': BlockedLinkChip,
+} as Components
 
 /** Markdown image with a React-rendered fallback chip when the URL is broken
  *  (see `BrokenImage`). The fallback is React-rendered rather than a hand-built
@@ -4615,7 +4871,7 @@ function deferIncompleteStreamingTable(content: string): string {
   return lines.slice(0, start).join('\n')
 }
 
-const MarkdownBlock = memo(function MarkdownBlock({ content, sourcePos, startLine, glow, smooth, softBreaks, live, unfurl }: { content: string; sourcePos?: boolean; startLine?: number; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean }) {
+const MarkdownBlock = memo(function MarkdownBlock({ content, sourcePos, startLine, glow, smooth, softBreaks, live, unfurl, blockedDomains }: { content: string; sourcePos?: boolean; startLine?: number; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean; blockedDomains?: ReadonlySet<string> }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   // Declared before the early return below — Rules of Hooks.
   //
@@ -4664,6 +4920,13 @@ const MarkdownBlock = memo(function MarkdownBlock({ content, sourcePos, startLin
     if (!smooth) tail.push([rehypeStreamingGlow, { tailChars: GLOW_TAIL_CHARS }])
     if (smooth) tail.push(rehypeStreamingReveal)
     rehypePlugins = [...baseRehype, ...tail]
+  }
+  // After sanitize (baseRehype ends with it) and after the streaming tail, so
+  // the injected `<blocked-link>` element is not stripped and the glow/reveal
+  // passes have already claimed the trailing text. Only added when the message
+  // carries records, so every other surface is untouched.
+  if (blockedDomains && blockedDomains.size > 0) {
+    rehypePlugins = [...rehypePlugins, [rehypeBlockedLinkChips, { domains: blockedDomains }]]
   }
   // Last, so it wraps the root shape every other plugin has finished producing:
   // an earlier position would let a later plugin read `div` where it expects the
@@ -4794,7 +5057,7 @@ function extractPathHintFromText(text: string | undefined): string | undefined {
   return undefined
 }
 
-function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, slotKey, glow, smooth, softBreaks, live, unfurl, collapseDiffs, mdCardToggle, readOnlyCode }: { block: ContentBlock; prevBlock?: ContentBlock; onFileOpen?: (path: string) => void; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean; collapseDiffs?: boolean; mdCardToggle?: boolean; readOnlyCode?: boolean }) {
+function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, slotKey, glow, smooth, softBreaks, live, unfurl, collapseDiffs, mdCardToggle, readOnlyCode, blockedDomains }: { block: ContentBlock; prevBlock?: ContentBlock; onFileOpen?: (path: string) => void; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean; collapseDiffs?: boolean; mdCardToggle?: boolean; readOnlyCode?: boolean; blockedDomains?: ReadonlySet<string> }) {
   switch (block.type) {
     case 'diff': {
       const pathHint = prevBlock?.type === 'markdown'
@@ -4869,11 +5132,11 @@ function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, slo
       // `live` = this block is the streaming tail (see MarkdownRenderer). ORed
       // with the block's own `complete` flag so a provisional block is treated
       // as live too, whatever produced it.
-      return <MarkdownBlock content={block.content} sourcePos={sourcePos} startLine={block.startLine} glow={glow} smooth={smooth} softBreaks={softBreaks} live={!block.complete || !!live} unfurl={unfurl} />
+      return <MarkdownBlock content={block.content} sourcePos={sourcePos} startLine={block.startLine} glow={glow} smooth={smooth} softBreaks={softBreaks} live={!block.complete || !!live} unfurl={unfurl} blockedDomains={blockedDomains} />
   }
 }
 
-export default memo(function MarkdownRenderer({ content, streaming = false, onFileOpen, onFolderOpen, onArtifactOpen, onSessionOpen, sessions, activeSession, rawMode = false, sourcePos = false, messageTs, slotKey, glow = false, smooth, softBreaks = false, compactImages = false, linkPreviews = false, collapseDiffs = false, mdCardToggle = false, readOnlyCode = false }: { content: string; streaming?: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; onSessionOpen?: (key: string) => void; sessions?: ReadonlyMap<string, string>; activeSession?: string; rawMode?: boolean; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; compactImages?: boolean; linkPreviews?: boolean; /** Chat transcript only: render a ```diff fence collapsed to a chip. Off everywhere else, where the patch IS the content rather than a retelling of it. */ collapseDiffs?: boolean; /** Chat transcript only: give a ```markdown content card a Formatted | Raw view toggle. Off everywhere else, where the fence IS the source being shown. */ mdCardToggle?: boolean; /** Render fenced code with the plain CodeBlock (copy only) instead of EditableCodeBlock. For content the reader must not be able to alter in place -- an approval's command beside its Approve control. */ readOnlyCode?: boolean }) {
+export default memo(function MarkdownRenderer({ content, streaming = false, onFileOpen, onFolderOpen, onArtifactOpen, onSessionOpen, sessions, activeSession, rawMode = false, sourcePos = false, messageTs, slotKey, glow = false, smooth, softBreaks = false, compactImages = false, linkPreviews = false, collapseDiffs = false, mdCardToggle = false, readOnlyCode = false, blockedLinks }: { content: string; streaming?: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; onSessionOpen?: (key: string) => void; sessions?: ReadonlyMap<string, string>; activeSession?: string; rawMode?: boolean; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; compactImages?: boolean; linkPreviews?: boolean; /** Chat transcript only: render a ```diff fence collapsed to a chip. Off everywhere else, where the patch IS the content rather than a retelling of it. */ collapseDiffs?: boolean; /** Chat transcript only: give a ```markdown content card a Formatted | Raw view toggle. Off everywhere else, where the fence IS the source being shown. */ mdCardToggle?: boolean; /** Render fenced code with the plain CodeBlock (copy only) instead of EditableCodeBlock. For content the reader must not be able to alter in place -- an approval's command beside its Approve control. */ readOnlyCode?: boolean; /** Raw `meta.blocked_links` off the assistant message — the step-3 suspicious-URL records this message's redaction placeholders render from. Validated here; absent/malformed leaves every placeholder as plain text. */ blockedLinks?: unknown }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const blocks = useBlockAssembler(content, streaming)
   // One message = one config-rule scan pool. The blocks below each mount their
@@ -4909,6 +5172,11 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
   /** Stable identity so every chip in a long transcript doesn't re-render when
    *  this component does. */
   const pathActions = useMemo<PathActions>(() => ({ onFileOpen, onFolderOpen }), [onFileOpen, onFolderOpen])
+  // The message's suspicious-URL records, validated once. `blockedDomains` is
+  // the set the injection pass gates on; the full records ride down through
+  // context for the chip's domain pairing.
+  const blockedRecords = useMemo(() => normalizeBlockedLinks(blockedLinks), [blockedLinks])
+  const blockedDomains = useMemo(() => new Set(blockedRecords.map(r => r.domain)), [blockedRecords])
   const sessionActions = useMemo<SessionActions>(
     // The write time the SHORT-name chip needs. Absent, non-absolute, or
     // unparseable yields undefined, and a short name then resolves to NOTHING —
@@ -5020,6 +5288,10 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
           rewriting one file across turns is not served the previous bytes from
           the in-document resource cache. */}
       <ImageVersionCtx.Provider value={messageTs ?? null}>
+      {/* BlockedLinksCtx: the step-3 suspicious-URL records the blocked-link
+          chip pairs by domain. A Provider renders no DOM node, so the scoping
+          on the wrapper div above is unaffected. */}
+      <BlockedLinksCtx.Provider value={blockedRecords}>
         {blocks.map((block, i) => (
           // Key on startLine (stable across streaming) instead of block.type, so
           // a code -> diff reclassification mid-stream doesn't unmount the
@@ -5044,8 +5316,10 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
             collapseDiffs={collapseDiffs}
             mdCardToggle={mdCardToggle}
             readOnlyCode={readOnlyCode}
+            blockedDomains={blockedDomains}
           />
         ))}
+      </BlockedLinksCtx.Provider>
       </ImageVersionCtx.Provider>
       </CompactImagesCtx.Provider>
       </SessionActionCtx.Provider>

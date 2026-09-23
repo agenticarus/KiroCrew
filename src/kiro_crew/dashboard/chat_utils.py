@@ -52,6 +52,8 @@ from kiro_crew.security import (
     oauth_url_contains_credential,
     redact_credentials,
     redact_exfiltration_urls,
+    MAX_BLOCKED_LINKS_PER_MESSAGE,
+    revalidate_blocked_link,
 )
 from kiro_crew.sel import SecurityEvent, sel
 from kiro_crew.session_surface import has_dashboard_surface, set_dashboard_surfaced
@@ -1722,6 +1724,52 @@ def _redact_value(v):  # type: ignore[no-untyped-def]
     return v
 
 
+def variant_from_row(row: dict) -> dict:
+    """Stash a row as a variant, taking its blocked-link records with it.
+
+    The mirror of ``adopt_variant_text``: that one moves a variant onto the row,
+    this one moves the row into the variant list. Both directions carry the
+    records because the records cannot be recovered from the text -- the stashed
+    content is already redacted, so the URL they describe is gone and a rescan
+    finds nothing to describe. A stash that dropped them would destroy the
+    explanation for good, and the reader switching back would be handed a bare
+    placeholder with no way to learn what was removed.
+    """
+    entry = {"content": row.get("content", ""), "ts": row.get("ts", "")}
+    meta = row.get("meta")
+    if isinstance(meta, dict):
+        records = meta.get("blocked_links")
+        if isinstance(records, list) and records:
+            entry["blocked_links"] = records
+    return entry
+
+
+def adopt_variant_text(row: dict, variant: dict) -> None:
+    """Move a row onto one of its variants, text and blocked-link records together.
+
+    A record describes ONE text: it names the domain and the reason for a
+    placeholder standing in that text. A caller that takes a variant's content
+    without its records leaves the row explaining a link that is absent from the
+    text on screen, and the chip then states a host that text never held. The pair
+    moves through this one function so no site can take half of it -- the records
+    are replaced when the variant carries them and REMOVED when it does not,
+    because a variant with no records has nothing to explain.
+    """
+    row["content"] = variant.get("content", "")
+    row["ts"] = variant.get("ts", row.get("ts", ""))
+    meta = row.get("meta")
+    records = variant.get("blocked_links")
+    if isinstance(records, list) and records:
+        if not isinstance(meta, dict):
+            meta = {}
+            row["meta"] = meta
+        meta["blocked_links"] = records
+    elif isinstance(meta, dict):
+        meta.pop("blocked_links", None)
+        if not meta:
+            row.pop("meta", None)
+
+
 def _redact_meta(meta: dict) -> dict:
     """Recursively redact string values in meta dict.
 
@@ -1747,9 +1795,28 @@ def _redact_meta_for_role(role: str, meta: dict) -> dict:
     dependency runs chat_persistence -> chat_utils, so keeping it here lets both
     the save path and the emit path share one implementation without a cycle.
     """
+    # blocked_links is a structure-only record set the persistence layer attaches
+    # (see chat_persistence._build_message_entry_uncached); the generic string
+    # redaction below would blank it. Preserve it across every role, but the
+    # transcript line is attacker-writable, so re-validate each record against the
+    # collector's shape and drop any that fails on its own -- never the message.
+    # The count is bounded here as well as in the collector, because this is the
+    # second RETENTION point and the only one that reads the line: a forged line
+    # can carry any number of well-formed records, and this function runs on every
+    # render of the message that holds it.
+    validated_blocked_links: list[dict] = []
+    raw_blocked_links = meta.get("blocked_links")
+    if isinstance(raw_blocked_links, list):
+        for record in raw_blocked_links[:MAX_BLOCKED_LINKS_PER_MESSAGE]:
+            checked = revalidate_blocked_link(record)
+            if checked is not None:
+                validated_blocked_links.append(checked)
+
     if role == "mcp_oauth":
         out: dict = {}
         for k, v in list(meta.items()):
+            if k == "blocked_links":
+                continue
             if k == "oauth_url" and isinstance(v, str):
                 # Two gates, and deliberately NOT a third:
                 #   1. http(s)-only — a tampered history line can't smuggle a
@@ -1776,8 +1843,13 @@ def _redact_meta_for_role(role: str, meta: dict) -> dict:
                 out[k] = v if (safe_scheme and not oauth_url_contains_credential(v)) else ""
             else:
                 out[k] = _redact_value(v)
+        if validated_blocked_links:
+            out["blocked_links"] = validated_blocked_links
         return out
-    return _redact_meta(meta)
+    out = {k: _redact_value(v) for k, v in list(meta.items()) if k != "blocked_links"}
+    if validated_blocked_links:
+        out["blocked_links"] = validated_blocked_links
+    return out
 
 
 def _redact_for_display(text: str) -> str:

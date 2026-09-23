@@ -7013,6 +7013,15 @@
       "diff_status_failed": "इस फ़ाइल के git परिवर्तनों की जाँच नहीं की जा सकी।"
     },
     "markdownRenderer": {
+      "blocked_link_why": "क्यों हटाया गया?",
+      "blocked_link_label": "लिंक हटाया गया",
+      "blocked_link_query_chars": "पते के बाद {{chars}} अक्षर हटाए गए",
+      "blocked_link_query_not_kept": "वे अक्षर नहीं रखे गए।",
+      "blocked_link_reason_credential": "ऐसा लगा कि लिंक कोई गोपनीय कुंजी या क्रेडेंशियल ले जा रहा था।",
+      "blocked_link_reason_encoding": "इसके पते में लंबे समय तक एस्केप किए गए अक्षर थे, जिनमें डेटा छिप सकता है। गैर-लैटिन लिपि में लिखा शीर्षक भी वैसा ही दिखता है।",
+      "blocked_link_reason_generic": "यह उन लिंक के नियम से मेल खाता है जो बातचीत का डेटा बाहर भेज सकते हैं।",
+      "blocked_link_reason_query": "पते के बाद के अक्षर ऐसे लगे जैसे बातचीत से डेटा बाहर ले जा रहे हों।",
+      "blocked_link_rule": "नियम आईडी: <rule/>",
       "download_failed": "आरेख डाउनलोड नहीं हो सका। फिर से कोशिश करें।",
       "diagram_actions": "और कार्रवाइयाँ",
       "download_svg": "SVG डाउनलोड करें",

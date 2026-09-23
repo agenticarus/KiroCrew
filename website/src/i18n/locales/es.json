@@ -7116,6 +7116,15 @@
       "diff_status_failed": "No se pudieron comprobar los cambios de git de este archivo."
     },
     "markdownRenderer": {
+      "blocked_link_why": "¿Por qué se eliminó?",
+      "blocked_link_label": "Enlace eliminado",
+      "blocked_link_query_chars": "{{chars}} caracteres eliminados después de la dirección",
+      "blocked_link_query_not_kept": "Esos caracteres no se conservaron.",
+      "blocked_link_reason_credential": "Parecía que el enlace llevaba un secreto o una credencial.",
+      "blocked_link_reason_encoding": "Su dirección tenía una larga serie de caracteres escapados, que pueden ocultar datos. Un título escrito en un alfabeto no latino se ve igual.",
+      "blocked_link_reason_generic": "Coincidió con una regla para enlaces que pueden enviar datos de la conversación al exterior.",
+      "blocked_link_reason_query": "Los caracteres después de la dirección parecían llevarse datos de la conversación.",
+      "blocked_link_rule": "ID de regla: <rule/>",
       "download_failed": "No se pudo descargar el diagrama. Inténtalo de nuevo.",
       "diagram_actions": "Más acciones",
       "download_svg": "Descargar SVG",

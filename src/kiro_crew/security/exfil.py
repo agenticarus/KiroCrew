@@ -34,7 +34,11 @@ from urllib.parse import parse_qs, unquote, unquote_plus, urlparse
 from kiro_crew.credential_patterns import AWS_KEY_ID
 from kiro_crew.sel import SecurityEvent, SecurityEventLog
 
-from .redaction import _contains_fixed_credential, _text_contains_bare_secret
+from .redaction import (
+    _contains_fixed_credential,
+    _text_contains_bare_secret,
+    redact_credentials,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1078,28 +1082,205 @@ def scan_exfiltration_urls(text: str) -> list[str]:
 EXFILTRATION_REDACTION_TAG_PREFIX = "[REDACTED: suspicious URL to "
 
 
+#: What one message may retain about blocked links. The bound belongs at the
+#: RETENTION points rather than at a render site, because the store IS the
+#: transcript line: a record is cheap to write there, and every render of that
+#: message re-validates and re-serializes whatever the line holds. A path longer
+#: than this is dropped rather than truncated, which keeps the rule "only what
+#: the removers pass is kept" from acquiring a second, weaker branch. Records
+#: past the count are not recorded and the overflow is counted in one log line.
+MAX_BLOCKED_LINKS_PER_MESSAGE = 32
+MAX_BLOCKED_LINK_PATH_CHARS = 256
+#: A query longer than this did not come from a message a client can render, so
+#: a count above it marks the record as malformed rather than merely large.
+MAX_BLOCKED_LINK_QUERY_CHARS = 100_000
+
+
+def _exfil_retained_path(
+    domain: str,
+    path: str,
+    exempt_hosts: frozenset[str],
+    *,
+    port: str = "",
+    is_https: bool = True,
+) -> str | None:
+    """Return *path* only when both removers leave it as written, else None.
+
+    A path can smuggle data as readily as a query, so the rule is "keep only
+    what the redactors themselves pass": the path alone must not trip the URL
+    warning, and it must survive credential redaction unchanged.
+    """
+    if not path:
+        return None
+    if len(path) > MAX_BLOCKED_LINK_PATH_CHARS:
+        return None
+    if _exfil_url_warning(domain, path, exempt_hosts, port=port, is_https=is_https) is not None:
+        return None
+    if redact_credentials(path)[0] != path:
+        return None
+    return path
+
+
+#: The keys a blocked-link record carries, and nothing besides.
+_BLOCKED_LINK_RECORD_KEYS = frozenset({"domain", "rule", "path", "query_chars"})
+#: Every STRING a record may retain, with the bound that applies to it. The
+#: validator reads this table rather than each field by name, so a field added to
+#: the record without an entry here is not retained at all: being bounded is a
+#: property of the record's shape instead of a check someone has to remember to
+#: write for each new field. 253 is the DNS maximum, so a longer host cannot
+#: resolve and is not a host this collector saw.
+_BLOCKED_LINK_STRING_BOUNDS = {
+    "domain": 253,
+    "rule": 64,
+    "path": MAX_BLOCKED_LINK_PATH_CHARS,
+}
+#: A host in the forms ``_URL_RE`` group 1 emits: a DNS name, an IPv4 literal,
+#: or a bracketed IPv6 literal. Quantifiers are bounded so the pattern and the
+#: table above cannot disagree about what length is acceptable.
+_BLOCKED_LINK_DOMAIN_RE = re.compile(
+    r"(?:[a-zA-Z0-9._-]{1,253}\.[a-zA-Z]{2,63}"
+    r"|\d{1,3}(?:\.\d{1,3}){3}"
+    r"|\[[0-9A-Fa-f:.]{1,45}\])"
+)
+#: A stable rule id, as ``_exfil_url_warning`` reports through ``_rule_out``.
+_BLOCKED_LINK_RULE_RE = re.compile(r"[a-z0-9_]{1,64}")
+
+
+def revalidate_blocked_link(record: object) -> dict | None:
+    """Return a blocked-link record safe to keep, or None to drop it.
+
+    A persisted transcript line is attacker-writable, so a record read back from
+    meta is re-checked against the shape the collector emits before it reaches a
+    client: exactly the known keys, every retained string within the bound
+    ``_BLOCKED_LINK_STRING_BOUNDS`` gives it, a strict host, a rule id of
+    ``[a-z0-9_]``, a bounded non-negative int char count, and a retained path
+    that still passes BOTH removers. A record that fails is dropped on its own;
+    its siblings stand.
+    """
+    if not isinstance(record, dict) or set(record.keys()) != _BLOCKED_LINK_RECORD_KEYS:
+        return None
+    domain = record["domain"]
+    rule = record["rule"]
+    path = record["path"]
+    query_chars = record["query_chars"]
+    # Length first and from the table, so the cheap bound runs before any regex
+    # and no field can be retained without one.
+    for field, limit in _BLOCKED_LINK_STRING_BOUNDS.items():
+        value = record[field]
+        if value is None:
+            continue
+        if not isinstance(value, str) or len(value) > limit:
+            return None
+    if not isinstance(domain, str) or _BLOCKED_LINK_DOMAIN_RE.fullmatch(domain) is None:
+        return None
+    if not isinstance(rule, str) or _BLOCKED_LINK_RULE_RE.fullmatch(rule) is None:
+        return None
+    # bool is an int subclass; a True/False char count is malformed input.
+    if isinstance(query_chars, bool) or not isinstance(query_chars, int) or query_chars < 0:
+        return None
+    if query_chars > MAX_BLOCKED_LINK_QUERY_CHARS:
+        return None
+    if path is not None:
+        # The strictest posture available, not the one the URL was collected
+        # under: `is_https` and `port` only ever UNLOCK exemptions inside the
+        # warning (the Slack app-create alias needs https and no port), so
+        # re-checking as plain http with no port can only reject more. A
+        # legitimate record dropped here degrades the chip to host and reason,
+        # which is the fail-closed direction for attacker-writable input.
+        if _exfil_retained_path(domain, path, _exfil_exempt_hosts(), is_https=False) != path:
+            return None
+    return {"domain": domain, "rule": rule, "path": path, "query_chars": query_chars}
+
+
+def redact_exfiltration_urls_with_records(
+    text: str,
+) -> tuple[str, list[str], list[dict]]:
+    """Redact suspicious URLs and, in the SAME pass, describe each one.
+
+    Returns ``(cleaned_text, warnings, records)``. The redaction and the records
+    come out of one loop on purpose: two independent scans can disagree, and a
+    single collector feeding every consumer makes that class of drift
+    unrepresentable. :func:`redact_exfiltration_urls` is a thin wrapper that
+    drops the third element, so callers needing only the text are untouched.
+
+    A record retains STRUCTURE, never the query VALUE::
+
+        {"domain": str, "rule": str, "path": str | None, "query_chars": int}
+
+    A URL string appearing more than once yields ONE record, in first-appearance
+    order. There is deliberately no positional index: the placeholder carries
+    only the domain, so two URLs on one domain redact to byte-identical text and
+    a position could pair one link's path with another's.
+    """
+    warnings = scan_exfiltration_urls(text)
+    if not warnings:
+        return text, [], []
+
+    exempt_hosts = _exfil_exempt_hosts()
+    result = text
+    records: list[dict] = []
+    seen: set[str] = set()
+    overflow = 0
+    for match in _URL_RE.finditer(text):
+        domain = match.group(1)
+        path_and_query = match.group(3) or ""
+        port = match.group(2) or ""
+        is_https = match.group(0).lower().startswith("https://")
+        rules: list[str] = []
+        if not _exfil_url_warning(
+            domain,
+            path_and_query,
+            exempt_hosts,
+            port=port,
+            is_https=is_https,
+            _rule_out=rules,
+        ):
+            continue
+        matched = match.group(0)
+        # replace() rewrites every occurrence of this exact URL, and the loop can
+        # revisit it, so the record set is keyed by the matched string.
+        result = result.replace(matched, f"{EXFILTRATION_REDACTION_TAG_PREFIX}{domain}]")
+        if matched in seen:
+            continue
+        if len(records) >= MAX_BLOCKED_LINKS_PER_MESSAGE:
+            # Before `seen` grows, not after: a dedupe row for a match the cap
+            # already refused is state the cap was supposed to bound.
+            overflow += 1
+            continue
+        seen.add(matched)
+        qmark = path_and_query.find("?")
+        query = path_and_query[qmark + 1 :] if qmark != -1 else ""
+        path_only = path_and_query[:qmark] if qmark != -1 else path_and_query
+        rule = rules[0] if rules else "exfil_unknown"
+        if len(rule) > _BLOCKED_LINK_STRING_BOUNDS["rule"]:
+            rule = "exfil_unknown"
+        records.append(
+            {
+                "domain": domain,
+                "rule": rule,
+                "path": _exfil_retained_path(
+                    domain, path_only, exempt_hosts, port=port, is_https=is_https
+                ),
+                "query_chars": len(query),
+            }
+        )
+    if overflow:
+        logger.info(
+            "blocked-link records capped at %d for this message; %d further blocked "
+            "link match(es) are redacted in the text but carry no record",
+            MAX_BLOCKED_LINKS_PER_MESSAGE,
+            overflow,
+        )
+    return result, warnings, records
+
+
 def redact_exfiltration_urls(text: str) -> tuple[str, list[str]]:
     """Scan and redact suspicious exfiltration URLs from text.
 
     Returns (cleaned_text, list_of_warnings).
     """
-    warnings = scan_exfiltration_urls(text)
-    if not warnings:
-        return text, []
-
-    exempt_hosts = _exfil_exempt_hosts()
-    result = text
-    for match in _URL_RE.finditer(text):
-        domain = match.group(1)
-        if _exfil_url_warning(
-            domain,
-            match.group(3) or "",
-            exempt_hosts,
-            port=match.group(2) or "",
-            is_https=match.group(0).lower().startswith("https://"),
-        ):
-            result = result.replace(match.group(0), f"{EXFILTRATION_REDACTION_TAG_PREFIX}{domain}]")
-    return result, warnings
+    cleaned, warnings, _ = redact_exfiltration_urls_with_records(text)
+    return cleaned, warnings
 
 
 # Markerless 40-character values collide with OAuth entropy only for these

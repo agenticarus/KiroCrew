@@ -7013,6 +7013,15 @@
       "diff_status_failed": "এই ফাইলের git পরিবর্তন পরীক্ষা করা যায়নি।"
     },
     "markdownRenderer": {
+      "blocked_link_why": "কেন সরানো হলো?",
+      "blocked_link_label": "লিঙ্ক সরানো হয়েছে",
+      "blocked_link_query_chars": "ঠিকানার পরে {{chars}}টি অক্ষর সরানো হয়েছে",
+      "blocked_link_query_not_kept": "সেই অক্ষরগুলো রাখা হয়নি।",
+      "blocked_link_reason_credential": "মনে হচ্ছিল লিঙ্কটি কোনো গোপন কি বা ক্রেডেনশিয়াল বহন করছে।",
+      "blocked_link_reason_encoding": "এর ঠিকানায় দীর্ঘ এস্কেপ করা অক্ষরের সারি ছিল, যার ভেতরে ডেটা লুকানো যায়। অ-ল্যাটিন লিপিতে লেখা শিরোনামও একই রকম দেখায়।",
+      "blocked_link_reason_generic": "এটি এমন লিঙ্কের নিয়মের সঙ্গে মিলে গেছে যেগুলো কথোপকথনের ডেটা বাইরে পাঠাতে পারে।",
+      "blocked_link_reason_query": "ঠিকানার পরের অক্ষরগুলো দেখে মনে হয়েছে সেগুলো কথাবার্তা থেকে তথ্য বাইরে নিয়ে যাচ্ছে।",
+      "blocked_link_rule": "নিয়মের আইডি: <rule/>",
       "download_failed": "ডায়াগ্রাম ডাউনলোড করা যায়নি। আবার চেষ্টা করুন।",
       "diagram_actions": "আরও অ্যাকশন",
       "download_svg": "SVG ডাউনলোড করুন",

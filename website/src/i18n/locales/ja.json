@@ -6910,6 +6910,15 @@
       "diff_status_failed": "このファイルの git の変更を確認できませんでした。"
     },
     "markdownRenderer": {
+      "blocked_link_why": "削除された理由",
+      "blocked_link_label": "リンクを削除",
+      "blocked_link_query_chars": "アドレスの後ろの {{chars}} 文字を削除",
+      "blocked_link_query_not_kept": "その文字は保存していません。",
+      "blocked_link_reason_credential": "リンクに秘密情報または認証情報が含まれているように見えました。",
+      "blocked_link_reason_encoding": "アドレスにエスケープ文字が長く連なっていました。そこにはデータを隠せますが、非ラテン文字で書いた題名も同じ形になります。",
+      "blocked_link_reason_generic": "会話データを外部へ送信する可能性のあるリンクの規則に一致しました。",
+      "blocked_link_reason_query": "アドレスの後ろの文字が、会話からデータを持ち出しているように見えました。",
+      "blocked_link_rule": "ルール ID: <rule/>",
       "download_failed": "図をダウンロードできませんでした。もう一度お試しください。",
       "diagram_actions": "その他の操作",
       "download_svg": "SVG をダウンロード",

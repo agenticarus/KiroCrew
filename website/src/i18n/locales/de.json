@@ -7013,6 +7013,15 @@
       "diff_status_failed": "Die git-Änderungen dieser Datei konnten nicht geprüft werden."
     },
     "markdownRenderer": {
+      "blocked_link_why": "Warum entfernt?",
+      "blocked_link_label": "Link entfernt",
+      "blocked_link_query_chars": "{{chars}} Zeichen nach der Adresse entfernt",
+      "blocked_link_query_not_kept": "Diese Zeichen wurden nicht behalten.",
+      "blocked_link_reason_credential": "Der Link schien ein Geheimnis oder Anmeldedaten zu enthalten.",
+      "blocked_link_reason_encoding": "Die Adresse enthielt eine lange Folge maskierter Zeichen, in denen sich Daten verstecken lassen. Ein Titel in nicht lateinischer Schrift sieht genauso aus.",
+      "blocked_link_reason_generic": "Er entsprach einer Regel für Links, die Gesprächsdaten nach außen senden können.",
+      "blocked_link_reason_query": "Die Zeichen nach der Adresse sahen aus, als würden sie Daten aus der Unterhaltung hinaustragen.",
+      "blocked_link_rule": "Regel-ID: <rule/>",
       "download_failed": "Das Diagramm konnte nicht heruntergeladen werden. Versuche es erneut.",
       "diagram_actions": "Weitere Aktionen",
       "download_svg": "SVG herunterladen",

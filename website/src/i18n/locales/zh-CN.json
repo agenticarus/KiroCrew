@@ -6910,6 +6910,15 @@
       "diff_status_failed": "无法检查此文件的 git 更改。"
     },
     "markdownRenderer": {
+      "blocked_link_why": "为什么删除？",
+      "blocked_link_label": "链接已删除",
+      "blocked_link_query_chars": "地址后面删除了 {{chars}} 个字符",
+      "blocked_link_query_not_kept": "这些字符没有保留。",
+      "blocked_link_reason_credential": "该链接看起来携带了密钥或凭据。",
+      "blocked_link_reason_encoding": "它的地址里有一长串转义字符，这种形式可以藏数据。非拉丁文字写的标题看起来也一样。",
+      "blocked_link_reason_generic": "它匹配到了可能向外发送对话数据的链接规则。",
+      "blocked_link_reason_query": "地址后面的字符看起来在把对话里的数据带出去。",
+      "blocked_link_rule": "规则 ID：<rule/>",
       "download_failed": "无法下载图表。请重试。",
       "diagram_actions": "更多操作",
       "download_svg": "下载 SVG",

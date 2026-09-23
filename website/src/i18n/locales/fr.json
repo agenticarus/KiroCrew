@@ -7116,6 +7116,15 @@
       "diff_status_failed": "Impossible de vérifier les modifications git de ce fichier."
     },
     "markdownRenderer": {
+      "blocked_link_why": "Pourquoi supprimé ?",
+      "blocked_link_label": "Lien supprimé",
+      "blocked_link_query_chars": "{{chars}} caractères supprimés après l'adresse",
+      "blocked_link_query_not_kept": "Ces caractères n'ont pas été conservés.",
+      "blocked_link_reason_credential": "Le lien semblait contenir un secret ou un identifiant.",
+      "blocked_link_reason_encoding": "Son adresse contenait une longue suite de caractères échappés, ce qui peut cacher des données. Un titre écrit dans une écriture non latine y ressemble.",
+      "blocked_link_reason_generic": "Il correspondait à une règle visant les liens susceptibles d'envoyer des données de la conversation vers l'extérieur.",
+      "blocked_link_reason_query": "Les caractères après l'adresse semblaient emporter des données hors de la conversation.",
+      "blocked_link_rule": "Identifiant de règle : <rule/>",
       "download_failed": "Impossible de télécharger le diagramme. Réessayez.",
       "diagram_actions": "Plus d’actions",
       "download_svg": "Télécharger le SVG",

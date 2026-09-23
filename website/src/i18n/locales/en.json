@@ -4703,6 +4703,15 @@
       "word_wrap": "Word wrap"
     },
     "markdownRenderer": {
+      "blocked_link_why": "Why removed?",
+      "blocked_link_label": "Link removed",
+      "blocked_link_query_chars": "{{chars}} characters removed after the address",
+      "blocked_link_query_not_kept": "Those characters were not kept.",
+      "blocked_link_reason_credential": "It looked like the link carried a secret or credential.",
+      "blocked_link_reason_encoding": "Its address held a long run of escaped characters, which can hide data. A title written in a non-Latin script can look the same.",
+      "blocked_link_reason_generic": "It matched a rule for links that can send conversation data out.",
+      "blocked_link_reason_query": "The characters after the address looked like they were carrying data out of the conversation.",
+      "blocked_link_rule": "Rule id: <rule/>",
       "click_to_copy": "Click to copy",
       "click_to_open_shift_click_to_reveal_in_finder": "Click to open / Shift+click to reveal in Finder",
       "close": "Close",
