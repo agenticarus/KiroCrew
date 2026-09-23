@@ -104,6 +104,9 @@ HOOK_EVENT_PRE_TOOL_USE = "PreToolUse"
 HOOK_EVENT_POST_TOOL_USE = "PostToolUse"
 HOOK_EVENT_STOP = "Stop"
 
+#: The events the gateway itself fires. ``ScriptHookStore.fire`` has a call site
+#: for each one, and ``steering-and-hooks.md`` documents their exit-code
+#: contract. Membership here is what makes an event a *lifecycle* event.
 HOOK_EVENTS = (
     HOOK_EVENT_AGENT_SPAWN,
     HOOK_EVENT_USER_PROMPT_SUBMIT,
@@ -111,6 +114,57 @@ HOOK_EVENTS = (
     HOOK_EVENT_POST_TOOL_USE,
     HOOK_EVENT_STOP,
 )
+
+# Triggers a Kiro Agent session owns that the gateway has no lifecycle call site
+# for. They are authorable and persisted, and NO EVENT FIRES ANY OF THEM: no call
+# site fires one and no other reader consumes this tuple. That is why they are a
+# separate tuple rather than new members of ``HOOK_EVENTS`` -- an event in that
+# tuple carries a promise that something calls ``fire`` for it, and these carry
+# none.
+#
+# "No event fires them" is not "the command cannot run": the dashboard's Test
+# endpoint runs a STORED hook's command on demand and never consults this tuple
+# (``handlers/hooks.py`` ``api_hook_test`` -> ``run_script_hook``), so Test works on
+# one of these exactly as it does on a fired event.
+#
+# They are not equidistant from running, and a reader planning the delivery side
+# needs the difference. A Kiro Agent requests hooks by trigger name over ACP from
+# a fixed set of seven, and only ``preTaskExecution`` and ``postTaskExecution``
+# are in it; the file and manual triggers are absent, so a Kiro Agent does not ask
+# for those four at all today. All six are valid names in a Kiro Agent's own
+# profile, which is what makes storing all six correct.
+HOOK_EVENT_PRE_TASK_EXECUTION = "PreTaskExecution"
+HOOK_EVENT_POST_TASK_EXECUTION = "PostTaskExecution"
+HOOK_EVENT_FILE_CREATED = "FileCreated"
+HOOK_EVENT_FILE_EDITED = "FileEdited"
+HOOK_EVENT_FILE_DELETED = "FileDeleted"
+HOOK_EVENT_USER_TRIGGERED = "UserTriggered"
+
+HOOK_EVENTS_KAS_ONLY = (
+    HOOK_EVENT_PRE_TASK_EXECUTION,
+    HOOK_EVENT_POST_TASK_EXECUTION,
+    HOOK_EVENT_FILE_CREATED,
+    HOOK_EVENT_FILE_EDITED,
+    HOOK_EVENT_FILE_DELETED,
+    HOOK_EVENT_USER_TRIGGERED,
+)
+
+#: The subset a Kiro Agent session actually asks its client for. It requests
+#: hooks by trigger name from a fixed set of seven, and only these two of the six
+#: are in it -- so these wait on Kiro Crew answering that request, while the file
+#: and manual triggers are not asked for at all. The dashboard marks the two
+#: groups differently because the distance to running is different, and it reads
+#: the split from here rather than restating it in copy.
+HOOK_EVENTS_AGENT_REQUESTED = (
+    HOOK_EVENT_PRE_TASK_EXECUTION,
+    HOOK_EVENT_POST_TASK_EXECUTION,
+)
+
+#: Every event a hook may be authored against and persisted under. This is the
+#: authoring vocabulary -- the dashboard form's options, the create/update
+#: schemas, and the store's own load and save gates all read this set, so an
+#: event absent from it is refused at authoring time and dropped on reload.
+HOOK_EVENTS_ALL = HOOK_EVENTS + HOOK_EVENTS_KAS_ONLY
 
 
 @dataclass
@@ -4225,7 +4279,7 @@ def validate_hook_fields(
 
     Raises ``ValueError`` (which the dashboard handler maps to HTTP 400) when:
 
-    * ``event`` is not one of ``HOOK_EVENTS``;
+    * ``event`` is not one of ``HOOK_EVENTS_ALL``;
     * ``timeout`` is not an int in ``[1, 300]``;
     * neither ``command`` nor ``skills`` is present (an empty hook);
     * ``skills`` is combined with a ``command`` (the skills would never fire);
@@ -4233,7 +4287,7 @@ def validate_hook_fields(
       (the "Load skills:" directive has no consumer there);
     * ``matcher_mode`` is ``regex`` with a syntactically invalid ``matcher``.
     """
-    if event not in HOOK_EVENTS:
+    if event not in HOOK_EVENTS_ALL:
         raise ValueError(f"invalid event: {event}")
     if (
         isinstance(timeout, bool)
@@ -4883,7 +4937,10 @@ class ScriptHookStore:
             try:
                 if not isinstance(h, dict):
                     raise TypeError("hook entry is not an object")
-                if h.get("event", HOOK_EVENT_USER_PROMPT_SUBMIT) not in HOOK_EVENTS:
+                # The full authoring vocabulary, not the fired subset: a hook
+                # stored against a Kiro Agent trigger must survive a reload,
+                # and the narrower set would quarantine it as unparseable.
+                if h.get("event", HOOK_EVENT_USER_PROMPT_SUBMIT) not in HOOK_EVENTS_ALL:
                     raise ValueError("hook entry has an invalid event")
                 hook = ScriptHook.from_dict(h)
                 # Keep insertion inside the per-entry guard: a hand-edited ID

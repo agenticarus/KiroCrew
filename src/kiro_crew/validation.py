@@ -167,9 +167,28 @@ LESSON_LIST_OFFSET_MAX = 100_000_000
 # Allowed cron schedule kinds
 ALLOWED_SCHEDULE_KINDS = frozenset({"every", "cron", "at"})
 
-# Allowed hook events
+# Every event a script hook may be authored against: the five the gateway fires,
+# plus the six a Kiro Agent session owns, which are stored and fired by no event
+# (``hooks.HOOK_EVENTS_KAS_ONLY``, whose header says which of the six a Kiro
+# Agent even asks for and why Test still runs one). Spelled
+# out rather than imported from ``kiro_crew.hooks``, which imports this module --
+# ``test_hook_validation_parity`` pins the two sets equal, so a member added
+# there and forgotten here fails a test instead of silently refusing the new
+# event at the create and update schemas.
 ALLOWED_HOOK_EVENTS = frozenset(
-    {"AgentSpawn", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"}
+    {
+        "AgentSpawn",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+        "PreTaskExecution",
+        "PostTaskExecution",
+        "FileCreated",
+        "FileEdited",
+        "FileDeleted",
+        "UserTriggered",
+    }
 )
 
 # Valid agent name pattern (alphanumeric, hyphens, underscores)

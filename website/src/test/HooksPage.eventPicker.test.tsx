@@ -71,15 +71,26 @@ describe('hooks page — lifecycle event picker', () => {
     expect(trigger).toHaveTextContent('UserPromptSubmit')
   })
 
-  it('offers every lifecycle event and commits the pick', async () => {
+  it('offers every authorable trigger and commits the pick', async () => {
     renderPage()
     const trigger = await openForm()
 
     // Radix Select: open, then click — a `change` on the trigger does nothing.
     fireEvent.click(trigger)
-    await waitFor(() => expect(screen.getAllByRole('option')).toHaveLength(5))
-    expect(screen.getAllByRole('option').map(o => o.textContent)).toEqual([
+    await waitFor(() => expect(screen.getAllByRole('option')).toHaveLength(11))
+    // The five the gateway fires, then the six a Kiro Agent session owns. The
+    // order is asserted whole because the picker's order is the one the hook
+    // table sorts rows by.
+    //
+    // Read past the dormant mark: six options carry a trailing badge, so
+    // `textContent` is `FileEdited` + `stored only`. The mark itself is covered
+    // below; what this asserts is the vocabulary and its order.
+    const names = screen.getAllByRole('option')
+      .map(o => (o.textContent ?? '').replace(/waiting|stored/, '').trim())
+    expect(names).toEqual([
       'AgentSpawn', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop',
+      'PreTaskExecution', 'PostTaskExecution', 'FileCreated', 'FileEdited', 'FileDeleted',
+      'UserTriggered',
     ])
 
     fireEvent.click(screen.getByRole('option', { name: 'PreToolUse' }))
@@ -92,6 +103,89 @@ describe('hooks page — lifecycle event picker', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
     await waitFor(() => expect(createHook).toHaveBeenCalledTimes(1))
     expect(createHook.mock.calls[0][0]).toMatchObject({ event: 'PreToolUse' })
+  })
+
+  it.each([
+    'PreTaskExecution', 'PostTaskExecution', 'FileCreated', 'FileEdited', 'FileDeleted',
+    'UserTriggered',
+  ])('saves a hook authored against %s', async (event) => {
+    renderPage()
+    const trigger = await openForm()
+    fireEvent.click(trigger)
+    fireEvent.click(await screen.findByRole('option', { name: event }))
+    await waitFor(() => expect(screen.getByLabelText('Event')).toHaveTextContent(event))
+
+    // These are not tool events, so the matcher keeps its message-mode copy --
+    // picking one must not put the form in the tool-filter shape.
+    expect(screen.queryByPlaceholderText(/Matcher \(tool filter/)).toBeNull()
+
+    fireEvent.change(screen.getByPlaceholderText('Hook name'), { target: { value: 'h' } })
+    fireEvent.change(screen.getByPlaceholderText(/hook fired/), { target: { value: 'true' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(createHook).toHaveBeenCalledTimes(1))
+    expect(createHook.mock.calls[0][0]).toMatchObject({ event, command: 'true' })
+  })
+
+  it.each([
+    ['PreTaskExecution', 'waiting'],
+    ['PostTaskExecution', 'waiting'],
+    ['FileCreated', 'stored'],
+    ['FileEdited', 'stored'],
+    ['FileDeleted', 'stored'],
+    ['UserTriggered', 'stored'],
+  ])('marks %s in the picker as "%s"', async (event, mark) => {
+    renderPage()
+    const trigger = await openForm()
+    fireEvent.click(trigger)
+    const option = await screen.findByRole('option', { name: event })
+
+    // The mark rides the option, and the option's ACCESSIBLE NAME stays the bare
+    // wire value — `findByRole(name: event)` above is the assertion for that, and
+    // it is what keeps locators and a screen reader's "select FileEdited" working.
+    expect(option).toHaveTextContent(mark)
+  })
+
+  it('does not mark the five events the gateway fires', async () => {
+    renderPage()
+    const trigger = await openForm()
+    fireEvent.click(trigger)
+    await screen.findByRole('option', { name: 'AgentSpawn' })
+    for (const event of ['AgentSpawn', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop']) {
+      const option = screen.getByRole('option', { name: event })
+      expect(option).not.toHaveTextContent('waiting')
+      expect(option).not.toHaveTextContent('stored')
+    }
+  })
+
+  it.each([
+    ['PostTaskExecution', 'waiting'],
+    ['FileEdited', 'stored'],
+  ])('a %s row says "%s" in STATUS instead of an em dash', async (event, mark) => {
+    hooksPayload = {
+      hooks: [{
+        id: 'h1', name: 'formatter', event, matcher: '', command: 'formatter --changed',
+        matcher_mode: 'glob', skills: [],
+        timeout: 30, enabled: true, last_run: 0, last_status: '', last_error: '', run_count: 0,
+      }],
+    }
+    renderPage()
+    expect(await screen.findByText(mark)).toBeTruthy()
+  })
+
+  it('lets a real status win over the mark once the hook has been tested', async () => {
+    // A dormant hook that was Tested HAS a result, and the result is the more
+    // useful thing to show: the mark answers "will this run on its own", which
+    // the row's own event already implies once you know the vocabulary.
+    hooksPayload = {
+      hooks: [{
+        id: 'h1', name: 'formatter', event: 'FileEdited', matcher: '', command: 'true',
+        matcher_mode: 'glob', skills: [],
+        timeout: 30, enabled: true, last_run: 1, last_status: 'ok', last_error: '', run_count: 1,
+      }],
+    }
+    renderPage()
+    await screen.findByRole('button', { name: 'More actions' })
+    expect(screen.queryByText('stored')).toBeNull()
   })
 
   it('shows a stored event the picker no longer offers instead of the first option', async () => {

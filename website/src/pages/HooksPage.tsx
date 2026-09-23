@@ -16,6 +16,7 @@ import { useSortableTable } from '../hooks/useSortableTable'
 import { useScrollEdges } from '../hooks/useScrollEdges'
 import { useArmedDelete } from '../hooks/useArmedDelete'
 import SortableHeader from '../components/SortableHeader'
+import { EVENTS, KAS_ONLY_EVENTS, AGENT_REQUESTED_EVENTS } from './hookEventWireValues'
 
 import { i18nT } from '../i18n/t'
 interface Hook {
@@ -34,7 +35,6 @@ interface HookTestResult {
   stderr?: string
 }
 
-const EVENTS = ['AgentSpawn', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop']
 const MATCHER_MODES = ['glob', 'regex', 'contains']
 
 const EVENT_STYLE: Record<string, string> = {
@@ -43,14 +43,35 @@ const EVENT_STYLE: Record<string, string> = {
   PreToolUse: 'bg-aim-subtle text-aim border-aim/30',
   PostToolUse: 'bg-aim-subtle text-aim border-aim/30',
   Stop: 'bg-warn-subtle text-warn border-warn/30',
+  PreTaskExecution: 'bg-aim-subtle text-aim border-aim/30',
+  PostTaskExecution: 'bg-aim-subtle text-aim border-aim/30',
+  FileCreated: 'bg-ok-subtle text-ok border-ok/30',
+  FileEdited: 'bg-ok-subtle text-ok border-ok/30',
+  FileDeleted: 'bg-warn-subtle text-warn border-warn/30',
+  UserTriggered: 'bg-accent/15 text-accent border-accent/30',
 }
 
 const EVENT_BADGE: Record<string, 'ok' | 'err' | 'warn' | 'aim'> = {
   AgentSpawn: 'ok', UserPromptSubmit: 'ok',
   PreToolUse: 'aim', PostToolUse: 'aim', Stop: 'warn',
+  PreTaskExecution: 'aim', PostTaskExecution: 'aim',
+  FileCreated: 'ok', FileEdited: 'ok', FileDeleted: 'warn',
+  UserTriggered: 'ok',
 }
 
 const EVENT_ORDER = Object.fromEntries(EVENTS.map((e, i) => [e, i]))
+
+/** The mark an event carries when no event fires it, or undefined when one does.
+ *
+ *  Two marks, not one: the distance to running differs. A task trigger is asked
+ *  for by an agent and waits only on this side answering; a file or manual
+ *  trigger is not asked for at all. One mark for both would be a promise to
+ *  four of them that nothing has made. */
+const dormantMark = (event: string): string | undefined =>
+  !KAS_ONLY_EVENTS.includes(event) ? undefined
+    : AGENT_REQUESTED_EVENTS.includes(event)
+      ? i18nT('pages.hooksPage.awaiting_agent')
+      : i18nT('pages.hooksPage.stored_only')
 
 const normalizeEvent = (e: string) => e.charAt(0).toUpperCase() + e.slice(1)
 
@@ -99,6 +120,13 @@ function HookForm({ hook, onSave, onCancel }: {
           <Input placeholder={i18nT('pages.hooksPage.hook_name')} value={name} onChange={e => setName(e.target.value)} />
           <SimpleSelect
             options={EVENTS}
+            // The mark rides the OPTION, which is where the choice is made; the
+            // option's value and accessible name stay the bare wire value, and the
+            // touch path spells the same fact as `name -- mark`.
+            optionBadges={EVENTS.map(e => {
+              const mark = dormantMark(e)
+              return mark ? { label: mark, source: 'kirocrew' } : undefined
+            })}
             value={event}
             onChange={setEvent}
             // A hook stored with an event this picker no longer offers (legacy
@@ -401,7 +429,19 @@ export default function HooksPage({ embedded }: { embedded?: boolean } = {}) {
                         {/* The persisted last_error is not tooltip-only: the
                             chevron expands it beneath the row as an ErrorNotice
                             (the status column is too narrow to hold it inline). */}
-                        {!h.last_status ? <span className="text-muted italic">—</span>
+                        {!h.last_status && dormantMark(h.event)
+                          // An em dash reads as "has not run yet", which is the wrong
+                          // story for a row nothing will ever run. Only when the hook
+                          // HAS a status does the status win: a dormant hook that was
+                          // Tested has a real result to show.
+                          //
+                          // `muted`, not `warn`: amber beside a green OK read as a
+                          // fault, and a designed dormant state is not one. The mark
+                          // is short enough to fit the column, so it carries its own
+                          // decode in `title` rather than sending the reader to the
+                          // panel's "?".
+                          ? <Badge variant="muted" title={i18nT('pages.hooksPage.runs_on_no_event_yet')}>{dormantMark(h.event)}</Badge>
+                          : !h.last_status ? <span className="text-muted italic">—</span>
                           : h.last_status === 'ok' ? <Badge variant="ok">{i18nT('pages.hooksPage.ok')}</Badge>
                           : (
                             <span className="inline-flex items-center gap-1">
