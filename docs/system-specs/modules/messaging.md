@@ -4,7 +4,7 @@
 
 `kiro_crew.messaging` is the channel-neutral transport abstraction used by the shipped Slack, Discord, Telegram, Webex, WeCom, Microsoft Teams, Weixin, iMessage, WhatsApp, and Feishu integrations; its conservative contract also leaves room for a further channel. It avoids re-implementing streaming, tool approval, session identity, or rendering for each integration. It holds the channel-neutral core of the Slack turn loop (`slack/handler.py::handle_message`) so a new channel implements only two small interfaces (a `MessagingTransport` + a `Renderer`) and inherits everything else.
 
-**Dependency direction is one-way:** `slack` / `dashboard` → `messaging`, never the reverse. The `kiro_crew.messaging` package imports nothing from `kiro_crew.slack` or `kiro_crew.dashboard`; its only first-party dependencies are the shared lower-level helpers — `acp.types` event constants, the `security` redactors (`redact_credentials` / `redact_exfiltration_urls`), and `sel` for audit.
+**Dependency direction is one-way:** `slack` / `dashboard` → `messaging`, never the reverse. The `kiro_crew.messaging` package imports nothing from `kiro_crew.slack` or `kiro_crew.dashboard`; its only first-party dependencies are the shared lower-level helpers — `acp.types` event constants, the `security` redactors (`redact_credentials` / `redact_exfiltration_urls`), `sel` for audit, and, function-locally from `privacy_mode`, `session_map` (the durable flag) and `history` (the transcript header the mode is stamped into).
 
 Slack's transport path is gated behind the `messaging.use_transport` config flag (default `true` in Kiro Crew, so the abstraction is the canonical path); when off, Slack's native `handle_message` path runs instead.
 
@@ -1737,14 +1737,48 @@ rather than a second copy of them; `slack/handler.py` keeps every public symbol
   class rather than any attribute: a `MagicMock` stand-in returns a **truthy mock**
   for every flag, which would mark every session both temporary and incognito —
   failing closed, but wrongly and silently.
+- **Two durable records, two readers.** The `SessionMap` flag is what `hydrate`
+  restores the channel's own gate from on every inbound message, and it keeps
+  the map entry alive through `SessionMap.prune` and the per-read repair (both
+  loop-side and lock-held, so neither reads a transcript): the flag protects the
+  conversation's transcript, which outlives the provider session whose
+  reclaimed file makes an entry stale, and a memory reader that found neither
+  record would read the thread as persistent. Once the header carries a mode at
+  least as strict as the flag the entry protects nothing, and
+  `SessionMap.collect_recorded_privacy_entries` -- awaited by `start_pool` right
+  after `prune`, the `sid` stats and header probes both on a worker thread, the
+  lock-held halves touching no file -- collects it like any other
+  stale row.
+  The transcript header's `memory_mode` is the record the memory readers
+  consult: `apply_mode` stamps it through `_persist_transcript_mode`
+  (`ConversationLog.update_metadata_if` on the default `ConversationLog`, off the
+  loop, best-effort) so a transcript read never depends on the map being loaded,
+  and every memory reader already refuses on that field (`is_incognito_transcript`,
+  the shared `resolve_consolidation_target` behind the consolidator and the
+  consolidate route -- which reads it only for a target whose mode neither the
+  execution record nor the map flag already knows, so a known-restricted session's
+  transcript is never opened -- and the dashboard's persisted probe). Tighten-only: a `!incognito` typed after
+  `!temporary` leaves `temporary` in place. Upserted: a thread flagged before its
+  first turn gets a metadata-only header — the mode marker, no user-authored
+  content, the same shape `bind_session_execution` writes for a restricted
+  session — and `ConversationLog.append` keeps an existing header, so the first
+  row any later writer appends lands under it. This is not the `/title` defect
+  below: the header carries the mode and nothing the user typed. A thread flagged
+  before the stamp existed is covered by its map entry until the startup
+  collection step copies the mode into its existing transcript's header and
+  retires the row.
 - **`apply_mode(mode, session_key, *, source, caller, resources, sessions, notify,
   on_applied) -> bool`** is idempotent and returns whether the mode was NEWLY
   applied. The in-memory mark lands FIRST, before any await, so a concurrent
   inbound message cannot observe the session as unrestricted after the user asked
-  for privacy; then the durable write, the audit (`f"{source}.{mode}_mode"`), the
-  caller's `on_applied` hook, and the notice. A persist failure is logged, not
-  raised — the mark already holds for this process, and refusing the modifier would
-  tell the user privacy is off while it is on.
+  for privacy; then, still before any await, the map flag and the audit
+  (`f"{source}.{mode}_mode"`) — so a task cancelled while the awaited transcript
+  header write is in flight (a gateway shutdown right after the modifier) has
+  already written the audit record, which the idempotency return would never
+  come back to write; then the header write, the caller's `on_applied` hook,
+  and the notice. A persist failure — either record — is logged, not raised — the
+  mark already holds for this process, and refusing the modifier would tell the
+  user privacy is off while it is on.
 - **`strip_and_apply(text, session_key, *, source, …) -> (text, only_modifier)`**
   is the single-text entry point. `only_modifier` means the message was nothing
   but modifiers and the caller MUST return without starting a turn. Slack drives
@@ -1752,10 +1786,13 @@ rather than a second copy of them; `slack/handler.py` keeps every public symbol
   carries two texts and only the mention-stripped command text decides
   `only_modifier`.
 - **Everything platform-shaped is a parameter**: `source` (the audit label),
-  `sessions` (only to reach the one `SessionMap`), `notify` (delivers
-  `NOTICE_TEMPORARY` / `NOTICE_INCOGNITO`, held here so two channels cannot
-  describe the same mode differently), and `on_applied` (Slack's `set_slack_link`,
-  so follow-ups pass its in-active-thread gate).
+  `sessions` (supplying it is what makes the mode durable; it is used only to
+  reach the one `SessionMap`), `notify` (delivers `NOTICE_TEMPORARY` /
+  `NOTICE_INCOGNITO`, held here so two channels cannot describe the same mode
+  differently), and `on_applied` (Slack's `set_slack_link`, so follow-ups pass
+  its in-active-thread gate). The header write takes no parameter: every
+  production `ConversationLog` reads the one configured sessions directory, so
+  the default instance reaches the file the channel writes.
 - **`strictest(modes) -> str`** collapses several requests into the one mode a
   shared turn can carry, for a channel whose queue drain answers a burst of
   messages as a single turn under a single key. Ranked on `_STRICTNESS`, which is

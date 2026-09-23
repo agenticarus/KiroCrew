@@ -33,6 +33,7 @@ from kiro_crew.messaging.link import (
     legacy_dashboard_mirror_key,
     split_dm_session_key,
 )
+from kiro_crew.messaging.privacy_mode import strictest
 from kiro_crew.sel import _infer_source, sel
 from kiro_crew.validation import bounded_session_id
 
@@ -72,10 +73,26 @@ GENERATION_FLOOR_FIELD = "generation_floor"
 # Flags that are durable SETTINGS rather than session-scoped state, and so keep
 # their entry alive through :meth:`SessionMap.prune`. Membership is opt-in
 # BECAUSE immortality has a cost: an entry that prune can never collect is a row
-# the map carries forever, and every mutation rewrites the whole map. A flag
-# describing one session (Slack's ``temporary`` / ``incognito`` threads) must
-# stay collectable — one leaked row per such thread would grow without bound.
+# the map carries forever, and every mutation rewrites the whole map.
 _DURABLE_FLAGS = frozenset({MIRROR_OPT_OUT_FLAG})
+
+# The ``!temporary`` / ``!incognito`` privacy modes, spelled exactly as
+# ``messaging.privacy_mode`` names them (MODE_TEMPORARY / MODE_INCOGNITO; a test
+# pins the two spellings together), strictest first (the ranking
+# ``privacy_mode.strictest`` uses; pinned by the same test). Session-scoped, and
+# NOT immortal: a privacy flag keeps its entry only while the conversation's
+# Kiro Crew transcript header does not yet carry the mode. The flag protects
+# that transcript -- the turns written before the modifier -- which outlives the
+# provider session whose reclaimed file is what makes an entry stale; a memory
+# reader that finds neither record reads the thread as persistent and
+# consolidates it. The two stale paths (``prune`` and the per-read repair)
+# therefore KEEP a flagged entry, clearing only its dead ``sid``; whether the
+# header already carries the mode is decided off the event loop and off the map
+# lock by :meth:`SessionMap.collect_recorded_privacy_entries`, which the startup
+# path awaits after ``prune`` -- a transcript read is disk I/O the loop must not
+# pay and the lock must not be held across (see the class docstring).
+_PRIVACY_STRICTNESS = ("temporary", "incognito")
+_PRIVACY_FLAGS = frozenset(_PRIVACY_STRICTNESS)
 
 # How long a deferred flush waits before serializing, so a burst of mutations
 # (a subagent wave calling ``set`` once per spawn) collapses into one write
@@ -87,11 +104,64 @@ _FLUSH_DEBOUNCE_SECS = 0.05
 
 
 def _has_durable_flag(entry: dict) -> bool:
-    """True iff *entry* carries a flag that must outlive its native session."""
+    """True iff *entry* carries a durable SETTING (:data:`_DURABLE_FLAGS`)."""
     flags = entry.get("flags")
     if not isinstance(flags, dict):
         return False
     return any(flags.get(name) for name in _DURABLE_FLAGS)
+
+
+def _privacy_flags_on(entry: dict) -> list[str]:
+    """The privacy flags *entry* carries, strictest first (``[]`` for none)."""
+    flags = entry.get("flags")
+    if not isinstance(flags, dict):
+        return []
+    return [name for name in _PRIVACY_STRICTNESS if flags.get(name)]
+
+
+def _header_records_privacy_mode(key: str, flagged: list[str]) -> bool:
+    """True iff *key*'s transcript header carries a mode at least as strict as *flagged*.
+
+    The header (``memory_mode``, the field every memory reader refuses on) is the
+    record that outlives the map row. It is ENSURED here, not merely read: a
+    thread flagged before the modifier stamped headers has the mode in its map
+    row alone, so the mode is copied into an EXISTING transcript's header first
+    (``update_metadata_if``, tighten-only, ``require_existing`` -- this must
+    never create a transcript), and only then is the header consulted. A
+    transcript that does not exist, an unreadable header, or a header carrying a
+    weaker mode than the flag all answer False: the row still protects
+    something, and keeping is the safe direction.
+
+    Disk I/O on purpose kept out of every guarded method: call it from a worker
+    thread with no map lock held (:meth:`SessionMap.collect_recorded_privacy_entries`).
+    """
+    if not flagged:
+        return False
+    # Call-time import, like ``channel_key_for_stem``'s ``_safe_key`` below, and
+    # for weight rather than a cycle (there is none: nothing in ``history``'s
+    # import graph imports this module). ``kiro_crew.history`` is the memory
+    # facade -- the consolidator, skills, the vector-memory constants ride in
+    # with it -- and this module is a leaf of the session layer: ``import
+    # kiro_crew.session`` loads 519 modules without it and 1006 with it
+    # (measured), for every process that needs sessions and no memory.
+    from kiro_crew.history import ConversationLog
+
+    mode = flagged[0]
+
+    def _tighten_only(metadata: dict) -> bool:
+        return strictest([str(metadata.get("memory_mode") or ""), mode]) == mode
+
+    log = ConversationLog()
+    try:
+        log.update_metadata_if(key, {"memory_mode": mode}, _tighten_only, require_existing=True)
+        header_mode = log.get_metadata(key).get("memory_mode")
+    except Exception:
+        return False
+    if header_mode not in _PRIVACY_FLAGS:
+        return False
+    # ``_PRIVACY_STRICTNESS`` is strictest first: the header is enough iff it is
+    # at least as strict as the strictest flag the entry carries.
+    return _PRIVACY_STRICTNESS.index(str(header_mode)) <= _PRIVACY_STRICTNESS.index(mode)
 
 
 def _survives_prune(entry: dict) -> bool:
@@ -100,6 +170,7 @@ def _survives_prune(entry: dict) -> bool:
     Durable settings, an explicit generation floor, and channel bindings all
     outlive a provider session. The generation floor prevents a restart from
     reusing a history key after ``/new`` was acknowledged before the first turn.
+    Entry-only, no I/O; :func:`_keeps_entry` adds the privacy-flag rule.
     """
     floor = entry.get(GENERATION_FLOOR_FIELD)
     has_generation_floor = isinstance(floor, int) and not isinstance(floor, bool) and floor > 0
@@ -109,6 +180,17 @@ def _survives_prune(entry: dict) -> bool:
         or entry.get("slack_thread_ts")
         or entry.get("mirror")
     )
+
+
+def _keeps_entry(entry: dict) -> bool:
+    """The one predicate both stale paths ask: keep *entry* (clearing only its ``sid``)?
+
+    :func:`_survives_prune` for the durable reasons, plus a privacy flag, which
+    keeps the entry until :meth:`SessionMap.collect_recorded_privacy_entries`
+    has confirmed -- off the loop -- that the transcript header records the
+    mode. No I/O: this runs under the map lock, on the event loop.
+    """
+    return _survives_prune(entry) or bool(_privacy_flags_on(entry))
 
 
 def _stash_and_clear_sid(entry: dict) -> bool:
@@ -867,16 +949,19 @@ class SessionMap:
     def _repair_or_remove_stale(self, key: str) -> None:
         """Drop a stale entry, or clear only its ``sid`` when state must outlive it.
 
-        Asks :func:`_survives_prune`, the same predicate :meth:`prune` uses, so
-        the two stale paths cannot disagree: an entry carrying a channel binding
-        or a durable flag keeps the entry and loses only the dead ``sid``. The
+        Asks :func:`_keeps_entry`, the same predicate :meth:`prune` uses, so
+        the two stale paths cannot disagree: an entry carrying a channel binding,
+        a durable flag or a privacy flag keeps the entry and loses only the dead
+        ``sid`` (a privacy-flagged entry is collected only by
+        :meth:`collect_recorded_privacy_entries`, which has read the transcript
+        header off the loop; this path never reads a transcript). The
         binding is the conversation's identity — deleting it here would strand the
         channel. No inbound-unbind audit or notice fires on the repair branch,
         because no binding was removed; the removal branch reaches an entry that
         holds none.
         """
         entry = self._data.get(key)
-        if entry is not None and _survives_prune(entry):
+        if entry is not None and _keeps_entry(entry):
             if _stash_and_clear_sid(entry):
                 self._save()
             return
@@ -1144,7 +1229,7 @@ class SessionMap:
 
         An entry carrying a DURABLE flag or a channel binding is never deleted,
         and when its ``sid`` has gone stale the ``sid`` is cleared instead —
-        :func:`_survives_prune` is the single predicate both stale branches ask,
+        :func:`_keeps_entry` is the single predicate both stale branches ask,
         so neither can start discarding what the other keeps. A durable flag is a
         per-conversation SETTING, not session state: it can be written before the
         conversation has ever run a turn (``/unlink`` as the very first message
@@ -1157,24 +1242,29 @@ class SessionMap:
         message from the channel opens a fresh session instead of resuming the
         one it is bound to.
 
-        Session-SCOPED flags (a temporary or incognito thread) are deliberately
-        NOT durable: they describe one session, so keeping their entries alive
-        would leak a never-collected row per such thread and grow the map — which
-        every mutation rewrites — without bound.
+        A privacy-mode flag (a temporary or incognito thread) is session-SCOPED
+        and keeps its entry here: the flag protects the conversation's
+        transcript, which outlives the provider session whose reclaimed file made
+        the entry stale, and a memory reader that finds neither record reads the
+        thread as persistent. Whether the transcript header already records the
+        mode -- in which case the entry has nothing left to protect -- is a
+        transcript read, which this loop-side, lock-held method must not pay;
+        :meth:`collect_recorded_privacy_entries`, awaited right after this on the
+        startup path, answers it on a worker thread and collects those entries.
 
         Returns the number of entries removed; a ``sid``-only reset is a repair,
         not a removal, so it is not counted.
 
         Collection goes through :meth:`_remove_entry` rather than deleting out of
         ``_data``, so it inherits the audit and the announcement every other
-        removal path gets. Today that is unreachable — :func:`_survives_prune`
-        holds every bound entry back — and reaching the choke point anyway is the
-        point: a future loosening of that predicate then lands on an audited path
-        instead of silently collecting a live binding. On prune's only production
-        path (``start_pool``, on the startup loop) the per-entry saves coalesce
-        through ``_save``'s debounced deferred flush into one worker-thread
-        write; off the loop each save writes inline, which no production caller
-        does.
+        removal path gets. For bound entries that is unreachable --
+        :func:`_survives_prune` holds every bound entry back -- and reaching the
+        choke point anyway is the point: a future loosening of that predicate then
+        lands on an audited path instead of silently collecting a live binding. On
+        prune's only production path (``start_pool``, on the startup loop) the
+        per-entry saves coalesce through ``_save``'s debounced deferred flush into
+        one worker-thread write; off the loop each save writes inline, which no
+        production caller does.
         """
         sessions_dir = _kiro_sessions_dir()
         stale: list[str] = []
@@ -1185,7 +1275,7 @@ class SessionMap:
             if (entry.get("provider") or PROVIDER_LABEL_DEFAULT) != PROVIDER_LABEL_DEFAULT:
                 continue
             sid = entry.get("sid")
-            survives = _survives_prune(entry)
+            survives = _keeps_entry(entry)
             if sid and not (sessions_dir / f"{sid}.json").exists():
                 if survives:
                     _stash_and_clear_sid(entry)
@@ -1215,6 +1305,103 @@ class SessionMap:
             # the same stale sid and repairs it again forever.
             self._save()
         return len(stale)
+
+    @_guarded
+    def stale_privacy_entries(self) -> dict[str, tuple[str, list[str]]]:
+        """Privacy-flagged entries that only their flag keeps alive: key -> (sid, flags).
+
+        The entries :meth:`prune` (or the per-read repair) kept for their
+        ``temporary`` / ``incognito`` flag alone -- no durable setting, no channel
+        binding. Whether each one may now go is answered off the loop by
+        :meth:`collect_recorded_privacy_entries`: whether its ``sid`` file still
+        exists (a live session is not stale) and whether its transcript header
+        records the mode (:func:`_header_records_privacy_mode`). This is the
+        cheap, lock-held half that names the candidates, and it performs NO
+        filesystem call: the ``sid`` each candidate carries (``""`` once
+        :meth:`prune` cleared a reclaimed one) travels with it so the worker
+        thread can stat it, and the lock-held removal can tell a row whose
+        ``sid`` changed underneath from one the worker judged.
+        """
+        out: dict[str, tuple[str, list[str]]] = {}
+        for key, entry in self._data.items():
+            if (entry.get("provider") or PROVIDER_LABEL_DEFAULT) != PROVIDER_LABEL_DEFAULT:
+                continue
+            if _survives_prune(entry):
+                continue
+            flagged = _privacy_flags_on(entry)
+            if not flagged:
+                continue
+            sid = entry.get("sid")
+            out[key] = (sid if isinstance(sid, str) else "", flagged)
+        return out
+
+    @_guarded
+    def _collect_privacy_entries(self, recorded: dict[str, str]) -> int:
+        """Remove the entries in *recorded* (key -> the ``sid`` the worker judged)
+        that are still privacy-only survivors.
+
+        Re-checked under the lock on ENTRY STATE alone, no filesystem call: an
+        entry that gained a binding, lost its flag, or whose ``sid`` differs from
+        the one the worker saw (a live session bound while the probe ran off the
+        loop) is current again and stays. The same ``sid`` cannot come back to
+        life -- kiro-cli never re-creates a reclaimed session file under its old
+        id -- so equality is the whole check. Goes through :meth:`_remove_entry`
+        like every other removal.
+        """
+        removed = 0
+        for key, seen_sid in recorded.items():
+            entry = self._data.get(key)
+            if entry is None or _survives_prune(entry) or not _privacy_flags_on(entry):
+                continue
+            sid = entry.get("sid")
+            if (sid if isinstance(sid, str) else "") != seen_sid:
+                continue
+            self._remove_entry(key, reason=UNBIND_REASON_PRUNED_STALE)
+            removed += 1
+        if removed:
+            self._rebuild_thread_index()
+            self._save()
+            logger.info(
+                "Pruned %d privacy-flagged session map entries recorded in their transcripts",
+                removed,
+            )
+        return removed
+
+    async def collect_recorded_privacy_entries(self) -> int:
+        """Collect the privacy-flagged stale entries whose transcript header records the mode.
+
+        The startup path awaits this right after :meth:`prune`. The candidates
+        are named under the lock with no filesystem call
+        (:meth:`stale_privacy_entries`); on a worker thread with no lock held,
+        each candidate's ``sid`` file is stat-ed (one that still exists is a live
+        session, not a candidate) and the transcript header is probed -- and,
+        for a row flagged before the modifier stamped headers, written --
+        (:func:`_header_records_privacy_mode`); the confirmed rows are removed
+        under the lock again (:meth:`_collect_privacy_entries`, which compares
+        entry state to what the worker saw and touches no file). So the event
+        loop never pays a stat or a transcript read for these rows, the map lock
+        is never held across one, and the header -- the record every memory
+        reader refuses on -- is in place before the row protecting the thread
+        goes. Returns the number of entries removed.
+        """
+        candidates = self.stale_privacy_entries()
+        if not candidates:
+            return 0
+        sessions_dir = _kiro_sessions_dir()
+
+        def _probe() -> dict[str, str]:
+            recorded: dict[str, str] = {}
+            for key, (sid, flagged) in candidates.items():
+                if sid and (sessions_dir / f"{sid}.json").exists():
+                    continue
+                if _header_records_privacy_mode(key, flagged):
+                    recorded[key] = sid
+            return recorded
+
+        recorded = await asyncio.to_thread(_probe)
+        if not recorded:
+            return 0
+        return self._collect_privacy_entries(recorded)
 
     @_guarded
     def mapped_sids_by_key(self) -> dict[str, str]:

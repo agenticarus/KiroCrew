@@ -1900,7 +1900,24 @@ flush on a crash leaves a well-formed older map, never a truncated file.
 **Auto-prune:** `SessionMap.get()` auto-removes entries whose `.json` file
 no longer exists (the entry drops from memory immediately; the file write rides
 the deferred flush). `SessionMap.prune()` bulk-removes all stale entries at
-startup.
+startup. Both paths ask `_keeps_entry`: an entry carrying a durable setting,
+a generation floor, a channel binding (`_survives_prune`), or a `temporary` /
+`incognito` privacy flag loses only its dead `sid` and keeps the rest -- with no
+transcript read, because both run under the map lock on the event loop. The
+privacy exception is the one that expires: the flag protects a transcript that
+outlives the provider session, and once that transcript's own header carries a
+mode at least as strict as the flag the entry protects nothing. That check is a
+disk read, so `start_pool` awaits `SessionMap.collect_recorded_privacy_entries()`
+right after `prune()`: the stale flagged rows are listed under the lock with no
+filesystem call (`stale_privacy_entries`, each with the `sid` it carries), a
+worker thread stats each row's `sid` file (a live session is not a candidate)
+and probes its header -- a row flagged before headers were stamped has the mode
+copied into its existing transcript's header first
+(`_header_records_privacy_mode`, tighten-only, never creating a transcript) --
+and the rows the header now covers are removed under the lock again
+(`_collect_privacy_entries`, comparing entry state -- flags, binding, `sid` --
+to what the worker saw, so a row a live session re-bound meanwhile stays, and
+touching no file). Immortality stays opt-in (`_DURABLE_FLAGS`).
 
 **Mapped-session enumeration:** `SessionMap.mapped_sids_by_key()` returns session
 key → kiro-cli session ID for every entry that has one. Disk accounting

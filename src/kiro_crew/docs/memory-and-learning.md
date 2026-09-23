@@ -169,7 +169,21 @@ Kiro Crew automatically consolidates conversations into memory:
 - **Preferences/projects**: every 30 messages per session
 - **Daily history + lessons**: after 3 hours idle per session
 
-No manual action needed — it happens in the background.
+No manual action needed — it happens in the background. The manual trigger
+(Overview → Memory tab → Summarize now, or `POST /api/memory/consolidate`) refuses
+an Incognito or Temporary session with a 403 no matter which session triggers it,
+and the background paths skip those sessions — including a Slack or Telegram
+thread marked `!incognito` / `!temporary`, whose mode is recorded in the thread's
+own transcript header so it holds across restarts — so the mode table above holds
+for every route. The Memory tab's tally reports those refusals as skipped, not
+failed, and names the mode when every skipped session shares one ("1 skipped:
+incognito session"); a failed count means a request genuinely failed, and the
+notice lists the sessions it failed for (by title, with the session key beside
+it) until you dismiss it, with a "Retry N failed" button that re-runs those
+sessions only. If the session list itself cannot be loaded, the tab says so as a
+failure (with the server's message) rather than reporting nothing to summarize.
+The line under the button says what it does: it writes summaries into memory
+and leaves your conversations untouched.
 
 ## Reading Memory Programmatically
 

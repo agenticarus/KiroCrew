@@ -20,6 +20,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from kiro_crew import execution_context
 from kiro_crew.config import live
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.frontmatter import SKILL_UPDATE, frontmatter_value
@@ -31,6 +32,8 @@ from kiro_crew.llm_helpers import (
     ToolApprovalPolicy,
     background_turn,
 )
+from kiro_crew.messaging import privacy_mode
+from kiro_crew.messaging.link import is_channel_session_key, is_legacy_slack_key
 from kiro_crew.project_scope import scope_is_admissible
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.skills import AUTO_SKILL_MAX_PROCEDURE_CHARS, AutoSkillProvenance
@@ -166,6 +169,134 @@ class _ConsolidationRefusedSentinel:
 
 
 _CONSOLIDATION_REFUSED = _ConsolidationRefusedSentinel()
+
+
+# The three durable sources of a consolidation target's memory mode, named the
+# way ``_refuse_restricted`` and the dashboard route report them.
+TARGET_SOURCE_EXECUTION = "execution record"
+TARGET_SOURCE_HEADER = "transcript header"
+TARGET_SOURCE_SESSION_MAP = "session map"
+
+
+class RestrictedTarget(NamedTuple):
+    """A consolidation target whose durable record says temporary or incognito."""
+
+    mode: str
+    """``temporary`` or ``incognito``."""
+    source: str
+    """Which record said so: one of the ``TARGET_SOURCE_*`` names."""
+
+
+class ConsolidationTarget(NamedTuple):
+    """What :func:`resolve_consolidation_target` read about a target, and its verdict."""
+
+    execution: Any
+    """The ``ExecutionContext`` bound to the key, or ``None``."""
+    metadata: dict
+    """The transcript header (``{}`` when there is none, or no log to read it from)."""
+    restricted: RestrictedTarget | None
+    """``None`` when no durable record calls the target temporary or incognito."""
+
+
+def channel_thread_mode(key: str, sessions: Any) -> str | None:
+    """The ``temporary`` / ``incognito`` mode channel thread *key* holds in the session map.
+
+    A channel thread marked ``!temporary`` or ``!incognito`` records that mode in
+    two places (``privacy_mode.apply_mode``): the transcript header's
+    ``memory_mode``, which :func:`resolve_restricted_target` reads ahead of this,
+    and the session map's per-conversation flag, keyed by the thread's LIVE key
+    (``slack:<ts>``). This read covers what the header cannot: a thread flagged
+    before the header carried the mode -- the entry is then the only record, and
+    the consolidator copies the mode into the header when this read refuses --
+    and a mark whose best-effort header write failed. Without it such a thread
+    reads as persistent and the idle sweep or the channel's session-end hook
+    consolidates its pre-flag transcript into durable memory.
+
+    *sessions* is the ``SessionManager`` whose map the modifier wrote through
+    (``None`` keeps the other two sources). The flag is read the way the
+    dashboard's ``live_session_memory_mode`` reads it: ``privacy_mode.hydrate``
+    restores the durable flag into the process-local trackers, and the trackers
+    answer -- which also honours a mark whose disk write failed, held for this
+    process only. A caller that names the thread by its transcript stem
+    (``slack_<ts>``: the dashboard trigger and the CLI) is unfolded to the live
+    key through the map first, the only authority for the ``:``-to-``_`` fold;
+    ``""`` keeps the key. Cheap and allocation-free for an unflagged key: dict
+    lookups plus one pass over the map for a stem, no disk read. ``None`` for a
+    non-channel key or an unflagged thread.
+    """
+    if sessions is None:
+        return None
+    if not (is_channel_session_key(key) or is_legacy_slack_key(key)):
+        return None
+    live_key = key
+    unfold = getattr(sessions, "channel_key_for_stem", None)
+    if callable(unfold):
+        unfolded = unfold(key)
+        if isinstance(unfolded, str) and is_channel_session_key(unfolded):
+            live_key = unfolded
+    privacy_mode.hydrate(sessions, live_key)
+    # Strictest first, the ranking ``privacy_mode.strictest`` uses: a thread
+    # carrying both flags reads as temporary.
+    if privacy_mode.is_temporary(live_key):
+        return privacy_mode.MODE_TEMPORARY
+    if privacy_mode.is_incognito(live_key):
+        return privacy_mode.MODE_INCOGNITO
+    return None
+
+
+async def resolve_consolidation_target(
+    key: str, *, log: ConversationLog | None, sessions: Any
+) -> ConsolidationTarget:
+    """The ONE read of a consolidation target's durable memory-mode records.
+
+    Both the dashboard route (``api_memory_consolidate``) and
+    ``HistoryConsolidator._consolidate`` ask this, so a source known to one is
+    known to the other by construction -- a source added here refuses at the
+    route and in the background sweep alike, and a source added anywhere else
+    is the bug class this exists to close (a thread the route passed and the
+    consolidator refused, or the reverse). Three sources, and the ORDER is a
+    privacy contract: a mode already KNOWN without opening the transcript
+    refuses first -- the execution record (live registry or persisted carrier),
+    then a channel thread's session-map flag through the process-local trackers
+    (:func:`channel_thread_mode`) -- and only a target neither knows falls
+    through to the transcript header's ``memory_mode`` (which the channel
+    modifier stamps too, so a transcript read never depends on the session
+    map). A restricted session whose mode is known is therefore refused without
+    this resolver, or the pass behind it, opening its transcript, not even for
+    the header (``test_restricted_consolidation_never_reads_transcript_or_opens_memory``
+    pins this); an entry point's own pre-checks ahead of the pass
+    (``consolidate_session``, ``consolidate_now``) are outside that scope.
+    ``restricted is None`` means no durable record calls the target
+    restricted; it says nothing about LIVE state (a dashboard slot's mode, an
+    inherited subagent mode), which the route reads separately and the
+    background paths cannot see. The header read on the fall-through rides
+    along, so the consolidator resolves its memory identity from the same
+    execution record and header without a second read. The file reads run off
+    the loop.
+    """
+    # Call-time import, and the one that has to be: ``kiro_crew.history`` imports
+    # THIS module at module scope (its facade re-exports the consolidator), so a
+    # module-scope import here is the cycle ``history -> history_consolidation
+    # -> history`` and fails on whichever side loads second.
+    from kiro_crew.history import is_incognito_transcript
+
+    execution = await asyncio.to_thread(execution_context.read_session_execution, key)
+    if execution is not None and execution.memory_mode != "persistent":
+        return ConsolidationTarget(
+            execution, {}, RestrictedTarget(execution.memory_mode, TARGET_SOURCE_EXECUTION)
+        )
+    mode = channel_thread_mode(key, sessions)
+    if mode is not None:
+        return ConsolidationTarget(execution, {}, RestrictedTarget(mode, TARGET_SOURCE_SESSION_MAP))
+    metadata: dict = {}
+    if log is not None:
+        read = await asyncio.to_thread(log.get_metadata, key)
+        if isinstance(read, dict):
+            metadata = read
+    restricted: RestrictedTarget | None = None
+    if is_incognito_transcript(metadata.get("memory_mode")):
+        restricted = RestrictedTarget(str(metadata.get("memory_mode")), TARGET_SOURCE_HEADER)
+    return ConsolidationTarget(execution, metadata, restricted)
 
 
 class AttemptedSpan(NamedTuple):
@@ -533,6 +664,15 @@ class HistoryConsolidator:
         self._last_lifecycle: float = 0.0
         self._running: set[str] = set()
         self._tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+        # Keys _refuse_restricted refused as temporary or incognito, with the
+        # mode: the memo the two AUTOMATIC entry points (check_idle_sessions,
+        # maybe_consolidate) consult before scheduling, so neither re-attempts
+        # a session already known to be refused. The explicit triggers
+        # (consolidate_session, consolidate_now, the dashboard route) do not
+        # read it: an explicit attempt is attempted, refused and audited every
+        # time. A mode only ever tightens, so a memo cannot go stale; it is
+        # process-local, so a restart costs one refusal per thread.
+        self._restricted_refused: dict[str, str] = {}
         # Track last activity per session for idle-based history consolidation
         self._last_activity: dict[str, float] = {}
         self._history_consolidated: dict[str, float] = {}  # key → last history consolidation time
@@ -722,6 +862,11 @@ class HistoryConsolidator:
             return
         if key in self._running:
             return
+        # Same memo as the idle sweep: past the threshold a refused private
+        # thread would otherwise schedule (and audit) a refusal on EVERY turn,
+        # since a refusal advances no offset.
+        if key in self._restricted_refused:
+            return
         total = len(self._log._read_messages(key))
         prefs_off = self._prefs_offset.get(key, 0)
         if total - prefs_off < _CONSOLIDATION_THRESHOLD:
@@ -762,6 +907,13 @@ class HistoryConsolidator:
         now = _time.time()
         for key, last in list(self._last_activity.items()):
             if now - last < self._history_idle_secs:
+                continue
+            # Already refused as temporary or incognito by a pass this process
+            # ran: a refusal sets no throttle (it is not a completed pass), so
+            # without this the sweep would re-schedule the key every tick and
+            # write one audit denial a minute for the life of the process.
+            # The memo is checked first, ahead of the metadata reads below.
+            if key in self._restricted_refused:
                 continue
             total, unconsolidated = self._log.consolidation_counts(key)
             if (
@@ -879,6 +1031,41 @@ class HistoryConsolidator:
         outcome = await self._consolidate(key, include_history=True)
         return outcome is not _CONSOLIDATION_REFUSED
 
+    def _refuse_restricted(self, key: str, mode: str, source: str) -> _ConsolidationRefusedSentinel:
+        """Refuse *key* as a *mode* session learned from *source*.
+
+        Two traces. The debug line names the source, so a skip is distinguishable
+        from a pass and a header that predates the modifier's stamp is visible
+        as such. The SEL record is the denial the dashboard route writes for the
+        same target (``memory.consolidate`` / ``denied`` /
+        ``restricted_target_session:<mode>``), with the target key appended and
+        ``source="background"`` because no request carried it here -- so an
+        audit reader sees a background sweep's refusal beside the route's.
+
+        EVERY refusal writes its own record; nothing is windowed, counted or
+        folded. An audit event that is sometimes not written is a gap the reader
+        cannot see, whatever a later record claims to account for. The volume
+        that a windowed record was meant to tame is solved where it arises
+        instead: the key goes into ``_restricted_refused``, and the two
+        automatic entry points skip a memoed key before scheduling anything --
+        a restricted session is attempted once per process by the idle sweep,
+        not once per 60 s tick. An explicit trigger ignores the memo, so a
+        Summarize-now aimed at the session is attempted and audited every time.
+        """
+        self._logger.debug("consolidation skipped for %s: %s session (%s)", key, mode, source)
+        self._restricted_refused[key] = mode
+        try:
+            _facade_sel().log_api_access(
+                caller="history_consolidator",
+                operation="memory.consolidate",
+                outcome="denied",
+                source="background",
+                resources=f"restricted_target_session:{mode}:{key}",
+            )
+        except Exception:  # noqa: BLE001 - the refusal must hold even if audit fails
+            self._logger.debug("SEL denial record failed for %s", key, exc_info=True)
+        return _CONSOLIDATION_REFUSED
+
     async def _consolidate(
         self, key: str, include_history: bool = True
     ) -> _ConsolidationRefusedSentinel | None:
@@ -922,16 +1109,31 @@ class HistoryConsolidator:
                 )
                 return _CONSOLIDATION_REFUSED
 
-            from kiro_crew.execution_context import read_session_execution
-            from kiro_crew.history import is_incognito_transcript
-
-            execution = await asyncio.to_thread(read_session_execution, key)
-            if execution is not None and execution.memory_mode != "persistent":
-                return _CONSOLIDATION_REFUSED
-
-            metadata = await asyncio.to_thread(self._log.get_metadata, key)
-            if isinstance(metadata, dict) and is_incognito_transcript(metadata.get("memory_mode")):
-                return _CONSOLIDATION_REFUSED
+            # Memory-mode choke point. Every entry point -- the idle sweep,
+            # maybe_consolidate, the expiry sweep, the dashboard trigger and
+            # the CLI -- funnels through here, so a temporary or incognito
+            # session is refused before THIS PASS reads its transcript (the
+            # snapshot below) even when a caller carries no target-side check
+            # of its own. The scope is the pass, not the entry point: the
+            # fire-and-forget consolidate_session and the CLI's consolidate_now
+            # read the transcript for their own pre-checks (the unconsolidated
+            # count, the sensitive-session scan) before scheduling this, so a
+            # restricted session's transcript IS read there -- and nothing of
+            # it is written anywhere. The durable records are read by
+            # resolve_consolidation_target, the ONE resolver the dashboard
+            # route asks as well, so the two cannot disagree on what refuses; a
+            # mode already known (execution record, session-map flag) refuses
+            # without the resolver opening the transcript, and only an unknown
+            # one reads the header. Each refusal goes through
+            # _refuse_restricted: a debug trace naming the source, and the same
+            # SEL denial the dashboard route records. A map-only mode is copied
+            # into the transcript header by the startup prune, off the loop and
+            # without a consolidation ever opening the transcript
+            # (SessionMap.collect_recorded_privacy_entries).
+            target = await resolve_consolidation_target(key, log=self._log, sessions=self._sessions)
+            execution, metadata, restricted = target
+            if restricted is not None:
+                return self._refuse_restricted(key, restricted.mode, restricted.source)
             # Atomically snapshot the unconsolidated tail, the total message
             # count (the absolute offset handed to mark_consolidated below), and
             # the rotation generation under ONE lock hold. Reading them as

@@ -90,6 +90,320 @@ class TestFlags:
         assert sm.get_flag("slack:1.2", "temporary") is True  # namespaced read
 
 
+class TestPrivacyFlagsAndPrune:
+    """A ``temporary`` / ``incognito`` flag keeps its entry through both stale
+    paths; the entry goes only once the transcript header records the mode, and
+    that decision is taken off the event loop.
+
+    The flag protects the conversation's transcript, which outlives the provider
+    session whose reclaimed file makes the entry stale; a memory reader that finds
+    neither the entry nor a header mode reads the thread as persistent. ``prune()``
+    and the per-read repair keep such an entry WITHOUT reading a transcript (they
+    run under the map lock, on the loop); ``collect_recorded_privacy_entries()``
+    probes -- and for a legacy row, stamps -- the header on a worker thread and
+    removes the rows the header now covers. Immortality stays opt-in. Mutations:
+    make ``_header_records_privacy_mode`` return True unconditionally -- the
+    ``kept`` cases go red; return False -- the ``collected`` cases go red.
+    """
+
+    KEY = "telegram:kirocrew:direct:4242"
+
+    def test_flag_names_are_the_privacy_mode_names_strictest_first(self):
+        from kiro_crew.messaging import privacy_mode
+        from kiro_crew.session_map import _PRIVACY_FLAGS, _PRIVACY_STRICTNESS
+
+        assert _PRIVACY_FLAGS == {privacy_mode.MODE_TEMPORARY, privacy_mode.MODE_INCOGNITO}
+        # The collection rule compares strictness the way ``privacy_mode.strictest`` does.
+        assert list(_PRIVACY_STRICTNESS) == [
+            m for m in privacy_mode._STRICTNESS if m in _PRIVACY_FLAGS
+        ]
+
+    @staticmethod
+    def _log(*, seed: bool, mode: str | None = None):
+        """The thread's default-directory transcript: seeded with a turn, optionally stamped."""
+        from kiro_crew import history as history_mod
+        from kiro_crew.history import ConversationLog
+
+        log = ConversationLog()
+        log.init()
+        if seed:
+            with history_mod.allow_on_loop_persist():
+                log.append(TestPrivacyFlagsAndPrune.KEY, "user", "a pre-modifier turn")
+        if mode is not None:
+            log.update_metadata_if(
+                TestPrivacyFlagsAndPrune.KEY, {"memory_mode": mode}, lambda _m: True
+            )
+        return log
+
+    @pytest.mark.parametrize("flag", ["temporary", "incognito"])
+    def test_startup_prune_keeps_a_stale_flagged_entry_and_reads_no_transcript(
+        self, patched, monkeypatch, flag
+    ):
+        """The loop-side half: sid cleared, flag kept, on disk -- and no header read."""
+        from kiro_crew.history import ConversationLog
+
+        monkeypatch.setattr(
+            ConversationLog,
+            "get_metadata",
+            lambda self, key: pytest.fail("prune read a transcript"),
+        )
+        sm = SessionMap()
+        sm.set(self.KEY, "sid-reclaimed-by-kiro-cli")  # no such file under the kiro dir
+        sm.set_flag(self.KEY, flag, True)
+        assert sm.prune() == 0
+        assert sm.get_flag(self.KEY, flag) is True
+        assert (sm._data.get(self.KEY) or {}).get("sid") == ""
+        assert SessionMap().get_flag(self.KEY, flag) is True
+        # The candidate travels with the sid prune left it (cleared), so the
+        # worker thread can stat it and the lock-held removal can compare it.
+        assert sm.stale_privacy_entries() == {self.KEY: ("", [flag])}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("flag", ["temporary", "incognito"])
+    async def test_the_off_loop_step_collects_an_entry_whose_header_carries_the_mode(
+        self, patched, flag
+    ):
+        """The header is the durable record; the row has nothing left to protect."""
+        self._log(seed=True, mode=flag)
+        sm = SessionMap()
+        sm.set(self.KEY, "sid-reclaimed-by-kiro-cli")
+        sm.set_flag(self.KEY, flag, True)
+        assert sm.prune() == 0
+        assert await sm.collect_recorded_privacy_entries() == 1
+        assert sm.get_flag(self.KEY, flag) is False
+        assert self.KEY not in sm._data
+        assert SessionMap().get_flag(self.KEY, flag) is False
+
+    @pytest.mark.asyncio
+    async def test_the_off_loop_step_stamps_a_legacy_rows_mode_into_the_header_then_collects(
+        self, patched
+    ):
+        """A row flagged before headers were stamped: the mode moves into the
+        existing transcript's header first, so the memory readers keep refusing
+        after the row is gone."""
+        log = self._log(seed=True)
+        assert "memory_mode" not in log.get_metadata(self.KEY), "premise: legacy header"
+        sm = SessionMap()
+        sm.set(self.KEY, "sid-reclaimed-by-kiro-cli")
+        sm.set_flag(self.KEY, "incognito", True)
+        assert sm.prune() == 0
+        assert await sm.collect_recorded_privacy_entries() == 1
+        assert log.get_metadata(self.KEY).get("memory_mode") == "incognito"
+        assert self.KEY not in sm._data
+
+    @pytest.mark.asyncio
+    async def test_a_stricter_flag_tightens_the_header_before_the_row_goes(self, patched):
+        """``!incognito`` then ``!temporary`` with the header still saying incognito:
+        the header is tightened to temporary, then the row is collected."""
+        log = self._log(seed=True, mode="incognito")
+        sm = SessionMap()
+        sm.set(self.KEY, "sid-reclaimed-by-kiro-cli")
+        sm.set_flag(self.KEY, "temporary", True)
+        sm.prune()
+        assert await sm.collect_recorded_privacy_entries() == 1
+        assert log.get_metadata(self.KEY).get("memory_mode") == "temporary"
+
+    @pytest.mark.asyncio
+    async def test_a_flagged_entry_with_no_transcript_is_kept(self, patched):
+        """``!incognito`` as the very first message: no sid, no transcript. Nothing to
+        stamp (a refusal must never create a transcript), so the row stays."""
+        sm = SessionMap()
+        sm.set_flag(self.KEY, "incognito", True)
+        assert sm.prune() == 0
+        assert await sm.collect_recorded_privacy_entries() == 0
+        assert sm.get_flag(self.KEY, "incognito") is True
+
+    @pytest.mark.asyncio
+    async def test_an_unwritable_or_unreadable_header_keeps_the_entry(self, patched, monkeypatch):
+        """Unreadable is not "already recorded": keeping is the safe direction."""
+        from kiro_crew.history import ConversationLog
+
+        self._log(seed=True, mode="incognito")
+        monkeypatch.setattr(
+            ConversationLog,
+            "update_metadata_if",
+            lambda self, *a, **kw: (_ for _ in ()).throw(OSError("read-only")),
+        )
+        sm = SessionMap()
+        sm.set(self.KEY, "sid-reclaimed-by-kiro-cli")
+        sm.set_flag(self.KEY, "incognito", True)
+        sm.prune()
+        assert await sm.collect_recorded_privacy_entries() == 0
+        assert sm.get_flag(self.KEY, "incognito") is True
+
+    @pytest.mark.asyncio
+    async def test_a_row_that_came_back_to_life_during_the_probe_is_not_collected(self, patched):
+        """Re-checked under the lock: a live sid regained while the probe ran off
+        the loop makes the row current again."""
+        self._log(seed=True, mode="incognito")
+        tmp, kiro = patched
+        sm = SessionMap()
+        sm.set(self.KEY, "sid-reclaimed-by-kiro-cli")
+        sm.set_flag(self.KEY, "incognito", True)
+        sm.prune()
+        _make_kiro_session(kiro, "sid-alive")
+        sm.set(self.KEY, "sid-alive")  # the thread resumed before the collection landed
+        assert await sm.collect_recorded_privacy_entries() == 0
+        assert sm.get_flag(self.KEY, "incognito") is True
+
+    def test_the_per_read_repair_keeps_the_flag_and_reads_no_transcript(self, patched, monkeypatch):
+        """``get()`` on a stale sid keeps the entry whatever the header says; collection
+        belongs to the startup step, off the loop."""
+        from kiro_crew.history import ConversationLog
+
+        self._log(seed=True, mode="temporary")
+        monkeypatch.setattr(
+            ConversationLog,
+            "get_metadata",
+            lambda self, key: pytest.fail("the repair read a transcript"),
+        )
+        sm = SessionMap()
+        sm.set(self.KEY, "sid-reclaimed-by-kiro-cli")
+        sm.set_flag(self.KEY, "temporary", True)
+        assert sm.get(self.KEY) is None
+        assert sm.get_flag(self.KEY, "temporary") is True
+
+    @pytest.mark.asyncio
+    async def test_the_header_probe_never_runs_on_the_loop_thread(self, patched, monkeypatch):
+        """The whole point of the split: the transcript I/O is a worker thread's."""
+        import threading
+
+        from kiro_crew.history import ConversationLog
+
+        loop_thread = threading.current_thread()
+        seen: list[threading.Thread] = []
+        real_get = ConversationLog.get_metadata
+        real_update = ConversationLog.update_metadata_if
+
+        def _recording_get(self, key):
+            seen.append(threading.current_thread())
+            return real_get(self, key)
+
+        def _recording_update(self, *a, **kw):
+            seen.append(threading.current_thread())
+            return real_update(self, *a, **kw)
+
+        self._log(seed=True, mode="incognito")
+        monkeypatch.setattr(ConversationLog, "get_metadata", _recording_get)
+        monkeypatch.setattr(ConversationLog, "update_metadata_if", _recording_update)
+        sm = SessionMap()
+        sm.set(self.KEY, "sid-reclaimed-by-kiro-cli")
+        sm.set_flag(self.KEY, "incognito", True)
+        sm.prune()
+        assert await sm.collect_recorded_privacy_entries() == 1
+        assert seen, "premise: the header was probed"
+        assert [t for t in seen if t is loop_thread] == []
+
+    @pytest.mark.asyncio
+    async def test_the_sid_stat_never_runs_on_the_loop_thread_either(self, patched, monkeypatch):
+        """Naming the candidates and removing the confirmed rows are entry-state
+        work under the lock; whether a candidate's ``sid`` file still exists is
+        answered on the worker thread beside the header probe, so a map with many
+        flagged rows costs the loop no filesystem call. A row whose session is
+        live is still kept -- judged off the loop, not skipped on it."""
+        import pathlib
+        import threading
+
+        from kiro_crew import session_map as session_map_mod
+
+        tmp, kiro = patched
+        loop_thread = threading.current_thread()
+        stats: list[threading.Thread] = []
+
+        class _RecordingPath(type(pathlib.Path())):
+            def exists(self, *a, **kw):
+                stats.append(threading.current_thread())
+                return super().exists(*a, **kw)
+
+        live = "telegram:kirocrew:direct:7"
+        self._log(seed=True, mode="incognito")
+        _make_kiro_session(kiro, "sid-alive")
+        sm = SessionMap()
+        sm.set(self.KEY, "sid-reclaimed-by-kiro-cli")
+        sm.set_flag(self.KEY, "incognito", True)
+        sm.set(live, "sid-alive")
+        sm.set_flag(live, "incognito", True)
+        sm.prune()  # its own stats are the pre-existing loop-side pass
+        monkeypatch.setattr(session_map_mod, "_KIRO_SESSIONS_DIR", _RecordingPath(kiro))
+        assert sm.stale_privacy_entries() == {
+            self.KEY: ("", ["incognito"]),
+            live: ("sid-alive", ["incognito"]),
+        }
+        assert stats == [], "naming the candidates stat-ed a session file on the loop"
+        assert await sm.collect_recorded_privacy_entries() == 1
+        assert stats, "premise: the live row's sid file was stat-ed"
+        assert [t for t in stats if t is loop_thread] == []
+        assert self.KEY not in sm._data
+        assert sm.get_flag(live, "incognito") is True and sm.get(live) == "sid-alive"
+
+    def test_an_unflagged_stale_entry_is_still_collected_by_prune(self, patched):
+        """The two-step rule is exactly the two privacy flags, not every entry."""
+        sm = SessionMap()
+        sm.set(self.KEY, "sid-reclaimed-by-kiro-cli")
+        assert sm.prune() == 1
+
+
+class TestStartPoolPrunesOffTheLoop:
+    """``start_pool()`` prunes on the loop and awaits the header probe off it."""
+
+    @pytest.mark.asyncio
+    async def test_start_pool_reads_no_transcript_header_on_the_loop_thread(
+        self, patched, monkeypatch
+    ):
+        import threading
+        from unittest.mock import AsyncMock, MagicMock
+
+        from kiro_crew import history as history_mod
+        from kiro_crew.config import KiroCrewConfig
+        from kiro_crew.history import ConversationLog
+        from kiro_crew.session import SessionManager
+
+        key = TestPrivacyFlagsAndPrune.KEY
+        log = ConversationLog()
+        log.init()
+        with history_mod.allow_on_loop_persist():
+            log.append(key, "user", "a pre-modifier turn")
+        log.update_metadata_if(key, {"memory_mode": "incognito"}, lambda _m: True)
+        seeded = SessionMap()
+        seeded.set(key, "sid-reclaimed-by-kiro-cli")
+        seeded.set_flag(key, "incognito", True)
+        seeded.flush()
+
+        loop_thread = threading.current_thread()
+        seen: list[threading.Thread] = []
+        real_get = ConversationLog.get_metadata
+
+        def _recording_get(self, k):
+            seen.append(threading.current_thread())
+            return real_get(self, k)
+
+        monkeypatch.setattr(ConversationLog, "get_metadata", _recording_get)
+
+        def factory(session_key=None, agent=None, channel_id=None, **kwargs):
+            m = AsyncMock()
+            m.start = AsyncMock()
+            m.shutdown = AsyncMock()
+            m.is_process_alive = lambda: True
+            m.context_usage_pct = lambda: 0.0
+            m.context_usage_unknown = lambda: False
+            m.context_window_tokens = lambda: 0
+            m.has_active_turn = lambda: False
+            m.runtime_info = lambda: (None, None)
+            m.stream_command = MagicMock()
+            return m
+
+        cfg = KiroCrewConfig()
+        cfg.session.timeout_secs = 2
+        mgr = SessionManager(cfg, provider_factory=factory)
+        try:
+            await mgr.start_pool()
+            assert seen, "premise: start_pool probed the flagged row's header"
+            assert [t for t in seen if t is loop_thread] == []
+            assert mgr._session_map.get_flag(key, "incognito") is False
+        finally:
+            await mgr.close_all()
+
+
 class TestOverrides:
     def test_agent_override_round_trip(self, patched):
         sm = SessionMap()

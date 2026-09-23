@@ -447,6 +447,193 @@ class TestRestartDurability:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# The transcript header: the record that outlives the session-map entry
+# ──────────────────────────────────────────────────────────────────────
+class TestTranscriptHeaderDurability:
+    """The modifier stamps ``memory_mode`` into the transcript header -- the field
+    ``is_incognito_transcript`` and every memory reader already refuse on -- so a
+    transcript read never depends on the session map. The header write goes
+    through the default ``ConversationLog``, so these tests read the default
+    sessions directory (pinned per test by the conftest) rather than a private
+    ``base_dir``."""
+
+    @staticmethod
+    def _log(seed: bool = True):
+        from kiro_crew import history as history_mod
+        from kiro_crew.history import ConversationLog
+
+        log = ConversationLog()
+        log.init()
+        if seed:
+            with history_mod.allow_on_loop_persist():
+                log.append(_TG_KEY, "user", "a persistent-era turn")
+        return log
+
+    @pytest.mark.asyncio
+    async def test_the_modifier_stamps_the_transcript_header(self, audits, session_map):
+        """Mutation: delete the ``_persist_transcript_mode`` call — red.
+
+        This is the header the consolidator's header source and the consolidate
+        route's header probe read.
+        """
+        log = self._log()
+        assert "memory_mode" not in log.get_metadata(_TG_KEY), "premise: header carries no mode"
+        sm = session_map()
+        await privacy_mode.apply_mode(
+            privacy_mode.MODE_INCOGNITO,
+            _TG_KEY,
+            source="telegram",
+            sessions=_Sessions(sm),
+        )
+        await _land_on_disk(sm)
+        assert log.get_metadata(_TG_KEY).get("memory_mode") == "incognito"
+        # The turn written before the modifier is still there; the header, not
+        # the body, is what changed.
+        assert [m["content"] for m in log.read_messages(_TG_KEY)] == ["a persistent-era turn"]
+
+    @pytest.mark.asyncio
+    async def test_a_transcript_that_does_not_exist_yet_gets_the_header_first(
+        self, audits, session_map
+    ):
+        """``!incognito`` as the thread's very first message.
+
+        The header is upserted, so the first row a later writer appends lands
+        under a header that already carries the mode. Mutation: switch the
+        stamp to ``require_existing=True`` — red.
+        """
+        from kiro_crew import history as history_mod
+
+        log = self._log(seed=False)
+        assert not log.has_log(_TG_KEY), "premise: no transcript yet"
+        sm = session_map()
+        await privacy_mode.apply_mode(
+            privacy_mode.MODE_TEMPORARY,
+            _TG_KEY,
+            source="telegram",
+            sessions=_Sessions(sm),
+        )
+        await _land_on_disk(sm)
+        assert log.get_metadata(_TG_KEY).get("memory_mode") == "temporary"
+        with history_mod.allow_on_loop_persist():
+            log.append(_TG_KEY, "user", "a later turn")
+        assert log.get_metadata(_TG_KEY).get("memory_mode") == "temporary"
+        assert [m["content"] for m in log.read_messages(_TG_KEY)] == ["a later turn"]
+
+    @pytest.mark.asyncio
+    async def test_the_header_is_only_ever_tightened(self, audits, session_map):
+        """``!incognito`` typed after ``!temporary`` must not re-enable reads.
+
+        Mutation: drop the guard (write the mode unconditionally) — red.
+        """
+        log = self._log()
+        sm = session_map()
+        await privacy_mode.apply_mode(
+            privacy_mode.MODE_TEMPORARY,
+            _TG_KEY,
+            source="telegram",
+            sessions=_Sessions(sm),
+        )
+        await privacy_mode.apply_mode(
+            privacy_mode.MODE_INCOGNITO,
+            _TG_KEY,
+            source="telegram",
+            sessions=_Sessions(sm),
+        )
+        await _land_on_disk(sm)
+        assert log.get_metadata(_TG_KEY).get("memory_mode") == "temporary"
+
+    @pytest.mark.asyncio
+    async def test_a_header_write_failure_still_leaves_the_session_restricted(
+        self, audits, session_map, monkeypatch
+    ):
+        """Mutation: let ``_persist_transcript_mode`` re-raise — red.
+
+        Same contract as the map flag: the in-memory mark already happened, so
+        the modifier must not report failure for a mode that holds. Patched on
+        the class, because the module builds its own ``ConversationLog``.
+        """
+        from kiro_crew.history import ConversationLog
+
+        self._log()
+        monkeypatch.setattr(
+            ConversationLog, "update_metadata_if", MagicMock(side_effect=OSError("read-only"))
+        )
+        sm = session_map()
+        rec = _Recorder()
+        applied = await privacy_mode.apply_mode(
+            privacy_mode.MODE_INCOGNITO,
+            _TG_KEY,
+            source="telegram",
+            sessions=_Sessions(sm),
+            notify=rec.notify,
+        )
+        await _land_on_disk(sm)
+        assert applied is True
+        assert privacy_mode.is_restricted(_TG_KEY) is True
+        assert sm.get_flag(_TG_KEY, "incognito") is True
+        assert rec.notices == [privacy_mode.NOTICE_INCOGNITO]
+
+    @pytest.mark.asyncio
+    async def test_a_cancellation_during_the_header_write_has_already_audited(
+        self, audits, session_map, monkeypatch
+    ):
+        """Mutation: move the ``sel().log_api_access`` call back below the
+        awaited header write -- red (``assert [] == [...]``).
+
+        The header write is the first await after the mark. A gateway shutdown
+        that cancels the modifier's task while that write is in flight must not
+        take the audit record with it: the mark and the map flag already hold,
+        and the idempotency return at the top of ``apply_mode`` never comes back
+        to write the record for a session it already sees as marked.
+        """
+        from kiro_crew.history import ConversationLog
+
+        self._log()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        def _blocked_write(*_args, **_kwargs):
+            # Runs on the worker thread ``asyncio.to_thread`` hands it to; the
+            # cancellation lands on the awaiting task, not on this thread.
+            loop.call_soon_threadsafe(entered.set)
+            asyncio.run_coroutine_threadsafe(release.wait(), loop).result(timeout=5)
+
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(ConversationLog, "update_metadata_if", _blocked_write)
+        sm = session_map()
+        rec = _Recorder()
+        task = asyncio.ensure_future(
+            privacy_mode.apply_mode(
+                privacy_mode.MODE_INCOGNITO,
+                _TG_KEY,
+                source="telegram",
+                sessions=_Sessions(sm),
+                notify=rec.notify,
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        assert privacy_mode.is_restricted(_TG_KEY) is True
+        assert sm.get_flag(_TG_KEY, "incognito") is True
+        assert [(e["operation"], e["outcome"]) for e in audits] == [
+            ("telegram.incognito_mode", "allowed")
+        ]
+        # The notice never went out: it sits after the cancelled await.
+        assert rec.notices == []
+
+    @pytest.mark.asyncio
+    async def test_without_sessions_no_header_is_written(self, audits):
+        """In-memory only means neither record: no map flag, no header."""
+        log = self._log()
+        await privacy_mode.apply_mode(privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram")
+        assert "memory_mode" not in log.get_metadata(_TG_KEY)
+        assert privacy_mode.is_incognito(_TG_KEY) is True
+
+
+# ──────────────────────────────────────────────────────────────────────
 # The dashboard gates the ~30 memory mutations sit behind
 # ──────────────────────────────────────────────────────────────────────
 class TestDashboardGateReach:

@@ -67,6 +67,408 @@ async def test_consolidation_captures_execution_off_loop(tmp_path, monkeypatch, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["temporary", "incognito", "persistent"])
+async def test_consolidate_honors_the_transcript_header_mode(tmp_path, caplog, mode):
+    """The memory-mode choke point every entry point inherits.
+
+    A session with no execution record still carries its mode in the transcript
+    header. ``_consolidate`` must refuse a temporary or incognito header before
+    the model is called or any offset moves -- and say so at debug, so a skip is
+    distinguishable from a pass -- while a persistent header consolidates exactly
+    as before.
+    """
+    import logging
+
+    from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+
+    log = _seed_log(tmp_path)
+    with history_mod.allow_on_loop_persist():
+        log.update_metadata(KEY, {"memory_mode": mode})
+    c = _make_consolidator(log)
+    c._call_llm = AsyncMock(return_value={"history_entry": "x"})
+
+    with caplog.at_level(logging.DEBUG, logger="kiro_crew.history"):
+        result = await asyncio.wait_for(c._consolidate(KEY, include_history=True), 10)
+
+    if mode == "persistent":
+        assert result is None
+        c._call_llm.assert_awaited_once()
+        assert log.unconsolidated_count(KEY) == 0
+        return
+    assert result is _CONSOLIDATION_REFUSED
+    c._call_llm.assert_not_awaited()
+    assert log.unconsolidated_count(KEY) == 3
+    assert log.get_metadata(KEY).get("last_consolidated", 0) == 0
+    assert KEY not in c._running
+    skipped = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.DEBUG and "consolidation skipped" in r.getMessage()
+    ]
+    assert skipped, f"a {mode} refusal left no debug trace:\n{caplog.text}"
+    assert KEY in skipped[0].getMessage() and mode in skipped[0].getMessage()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("named_by", ["live_key", "stem"])
+async def test_consolidate_honors_a_channel_threads_session_map_flag(tmp_path, caplog, named_by):
+    """The third memory-mode source: a channel thread's durable ``!incognito`` flag.
+
+    A Slack thread marked ``!incognito`` keeps that mode ONLY in the session map
+    (``privacy_mode._persist`` -> ``SessionMap.set_flag``): no channel path writes
+    ``memory_mode`` into its transcript header or binds an execution record, so
+    the execution-record and header reads see a persistent session, and the
+    background paths -- the idle sweep and the channel's session-end hook, both
+    of which schedule ``_consolidate`` through ``consolidate_session`` -- would
+    consolidate the thread's pre-flag transcript into durable memory. The flag is
+    seeded in a real ``SessionMap`` with the process-local trackers emptied (what
+    a gateway restart leaves behind), and the thread is named both ways a caller
+    names it: the live ``slack:<ts>`` key the channel passes, and the transcript
+    stem ``slack_<ts>`` the dashboard trigger and the CLI pass, which only the
+    map can unfold.
+    """
+    import logging
+    from types import SimpleNamespace
+
+    from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+    from kiro_crew.messaging import privacy_mode
+    from kiro_crew.session_map import SessionMap
+
+    live_key = "slack:1785861252.833429"
+    key = live_key if named_by == "live_key" else "slack_1785861252.833429"
+    # The channel wrote the transcript under its live key; both names read it.
+    log = _seed_log(tmp_path, key=live_key)
+    assert "memory_mode" not in (log.get_metadata(key) or {}), "premise: header carries no mode"
+    sm = SessionMap()
+    sm.set_flag(live_key, "incognito", True)
+    sm.flush()
+    privacy_mode.reset()
+    assert privacy_mode.is_incognito(live_key) is False, "premise: trackers start empty"
+    sessions = SimpleNamespace(_session_map=sm, channel_key_for_stem=sm.channel_key_for_stem)
+    c = _make_consolidator(log, sessions=sessions)
+    c._call_llm = AsyncMock(return_value={"history_entry": "x"})
+
+    try:
+        with caplog.at_level(logging.DEBUG, logger="kiro_crew.history"):
+            c.consolidate_session(key)
+            tasks = list(c._tasks)
+            assert len(tasks) == 1, "premise: the session-end hook scheduled one pass"
+            result = await asyncio.wait_for(tasks[0], 10)
+    finally:
+        privacy_mode.reset()
+
+    assert (
+        c._call_llm.await_count == 0
+    ), "an incognito-flagged channel thread was consolidated into durable memory"
+    assert result is _CONSOLIDATION_REFUSED
+    assert log.unconsolidated_count(key) == 3
+    assert log.get_metadata(key).get("last_consolidated", 0) == 0
+    assert key not in c._running
+    skipped = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.DEBUG and "consolidation skipped" in r.getMessage()
+    ]
+    assert skipped, f"the session-map refusal left no debug trace:\n{caplog.text}"
+    message = skipped[0].getMessage()
+    assert key in message and "incognito" in message and "(session map)" in message
+
+
+@pytest.mark.asyncio
+async def test_consolidate_refuses_a_channel_thread_whose_map_entry_was_pruned(
+    tmp_path, monkeypatch, caplog
+):
+    """The transcript header is the record a memory reader consults.
+
+    ``privacy_mode.apply_mode`` stamps ``memory_mode`` into the header, the source
+    ``_consolidate`` reads before the map, so a transcript read never depends on
+    the session map being loaded. Driven the way production runs it: the real
+    modifier path over a real ``SessionMap``, then a consolidator that holds NO
+    session map at all (a header-only reader), with the process-local trackers
+    emptied (the restart), through the session-end hook's entry point.
+    """
+    import logging
+    from types import SimpleNamespace
+
+    from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+    from kiro_crew.messaging import privacy_mode
+    from kiro_crew.session_map import SessionMap
+
+    monkeypatch.setattr("kiro_crew.session_map.config_dir", lambda: tmp_path)
+    monkeypatch.setattr("kiro_crew.session_map._KIRO_SESSIONS_DIR", tmp_path / "kiro")
+    live_key = "telegram:kirocrew:direct:4242"
+    log = _seed_default_log(live_key)  # three turns before the modifier
+    sm = SessionMap()
+    sessions = SimpleNamespace(_session_map=sm, channel_key_for_stem=sm.channel_key_for_stem)
+    privacy_mode.reset()
+    try:
+        await privacy_mode.apply_mode(
+            privacy_mode.MODE_INCOGNITO,
+            live_key,
+            source="telegram",
+            sessions=sessions,
+        )
+        sm.flush()
+        assert log.get_metadata(live_key).get("memory_mode") == "incognito", "premise: stamped"
+        privacy_mode.reset()  # the fresh gateway's trackers start empty
+        c = _make_consolidator(log, sessions=None)  # no map: the header must answer
+        c._call_llm = AsyncMock(return_value={"history_entry": "x"})
+        with caplog.at_level(logging.DEBUG, logger="kiro_crew.history"):
+            c.consolidate_session(live_key)
+            tasks = list(c._tasks)
+            assert len(tasks) == 1, "premise: the session-end hook scheduled one pass"
+            result = await asyncio.wait_for(tasks[0], 10)
+    finally:
+        privacy_mode.reset()
+
+    assert (
+        c._call_llm.await_count == 0
+    ), "a channel thread marked incognito was consolidated without its session map"
+    assert result is _CONSOLIDATION_REFUSED
+    assert log.unconsolidated_count(live_key) == 3
+    assert log.get_metadata(live_key).get("last_consolidated", 0) == 0
+    skipped = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.DEBUG and "consolidation skipped" in r.getMessage()
+    ]
+    assert skipped, f"the refusal left no debug trace:\n{caplog.text}"
+    assert "(transcript header)" in skipped[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_privacy_flag_refuses_without_opening_the_transcript_until_the_prune_records_it(
+    tmp_path, monkeypatch, caplog
+):
+    """A thread flagged before the header carried the mode: the map entry is all it has.
+
+    Pre-upgrade installs hold private threads whose flag was written straight to
+    the session map, with no header stamp, and ``apply_mode`` returns early for a
+    mode already marked, so nothing re-stamps them. Three facts pinned in one
+    lifecycle: the startup ``prune()`` keeps such an entry (clearing only its
+    dead ``sid``) and never reads a transcript for it; the consolidator refuses
+    it from the map WITHOUT opening the transcript -- not even its header -- the
+    same contract ``test_restricted_consolidation_never_reads_transcript_or_opens_memory``
+    pins for a known execution record; and the startup path's off-loop step then
+    copies the mode into the existing transcript's header and collects the row,
+    after which a header-only reader refuses on its own.
+    """
+    import logging
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from kiro_crew.history import ConversationLog
+    from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+    from kiro_crew.messaging import privacy_mode
+    from kiro_crew.session_map import SessionMap
+
+    monkeypatch.setattr("kiro_crew.session_map.config_dir", lambda: tmp_path)
+    monkeypatch.setattr("kiro_crew.session_map._KIRO_SESSIONS_DIR", tmp_path / "kiro")
+    live_key = "telegram:kirocrew:direct:4242"
+    log = _seed_default_log(live_key)
+    assert "memory_mode" not in log.get_metadata(live_key), "premise: legacy header, no mode"
+    sm = SessionMap()
+    sm.set(live_key, "sid-reclaimed-by-kiro-cli")  # the provider session, since reclaimed
+    sm.set_flag(live_key, "incognito", True)  # the legacy flag: map only, no header stamp
+    sm.flush()
+    sessions = SimpleNamespace(_session_map=sm, channel_key_for_stem=sm.channel_key_for_stem)
+    privacy_mode.reset()
+    loop_thread = threading.current_thread()
+    header_reads: list[threading.Thread] = []
+    real_get_metadata = ConversationLog.get_metadata
+
+    def _recording_get_metadata(self, key):
+        header_reads.append(threading.current_thread())
+        return real_get_metadata(self, key)
+
+    monkeypatch.setattr(ConversationLog, "get_metadata", _recording_get_metadata)
+    try:
+        # The restart: startup prunes stale entries on the loop -- no transcript read.
+        pruned = sm.prune()
+        sm.flush()
+        assert pruned == 0
+        assert sm.get_flag(live_key, "incognito") is True
+        assert header_reads == [], "prune read a transcript header on the loop"
+
+        # The sweep: refused from the map, the transcript never opened.
+        c = _make_consolidator(log, sessions=sessions)
+        c._call_llm = AsyncMock(return_value={"history_entry": "x"})
+        c._log.get_metadata = MagicMock(side_effect=AssertionError("the transcript was opened"))
+        with caplog.at_level(logging.DEBUG, logger="kiro_crew.history"):
+            c.consolidate_session(live_key)
+            tasks = list(c._tasks)
+            assert len(tasks) == 1, "premise: the session-end hook scheduled one pass"
+            result = await asyncio.wait_for(tasks[0], 10)
+        assert result is _CONSOLIDATION_REFUSED
+        assert c._call_llm.await_count == 0, (
+            "a legacy incognito flag was not honoured and the thread was consolidated "
+            "into durable memory"
+        )
+        skipped = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.DEBUG and "consolidation skipped" in r.getMessage()
+        ]
+        assert skipped and "(session map)" in skipped[0].getMessage()
+        assert header_reads == [], "a known-restricted refusal opened the transcript"
+
+        # The startup path's off-loop step: the mode moves into the header, the
+        # row goes, and neither happened on the loop thread.
+        assert await sm.collect_recorded_privacy_entries() == 1
+        assert header_reads, "premise: the header was probed"
+        assert [t for t in header_reads if t is loop_thread] == []
+        assert sm.get_flag(live_key, "incognito") is False
+        assert real_get_metadata(log, live_key).get("memory_mode") == "incognito"
+        assert log.unconsolidated_count(live_key) == 3
+
+        # From here the header answers alone: a consolidator with no map refuses
+        # (the guard against opening the transcript comes off -- the header IS
+        # what this reader is meant to open).
+        del c._log.get_metadata
+        privacy_mode.reset()
+        header_only = _make_consolidator(log, sessions=None)
+        header_only._call_llm = AsyncMock(return_value={"history_entry": "x"})
+        assert (
+            await asyncio.wait_for(header_only._consolidate(live_key), 10) is _CONSOLIDATION_REFUSED
+        )
+        header_only._call_llm.assert_not_awaited()
+    finally:
+        privacy_mode.reset()
+
+
+@pytest.mark.asyncio
+async def test_every_restricted_refusal_is_its_own_sel_record(tmp_path, monkeypatch):
+    """The background refusal writes the denial the dashboard route writes, every time.
+
+    Same operation and outcome, ``restricted_target_session:<mode>`` plus the
+    target key in ``resources``, ``source="background"`` because no request
+    carried it. Two refusals of the same key are two records: an audit event
+    that is sometimes withheld, whatever a later record claims to fold in, is a
+    gap the reader cannot see. A tightened mode is a new fact and reads as such.
+    Mutation: drop the ``log_api_access`` call -- red; window or dedupe the
+    record per key -- the second assertion goes red.
+    """
+    from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+
+    events: list[dict] = []
+    fake = MagicMock()
+    fake.log_api_access = lambda **kw: events.append(kw)
+    monkeypatch.setattr(history_mod, "sel", lambda: fake)
+
+    log = _seed_log(tmp_path)
+    with history_mod.allow_on_loop_persist():
+        log.update_metadata(KEY, {"memory_mode": "incognito"})
+    c = _make_consolidator(log)
+    c._call_llm = AsyncMock()
+
+    assert await asyncio.wait_for(c._consolidate(KEY), 10) is _CONSOLIDATION_REFUSED
+    assert events == [
+        {
+            "caller": "history_consolidator",
+            "operation": "memory.consolidate",
+            "outcome": "denied",
+            "source": "background",
+            "resources": f"restricted_target_session:incognito:{KEY}",
+        }
+    ]
+    assert await asyncio.wait_for(c._consolidate(KEY), 10) is _CONSOLIDATION_REFUSED
+    with history_mod.allow_on_loop_persist():
+        log.update_metadata(KEY, {"memory_mode": "temporary"})
+    assert await asyncio.wait_for(c._consolidate(KEY), 10) is _CONSOLIDATION_REFUSED
+    assert [e["resources"] for e in events] == [
+        f"restricted_target_session:incognito:{KEY}",
+        f"restricted_target_session:incognito:{KEY}",
+        f"restricted_target_session:temporary:{KEY}",
+    ], "a repeated refusal was windowed, deduplicated or folded instead of recorded"
+    c._call_llm.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_idle_sweep_does_not_re_attempt_a_key_it_refused_as_restricted(
+    tmp_path, monkeypatch
+):
+    """The volume is solved at its source, not in the audit trail.
+
+    A refusal is not a completed pass, so it sets no throttle, and without a
+    memo the idle sweep would schedule the same refused key on every 60 s tick
+    -- one audit denial a minute per quiet private thread. After one refusal
+    the sweep skips the key without calling ``_consolidate`` (nothing scheduled,
+    no record); an EXPLICIT trigger aimed at the key is still attempted and
+    still audited. Mutation: drop the memo check in ``check_idle_sessions`` --
+    the second tick schedules again and the first assertion goes red.
+    """
+    from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+
+    events: list[dict] = []
+    fake = MagicMock()
+    fake.log_api_access = lambda **kw: events.append(kw)
+    monkeypatch.setattr(history_mod, "sel", lambda: fake)
+
+    log = _seed_log(tmp_path)
+    with history_mod.allow_on_loop_persist():
+        log.update_metadata(KEY, {"memory_mode": "incognito"})
+    c = _make_consolidator(log)
+    c._call_llm = AsyncMock()
+    attempts: list[str] = []
+    real_consolidate = c._consolidate
+
+    async def _counting(key, include_history=True):
+        attempts.append(key)
+        return await real_consolidate(key, include_history=include_history)
+
+    monkeypatch.setattr(c, "_consolidate", _counting)
+    c._last_activity[KEY] = time.time() - 10
+
+    c.check_idle_sessions()
+    assert c._tasks, "premise: the first tick schedules the (refused) pass"
+    await asyncio.gather(*list(c._tasks))
+    assert attempts == [KEY]
+    assert len(events) == 1
+    assert c._restricted_refused == {KEY: "incognito"}
+
+    c._tasks.clear()
+    c.check_idle_sessions()
+    assert not c._tasks, "the idle sweep re-attempted a key it had already refused as restricted"
+    assert attempts == [KEY]
+    assert len(events) == 1, "a skipped (never attempted) key must not audit a denial"
+
+    # The explicit trigger ignores the memo: attempted, refused, audited.
+    assert await asyncio.wait_for(c.consolidate_now(KEY), 10) is False
+    assert attempts == [KEY, KEY]
+    assert [e["resources"] for e in events] == [
+        f"restricted_target_session:incognito:{KEY}",
+        f"restricted_target_session:incognito:{KEY}",
+    ]
+    assert await asyncio.wait_for(real_consolidate(KEY), 10) is _CONSOLIDATION_REFUSED
+    c._call_llm.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_per_turn_trigger_does_not_re_attempt_a_refused_key(tmp_path, monkeypatch):
+    """``maybe_consolidate`` runs on every user turn and a refusal advances no
+    offset, so past the threshold a refused private thread would schedule a
+    refusal per turn. It reads the same memo as the idle sweep."""
+    from kiro_crew.history_consolidation import _CONSOLIDATION_THRESHOLD
+
+    monkeypatch.setattr(history_mod, "sel", lambda: MagicMock())
+    log = _seed_log(tmp_path, count=_CONSOLIDATION_THRESHOLD + 1)
+    with history_mod.allow_on_loop_persist():
+        log.update_metadata(KEY, {"memory_mode": "temporary"})
+    c = _make_consolidator(log)
+    c._call_llm = AsyncMock()
+
+    c.maybe_consolidate(KEY)
+    assert c._tasks, "premise: over the threshold, the first turn schedules the (refused) pass"
+    await asyncio.gather(*list(c._tasks))
+    assert c._restricted_refused == {KEY: "temporary"}
+    c._tasks.clear()
+    c.maybe_consolidate(KEY)
+    assert not c._tasks, "the per-turn trigger re-attempted a key already refused as restricted"
+    c._call_llm.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("version", "seed_source", "assistant_value"),
     (
@@ -180,6 +582,21 @@ def _seed_log(tmp_path, key: str = KEY, count: int = 3) -> ConversationLog:
     return log
 
 
+def _seed_default_log(key: str, count: int = 3) -> ConversationLog:
+    """Like :func:`_seed_log`, in the DEFAULT sessions directory.
+
+    For a test that drives ``privacy_mode.apply_mode``: its header stamp goes
+    through a default ``ConversationLog``, so the transcript under test has to
+    live where that instance writes (the conftest pins the directory per test).
+    """
+    log = ConversationLog()
+    log.init()
+    with history_mod.allow_on_loop_persist():
+        for i in range(count):
+            log.append(key, "user", f"m{i}")
+    return log
+
+
 def _make_consolidator(log: ConversationLog, **kw: Any) -> HistoryConsolidator:
     memory = MagicMock()
     memory.read_preferences.return_value = ""
@@ -224,8 +641,8 @@ def _dashboard_state(log: ConversationLog) -> DashboardState:
         sessions=sessions,
         crons=MagicMock(list_jobs=MagicMock(return_value=[]), status=MagicMock(return_value={})),
         lessons=MagicMock(load_all=MagicMock(return_value=[])),
-        start_time=0.0,
         conversation_log=log,
+        start_time=0.0,
     )
 
 

@@ -36,6 +36,8 @@ KillProvider = Callable[[LLMProvider], None]
 class _SessionMapPort(Protocol):
     def prune(self) -> int: ...
 
+    async def collect_recorded_privacy_entries(self) -> int: ...
+
 
 class WarmPoolOwner(Protocol):
     """Cross-boundary operations retained by the ``SessionManager`` facade.
@@ -256,6 +258,17 @@ class WarmSessionPool:
 
         self._owner._session_map.prune()
         self._pool_started = True
+        # The privacy-flagged rows prune kept: whether their transcript header
+        # already records the mode is a disk read, taken on a worker thread
+        # here rather than on this loop inside prune. Housekeeping: a failure
+        # leaves the rows in place for the next startup and must not stop the
+        # pool from starting.
+        try:
+            await self._owner._session_map.collect_recorded_privacy_entries()
+        except Exception:  # noqa: BLE001 - startup housekeeping never blocks the pool
+            self._deps.logger.warning(
+                "could not collect recorded privacy-flagged session map entries", exc_info=True
+            )
 
         if not blocking:
 
