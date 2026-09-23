@@ -786,8 +786,9 @@ def kiro_cli_not_found_message(
     return (
         f"{KIRO_CLI_BIN} not found "
         f"({describe_search_path(os.pathsep.join(searched_dirs))}). "
-        f"Kiro CLI is a separate prerequisite Kiro Crew does not bundle: install it "
-        f"from {OFFICIAL_INSTALL_DOCS_URL}, or point KIROCREW_KIRO_BIN at the binary."
+        f"Kiro CLI is a separate prerequisite that only the macOS and Linux desktop "
+        f"apps bundle: install it from {OFFICIAL_INSTALL_DOCS_URL}, or point "
+        f"KIROCREW_KIRO_BIN at the binary."
     )
 
 

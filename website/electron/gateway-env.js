@@ -20,6 +20,11 @@ const GATEWAY_UTF8_ENV = Object.freeze({
   PYTHONIOENCODING: "utf-8:backslashreplace",
 });
 
+// Where packaging/build-desktop.sh stages the pinned kiro-cli, relative to the
+// app's resources directory. One spelling shared with the backend's reader
+// (kiro_cli.known_kiro_cli_dirs, via the env var below) and the docs.
+const BUNDLED_KIRO_CLI_SUBDIR = ["backend-dist", "kiro-cli"];
+
 /**
  * Build a gateway child environment without mutating Electron's process.env.
  *
@@ -89,8 +94,44 @@ function gatewayBytecodeEnvironment(platform, cachePath, isPackaged) {
   return { PYTHONPYCACHEPREFIX: cachePath };
 }
 
+/**
+ * Point the gateway at the kiro-cli copy staged into the app's own resources.
+ *
+ * `packaging/build-desktop.sh` (BUNDLE_KIRO_CLI) stages a pinned, sha256-verified
+ * kiro-cli under `<resources>/backend-dist/kiro-cli/`. The backend reads the
+ * directory from `KIROCREW_BUNDLED_KIRO_DIR` and ranks it above every system
+ * install but below the `KIROCREW_KIRO_BIN` operator override
+ * (`kiro_cli.known_kiro_cli_dirs`), so the app runs the exact agent runtime it
+ * was built against while an operator can still force a different binary.
+ *
+ * The variable is set ONLY when the directory actually shipped. A build without
+ * the payload (`BUNDLE_KIRO_CLI=0`, Windows, or a source checkout with no
+ * resources) spreads nothing, so discovery falls through to the user's own
+ * install exactly as an unbundled build does. A directory rather than a binary
+ * path on purpose: kiro-cli exec-dispatches to sibling executables, so the whole
+ * layout has to resolve together.
+ *
+ * @param {Pick<typeof import("fs"), "statSync">} fs
+ * @param {Pick<typeof import("path"), "join">} path
+ * @param {string | undefined} resourcesPath  `process.resourcesPath`, absent in a
+ *   source checkout.
+ * @returns {NodeJS.ProcessEnv}
+ */
+function bundledKiroCliEnvironment(fs, path, resourcesPath) {
+  if (!resourcesPath) return {};
+  const bundledDir = path.join(resourcesPath, ...BUNDLED_KIRO_CLI_SUBDIR);
+  try {
+    return fs.statSync(bundledDir).isDirectory()
+      ? { KIROCREW_BUNDLED_KIRO_DIR: bundledDir }
+      : {};
+  } catch {
+    return {};
+  }
+}
+
 module.exports = {
   buildGatewayEnvironment,
+  bundledKiroCliEnvironment,
   gatewayBytecodeEnvironment,
   GATEWAY_UTF8_ENV,
 };

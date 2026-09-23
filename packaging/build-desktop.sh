@@ -7,7 +7,8 @@
 #   3. pip-install kiro_crew + deps INTO the bundled interpreter
 #   4. Stage the dashboard into the package's static dir
 #   5. Prune caches/tests/unused stdlib to shrink the bundle
-#   6. Package the desktop app with electron-builder -> DMG (mac) / AppImage (linux)
+#   6. Stage a pinned, sha256-verified kiro-cli into backend-dist/kiro-cli/
+#   7. Package the desktop app with electron-builder -> DMG (mac) / AppImage (linux)
 #
 # The result is a double-clickable app that embeds the whole Python backend +
 # dashboard — no system Python, pip, npm, or node required by the end user.
@@ -31,6 +32,7 @@
 #   UNIVERSAL=0 bash packaging/...             # macOS: host-arch-only DMG
 #   SKIP_FRONTEND=1 bash packaging/...         # reuse an already-staged dist
 #   SKIP_ELECTRON=1 bash packaging/...         # stop after the backend binary
+#   BUNDLE_KIRO_CLI=0 bash packaging/...       # ship without the bundled kiro-cli
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -882,6 +884,143 @@ if [ -n "${KIROCREW_MANAGED_INSTALL_MARKER:-}" ]; then
   trap 'rm -f "$ELECTRON_DIR/EXTERNALLY-MANAGED"' EXIT
   cp "$MARKER_SRC" "$ELECTRON_DIR/EXTERNALLY-MANAGED"
   log "Baking EXTERNALLY-MANAGED marker into the app from $MARKER_SRC"
+fi
+
+# --- 3c. Bundle kiro-cli into the app resources -------------------------------
+# Stages a pinned, sha256-verified kiro-cli under backend-dist/kiro-cli/ so the
+# installed app carries the agent runtime it was built against: no first-run
+# download, and the KAS backend's `kiro-cli acp --agent-engine v3` spawn works
+# out of the box. Mirrors docker/Dockerfile's fail-closed manifest resolution.
+# Landing inside backend-dist/ means the electron-builder extraResources entry
+# and the macOS x64ArchFiles glob both cover it with zero config changes; the
+# Electron shell exports the directory as KIROCREW_BUNDLED_KIRO_DIR at gateway
+# spawn (main.js), and the backend ranks it above system installs but below the
+# KIROCREW_KIRO_BIN operator override (kiro_cli.known_kiro_cli_dirs).
+# BUNDLE_KIRO_CLI=0 opts a build out; the app then behaves exactly as an
+# unbundled build does: detect-only, the user installs kiro-cli themselves.
+# Windows never bundles: upstream ships only an MSI there, and the Windows app
+# already detects the per-user MSI install.
+#
+# Payload budget: the macOS universal DMG is ~360 MB and each Linux zip ~160 MB,
+# which lands the mac signing zip near 1 GB. packaging/signing/sign.sh's poll
+# window and sign-and-notarize.yml's job timeout are sized for that; a kiro-cli
+# release that grows past it shows up as a signing timeout, not a build error.
+KIRO_CLI_MANIFEST_URL="https://desktop-release.q.us-east-1.amazonaws.com/latest/manifest.json"
+
+# Layout gate for the staged copy. packaging/signing/generate-manifest.py signs
+# every loose Mach-O under Contents/Resources per file, but FAILS the sign on a
+# nested bundle there (the suffixes below mirror its _BUNDLE_SUFFIXES): bundles
+# need bundle-level signing that per-file entries cannot express. Catching that
+# here turns a nightly signing failure into a build error the developer sees.
+#   $1 = staged kiro-cli dir
+kiro_cli_layout_gate() {
+  local dest="$1" nested
+  nested="$(find "$dest" -type d \( -name '*.app' -o -name '*.framework' -o -name '*.appex' \
+    -o -name '*.xpc' -o -name '*.bundle' -o -name '*.plugin' \) -print -quit 2>/dev/null)"
+  if [ -n "$nested" ]; then
+    echo "ERROR: bundled kiro-cli carries a nested bundle the signer cannot seal per-file:" >&2
+    echo "       $nested" >&2
+    exit 1
+  fi
+}
+
+fetch_kiro_cli() {
+  local dest="$ELECTRON_DIR/backend-dist/kiro-cli"
+  local cache="${KIRO_CLI_BUNDLE_CACHE:-$HOME/.cache/kirocrew-build/kiro-cli}"
+  mkdir -p "$cache"
+
+  log "Resolving kiro-cli from the release manifest…"
+  curl --proto '=https' --tlsv1.2 -fsSL "$KIRO_CLI_MANIFEST_URL" \
+    -o "$cache/manifest.json"
+  local version
+  version="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["version"])' \
+    "$cache/manifest.json")"
+  echo "    kiro-cli version: $version"
+
+  if [ "$OS" = "darwin" ]; then
+    # macOS publishes ONE universal DMG (no per-arch zips). The manifest
+    # sha256 covers the DMG itself, so verify the DMG fail-closed, then
+    # extract the CLI binaries from the mounted app. One copy serves both
+    # backend trees: the Mach-O binaries are already lipo'd universal.
+    # The download path contains a space ("Kiro CLI.dmg"), so the parser
+    # URL-encodes it; paths reach Python via argv, never string splicing.
+    local resolved dl sha dmg
+    resolved="$(python3 -c 'import json,sys,urllib.parse
+m = json.load(open(sys.argv[1]))
+p = next(x for x in m["packages"] if x["fileType"] == "dmg")
+print(urllib.parse.quote(p["download"]))
+print(p["sha256"])' "$cache/manifest.json")"
+    dl="$(printf '%s\n' "$resolved" | sed -n 1p)"
+    sha="$(printf '%s\n' "$resolved" | sed -n 2p)"
+    dmg="$cache/kirocli-$version.dmg"
+    if [ ! -f "$dmg" ] || ! echo "$sha  $dmg" | shasum -a 256 -c - >/dev/null 2>&1; then
+      curl --proto '=https' --tlsv1.2 -fsSL \
+        "https://desktop-release.q.us-east-1.amazonaws.com/$dl" -o "$dmg"
+      echo "$sha  $dmg" | shasum -a 256 -c - \
+        || { echo "ERROR: kiro-cli DMG sha256 mismatch: refusing to bundle" >&2; exit 1; }
+    fi
+    local mnt
+    mnt="$(mktemp -d)"
+    hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mnt" >/dev/null
+    mkdir -p "$dest"
+    # The whole MacOS/ directory, not one file: kiro-cli 2.15+ exec-dispatches
+    # to sibling executables, so the layout must travel together.
+    cp -a "$mnt/Kiro CLI.app/Contents/MacOS/." "$dest/"
+    hdiutil detach "$mnt" >/dev/null
+    rmdir "$mnt" 2>/dev/null || true
+  else
+    # Linux: per-arch gnu zip, selected exactly as docker/Dockerfile does
+    # (fileType=zip, matching architecture, musl excluded). Paths reach
+    # Python via argv, never string splicing.
+    local karch resolved dl sha zipf
+    karch="$HOST_ARCH"
+    [ "$karch" = "arm64" ] && karch="aarch64"
+    resolved="$(python3 -c 'import json,sys,urllib.parse
+m = json.load(open(sys.argv[1]))
+a = sys.argv[2]
+p = next(x for x in m["packages"]
+         if x["fileType"] == "zip" and x["architecture"] == a
+         and "musl" not in x["download"])
+print(urllib.parse.quote(p["download"]))
+print(p["sha256"])' "$cache/manifest.json" "$karch")"
+    dl="$(printf '%s\n' "$resolved" | sed -n 1p)"
+    sha="$(printf '%s\n' "$resolved" | sed -n 2p)"
+    zipf="$cache/kirocli-$version-$karch.zip"
+    if [ ! -f "$zipf" ] || ! echo "$sha  $zipf" | sha256sum -c - >/dev/null 2>&1; then
+      curl --proto '=https' --tlsv1.2 -fsSL \
+        "https://desktop-release.q.us-east-1.amazonaws.com/$dl" -o "$zipf"
+      echo "$sha  $zipf" | sha256sum -c - \
+        || { echo "ERROR: kiro-cli zip sha256 mismatch: refusing to bundle" >&2; exit 1; }
+    fi
+    local tmp
+    tmp="$(mktemp -d)"
+    unzip -q "$zipf" -d "$tmp"
+    mkdir -p "$dest"
+    cp -a "$tmp"/kirocli/bin/. "$dest/"
+    rm -rf "$tmp"
+  fi
+
+  kiro_cli_layout_gate "$dest"
+
+  # Record provenance beside the payload, mirroring the Docker image's
+  # /usr/local/share/kirocrew/kiro-cli-version audit file.
+  printf '%s\n' "$version" > "$dest/BUNDLED-VERSION"
+  # Build-time gate: the staged copy must actually run on this host class.
+  # Enforced on BOTH platforms: the Linux zip is selected by the build
+  # host's own architecture (karch=HOST_ARCH), so the binary is always
+  # executable here and a failure means a broken artifact, not a
+  # cross-arch limitation.
+  if "$dest/kiro-cli" --version >/dev/null 2>&1; then
+    echo "    staged kiro-cli $version -> backend-dist/kiro-cli/ ($(du -sh "$dest" 2>/dev/null | cut -f1))"
+  else
+    echo "ERROR: staged kiro-cli does not execute" >&2; exit 1
+  fi
+}
+
+if [ "${BUNDLE_KIRO_CLI:-1}" = "1" ] && [ "$OS" != "windows" ]; then
+  fetch_kiro_cli
+else
+  log "BUNDLE_KIRO_CLI=0 (or Windows): app ships without a bundled kiro-cli"
 fi
 
 # --- 4. Package the desktop app with electron-builder -----------------------

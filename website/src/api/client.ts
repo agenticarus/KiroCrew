@@ -2513,6 +2513,14 @@ export interface KiroPrerequisiteStatus {
    * not complete.
    */
   cli_update_error?: string
+  /**
+   * True when the resolved kiro-cli is the desktop app's own bundled copy.
+   * `login_command` / `sso_login_command` then carry its quoted absolute path
+   * (it is not on the user's shell PATH), and the update-cli POST answers with
+   * a refusal in `cli_update_error` because the copy is replaced by the next
+   * app update, never in place. Optional: older gateways do not send it.
+   */
+  bundled?: boolean
 }
 
 export interface KiroBonusCreditGrantPayload {

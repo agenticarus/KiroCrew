@@ -79,6 +79,39 @@ It needs only
 an Apple-Silicon host with Rosetta 2; the script fails fast with instructions
 otherwise, and `UNIVERSAL=0` is the opt-out.)
 
+### Bundled kiro-cli — the app carries its own agent runtime
+
+By default (`BUNDLE_KIRO_CLI=1`), the build stages a pinned, sha256-verified
+kiro-cli into the app's resources at `backend-dist/kiro-cli/`: the version is
+resolved from the official release manifest and the archive is verified
+fail-closed before staging, mirroring the Docker image's kiro-cli install. On
+macOS the binaries are extracted from the universal `Kiro CLI.dmg` (one copy
+serves both arches; ~360 MB for kiro-cli 2.23); Linux uses the matching
+per-arch zip (~160 MB). A `BUNDLED-VERSION` file beside the payload records
+provenance, and a layout gate refuses a payload that carries a nested
+`.app`/`.framework` under `Resources/`, which the signing manifest cannot seal
+per file.
+
+At runtime the Electron shell (`gateway-env.js`, `bundledKiroCliEnvironment`)
+exports the directory as `KIROCREW_BUNDLED_KIRO_DIR` when it spawns the
+gateway, and only when the directory shipped; the backend resolver
+(`kiro_cli.known_kiro_cli_dirs`) ranks it **above** any system install (the app
+was built against that exact version) but **below** the `KIROCREW_KIRO_BIN`
+operator override. The same ranking feeds the pinned off-`PATH` spawns
+(`pin_kiro_cli`), so the version check, the readiness probe and every ACP
+session all run the bundled copy. The setup gate reports `bundled: true`, serves
+the copy's quoted absolute path as the sign-in command (it is not on the user's
+shell `PATH`), and refuses the in-place **Update** because the copy lives inside
+the signed bundle and is replaced by the next app update. `kiro-cli login` is
+still the user's own step — bundling covers the binary, never the credential.
+
+The payload roughly adds ~360 MB to the macOS signing zip (about 1 GB in total),
+which is what `packaging/signing/sign.sh`'s poll window is sized for.
+
+`BUNDLE_KIRO_CLI=0 make desktop` opts a build out (the payload is large);
+the app then detects a system kiro-cli exactly as before. Windows builds
+never bundle (upstream ships only an MSI there).
+
 ### macOS opt-out and Linux — host-arch-only builds
 
 `UNIVERSAL=0 make desktop` (and every Linux build) produces an installer for
@@ -461,8 +494,10 @@ so a `node`-less build environment still produces a bundle (unvalidated).
 The gateway-hosted dashboard then checks both prerequisites needed by the ACP
 provider:
 
-1. It discovers `kiro-cli` in the inherited `PATH`, `~/.local/bin`,
-   `~/.cargo/bin`, Homebrew locations, or the macOS `Kiro CLI.app` bundle.
+1. It discovers `kiro-cli` in the app's own bundled copy
+   (`KIROCREW_BUNDLED_KIRO_DIR`, when built with one), then the inherited
+   `PATH`, `~/.local/bin`, `~/.cargo/bin`, Homebrew locations, or the macOS
+   `Kiro CLI.app` bundle.
 2. It verifies the first candidate selected by the shared ACP resolver with
    `kiro-cli --version`. A broken or untrusted higher-priority candidate blocks
    readiness instead of approving a later binary that ACP would not launch.

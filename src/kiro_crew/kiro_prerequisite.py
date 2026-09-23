@@ -39,6 +39,7 @@ import hashlib
 import json
 import logging
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -46,7 +47,7 @@ import sys
 import tempfile
 import time
 import urllib.request
-from collections.abc import Awaitable, Callable, Coroutine, MutableMapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapping
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -60,6 +61,7 @@ from kiro_crew.config.paths import config_dir
 from kiro_crew.executors import kiro_spawn_executor
 from kiro_crew.kiro_cli import (
     find_kiro_cli_candidates,
+    is_bundled_kiro_cli,
     known_kiro_cli_dirs,
 )
 from kiro_crew.sandbox import (
@@ -89,7 +91,15 @@ OFFICIAL_INSTALL_DOCS_URL = "https://kiro.dev/cli/"
 # website/docs/i18n-catalog.md — "A literal token the user must type must never be
 # a catalog value"). Served in the status payload so the UI has one source of
 # truth for it rather than hardcoding a second copy that can drift.
-KIRO_CLI_LOGIN_COMMAND = "kiro-cli login"
+# The argument tails are split out so login_commands_for() can compose the
+# bundled-copy form (absolute path + same tail) without duplicating flag
+# literals that would drift. They carry the leading space DELIBERATELY: the
+# read-only-probe tripwire in test_kiro_prerequisite.py forbids the standalone
+# quoted token a spawn argv element would have, and these are display strings
+# the user types, never argv.
+_LOGIN_TAIL = " login"
+_SSO_LOGIN_TAIL = " login --use-device-flow --license pro"
+KIRO_CLI_LOGIN_COMMAND = f"kiro-cli{_LOGIN_TAIL}"
 # The organization-SSO counterpart, served alongside the bare command so the gate
 # can offer both instead of one ambiguous line. Both flags are load-bearing:
 # ``--use-device-flow`` is what makes the others take effect at all (kiro-cli
@@ -99,7 +109,37 @@ KIRO_CLI_LOGIN_COMMAND = "kiro-cli login"
 # failure this exists to prevent: on the portal, a free Builder ID sits as a
 # visual peer of organization SSO, so a user on an SSO plan can sign in to the
 # wrong tier and only discover it when models are missing.
-KIRO_CLI_SSO_LOGIN_COMMAND = "kiro-cli login --use-device-flow --license pro"
+KIRO_CLI_SSO_LOGIN_COMMAND = f"kiro-cli{_SSO_LOGIN_TAIL}"
+
+
+def login_commands_for(
+    binary: str,
+    environ: Mapping[str, str],
+) -> tuple[str, str, bool]:
+    """Sign-in commands for the RESOLVED binary, plus whether it is bundled.
+
+    The desktop app's bundled kiro-cli (``KIROCREW_BUNDLED_KIRO_DIR``) is not
+    on the user's shell PATH, so when it is the copy that resolved, the served
+    commands must carry the binary's absolute path — otherwise the setup gate
+    asserts "installed" while its only on-screen instruction fails with
+    command-not-found on a fresh machine. The path is shlex-quoted because the
+    macOS resources path contains a space. Any other resolution keeps the bare
+    constants: the binary is on PATH by construction there.
+    """
+    if is_bundled_kiro_cli(binary, environ):
+        quoted = shlex.quote(binary)
+        return f"{quoted}{_LOGIN_TAIL}", f"{quoted}{_SSO_LOGIN_TAIL}", True
+    return KIRO_CLI_LOGIN_COMMAND, KIRO_CLI_SSO_LOGIN_COMMAND, False
+
+
+# Why ``update_cli`` refuses the desktop app's bundled copy. Shown verbatim in the
+# gate's ``cli_update_error``: the binary sits inside a signed, read-only app
+# bundle, so an in-place self-update either fails or breaks the app's signature
+# seal, and the next app update is what replaces it.
+BUNDLED_CLI_UPDATE_REFUSAL = (
+    "This kiro-cli ships inside the desktop app and is updated with the app, "
+    "not on its own. Update Kiro Crew to get a newer kiro-cli."
+)
 # The command that updates the CLI in place. Unlike the install/sign-in steps
 # above, which Kiro Crew only ever NAMES for the user to run, this one IS run on
 # the user's behalf (see :meth:`KiroPrerequisiteService.update_cli`): it is the
@@ -461,6 +501,13 @@ class PrerequisiteStatus:
     # names why the self-update did not complete, which is what a support
     # conversation needs.
     cli_update_error: str = ""
+    # True when the resolved binary is the desktop app's own bundled copy
+    # (KIROCREW_BUNDLED_KIRO_DIR). Provenance for the gate and diagnostics: a
+    # user comparing against a system install they upgraded can see WHICH
+    # kiro-cli answered, instead of chasing an upstream fix that never appears.
+    # Also what makes ``login_command`` carry an absolute path and what turns
+    # ``update_cli`` into a refusal.
+    bundled: bool = False
     # A Kiro CLI binary that is present and executable but could not be VERIFIED
     # (verification runs the binary inside the sandbox) is a categorically
     # different condition from a missing binary, and a failed sandbox build
@@ -2924,6 +2971,9 @@ class KiroPrerequisiteService:
                         kind,
                         detail,
                     )
+                    login_cmd, sso_cmd, is_bundled = login_commands_for(
+                        first_candidate, self._environ
+                    )
                     self._status = PrerequisiteStatus(
                         platform=_platform_label(self._platform),
                         # Present and executable on disk. Verification is what
@@ -2935,6 +2985,9 @@ class KiroPrerequisiteService:
                         ready=False,
                         repair_required=False,
                         initial_setup_complete=self._initial_setup_complete,
+                        login_command=login_cmd,
+                        sso_login_command=sso_cmd,
+                        bundled=is_bundled,
                         sandbox_unavailable=True,
                         sandbox_failure_kind=kind,
                         sandbox_detail=detail,
@@ -2986,6 +3039,9 @@ class KiroPrerequisiteService:
                             first_candidate,
                             _PROBE_TIMEOUT_SECS,
                         )
+                    login_cmd, sso_cmd, is_bundled = login_commands_for(
+                        first_candidate, self._environ
+                    )
                     self._status = PrerequisiteStatus(
                         platform=_platform_label(self._platform),
                         installed=True,
@@ -2995,6 +3051,9 @@ class KiroPrerequisiteService:
                         ready=False,
                         repair_required=False,
                         initial_setup_complete=self._initial_setup_complete,
+                        login_command=login_cmd,
+                        sso_login_command=sso_cmd,
+                        bundled=is_bundled,
                         probe_timed_out=True,
                     )
                     self._last_probe_at = self._clock()
@@ -3040,6 +3099,7 @@ class KiroPrerequisiteService:
             if whoami.ok:
                 rejected, rejection_detail = await self._probe_spec_acceptance(self._viable_binary)
                 acp_supported = await self._probe_acp_support(self._viable_binary)
+            login_cmd, sso_cmd, is_bundled = login_commands_for(self._viable_binary, self._environ)
             self._status = PrerequisiteStatus(
                 platform=_platform_label(self._platform),
                 installed=True,
@@ -3052,6 +3112,9 @@ class KiroPrerequisiteService:
                 ready=whoami.ok and not rejected and acp_supported,
                 repair_required=bool(rejected),
                 initial_setup_complete=self._initial_setup_complete,
+                login_command=login_cmd,
+                sso_login_command=sso_cmd,
+                bundled=is_bundled,
                 rejected_agent_specs=rejected,
                 agent_spec_rejection_detail=rejection_detail,
                 acp_supported=acp_supported,
@@ -3202,6 +3265,13 @@ class KiroPrerequisiteService:
         error = ""
         if not executable:
             error = "Kiro CLI could not be found to update."
+        elif is_bundled_kiro_cli(executable, self._environ):
+            # The bundled copy lives inside the signed app bundle: writing there
+            # breaks the codesign seal (Gatekeeper then calls the app "damaged"),
+            # and it is pinned to the version the app was built against anyway.
+            # Refused BEFORE the audited spawn so no "invoked" record is written
+            # for a step that never runs.
+            error = BUNDLED_CLI_UPDATE_REFUSAL
         else:
             # The resolved binary is UNVERIFIED (candidates[0] is whatever sits
             # first on PATH; an agent that can plant ~/.local/bin/kiro-cli would
