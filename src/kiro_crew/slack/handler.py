@@ -111,7 +111,7 @@ from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.inbound_spool import InboundRoute
 from kiro_crew.messaging.link import canonical_key
-from kiro_crew.messaging.renderer import redaction_notice
+from kiro_crew.messaging.renderer import count_redaction_tags, redaction_notice
 from kiro_crew.messaging.session_trust import _trusted_sessions as _shared_trusted_sessions
 from kiro_crew.messaging.session_trust import add_trusted_session as _add_trusted_session
 from kiro_crew.messaging.session_trust import clear_trusted_sessions, is_session_trusted
@@ -135,8 +135,6 @@ from kiro_crew.safety_override import (
     yolo_policy_permits,
 )
 from kiro_crew.security import (
-    CREDENTIAL_REDACTION_TAGS,
-    EXFILTRATION_REDACTION_TAG_PREFIX,
     StreamRedactor,
     is_sensitive_path,
     redact,
@@ -820,6 +818,7 @@ async def _apply_privacy_mode(
     slack: SlackClientOps,
     sessions: SessionManager,
     reply_ts: str,
+    link_thread: bool = True,
 ) -> None:
     """Mark a session as *mode* and notify the user (idempotent).
 
@@ -829,13 +828,20 @@ async def _apply_privacy_mode(
     """
 
     async def _notify(message: str) -> None:
-        await slack.post_message(channel, message, reply_ts)
+        await slack.post_message(channel, message, reply_ts or None)
 
     async def _on_applied(_mode: str) -> None:
         # Register thread so follow-up messages pass the in_active_thread
         # gate in mention/observe channels without needing another @mention.
         # reply_ts is the bare Slack thread_ts; session_key may be namespaced.
-        sessions.set_slack_link(session_key, reply_ts, channel)
+        # Skipped when there is no thread, and when the caller says this session
+        # is not thread-scoped at all (``link_thread=False`` -- a flat 1:1 DM,
+        # whose session is keyed by the channel): claiming a thread there would
+        # hand the dashboard mirror one branch to post into. Posting is a
+        # separate decision, so the confirmation still lands where the modifier
+        # was typed.
+        if reply_ts and link_thread:
+            sessions.set_slack_link(session_key, reply_ts, channel)
 
     await privacy_mode.apply_mode(
         mode,
@@ -856,10 +862,18 @@ async def _apply_temporary_modifier(
     slack: SlackClientOps,
     sessions: SessionManager,
     reply_ts: str,
+    link_thread: bool = True,
 ) -> None:
     """Mark a session as temporary and notify the user (idempotent)."""
     await _apply_privacy_mode(
-        privacy_mode.MODE_TEMPORARY, session_key, user_id, channel, slack, sessions, reply_ts
+        privacy_mode.MODE_TEMPORARY,
+        session_key,
+        user_id,
+        channel,
+        slack,
+        sessions,
+        reply_ts,
+        link_thread,
     )
 
 
@@ -870,10 +884,18 @@ async def _apply_incognito_modifier(
     slack: SlackClientOps,
     sessions: SessionManager,
     reply_ts: str,
+    link_thread: bool = True,
 ) -> None:
     """Mark a session as incognito and notify the user (idempotent)."""
     await _apply_privacy_mode(
-        privacy_mode.MODE_INCOGNITO, session_key, user_id, channel, slack, sessions, reply_ts
+        privacy_mode.MODE_INCOGNITO,
+        session_key,
+        user_id,
+        channel,
+        slack,
+        sessions,
+        reply_ts,
+        link_thread,
     )
 
 
@@ -886,6 +908,7 @@ async def maybe_apply_privacy_modifiers(
     slack: SlackClientOps,
     sessions: SessionManager,
     reply_ts: str,
+    link_thread: bool = True,
 ) -> tuple[str, str, bool]:
     """Strip and apply the ``!temporary`` / ``!incognito`` privacy modifiers.
 
@@ -914,7 +937,9 @@ async def maybe_apply_privacy_modifiers(
         cmd_stripped, had_mode = privacy_mode.strip_token(cmd_text, mode)
         if not had_mode:
             continue
-        await _apply_privacy_mode(mode, session_key, user_id, channel, slack, sessions, reply_ts)
+        await _apply_privacy_mode(
+            mode, session_key, user_id, channel, slack, sessions, reply_ts, link_thread
+        )
         cmd_text = cmd_stripped
         text = pattern.sub("", text)
         text = " ".join(text.split()) or text  # collapse whitespace
@@ -4747,6 +4772,7 @@ async def handle_message(
         # yield is a landmine.
         _options_verdict_deferred = False  # set at the verdict step; read by both finallys
         _verdict_booked = not _turn_completed_ok  # model errors already booked
+        _title_pin_held: auto_title.RecordPin | None = None  # set under the permit
         # Bound before the first suspension point so the release finally can read
         # it on a cancellation landing at any await. Recomputed at the delivery
         # step below; the default False is correct for a cancellation BEFORE
@@ -4947,15 +4973,17 @@ async def handle_message(
         # artifact answers the question the user has -- "is what I am about to copy
         # still what the assistant wrote?" -- and stays correct wherever the
         # substitution happened (per-chunk, the StreamRedactor wire pass, the final
-        # render, or the post-decorator scan). Sum every tag the redactor can emit
-        # (`CREDENTIAL_REDACTION_TAGS`) so an encoded-credential-only reply is not
-        # missed.
+        # render, or the post-decorator scan). The shared ``count_redaction_tags``
+        # sums every tag the redactor can emit so an encoded-credential-only reply
+        # is not missed, and counts the exfiltration-URL tag by its prefix, because
+        # that tag interpolates the redacted domain and has no constant form to
+        # equality-compare. Kept as separate counts because the notice is worded
+        # by kind: the remedies differ (re-enter the secret vs re-check the URL).
         #
         # The thinking block (redacted separately below) adds to this SAME tally so a
         # single warning covers the turn if either the answer or the thinking was
         # rewritten -- one turn, one notice, never two identical warnings.
-        _cred_redactions = sum(clean_text.count(tag) for tag in CREDENTIAL_REDACTION_TAGS)
-        _url_redactions = clean_text.count(EXFILTRATION_REDACTION_TAG_PREFIX)
+        _cred_redactions, _url_redactions = count_redaction_tags(clean_text)
 
         # ── Review mode: ephemeral draft instead of public post ──
         if channel_activation == ACTIVATION_REVIEW:
@@ -5165,6 +5193,25 @@ async def handle_message(
         # returns — and books a failure if both fail. The permit stays held across
         # the intervening decorations (fast, best-effort) so the deferred verdict
         # is still written under it.
+        # Pin the record for the naming turn while the permit is still held. Every
+        # release below is followed by Slack round-trips before the auto-title block,
+        # and a queued turn that takes the released permit can delete this key's
+        # record and re-mint it in that span. A pin read down there reads the
+        # REPLACEMENT, the guard matches it, and the title generated from this turn
+        # names a conversation it never ran in. While the permit is held no other
+        # turn for this key runs, so the identity read here is the record this turn
+        # is about. The same cheap ``is_titled`` peek the block below uses gates it,
+        # so an already-named conversation pays no thread hop.
+        #
+        # A key whose record has not landed yet pins ABSENT here and is re-pinned
+        # below once this turn's own row is written: with no record there is nothing
+        # a replacement can be mistaken for, and the first exchange stays nameable.
+        if (
+            not _had_error
+            and not _is_slack_restricted(session_key)
+            and not auto_title.is_titled(session_key)
+        ):
+            _title_pin_held = await auto_title.pin_record(conversation_log, session_key)
         _options_verdict_deferred = bool(_turn_completed_ok and options and _answer_reached)
         if not _options_verdict_deferred:
             if _turn_completed_ok:
@@ -5228,8 +5275,9 @@ async def handle_message(
             # review-mode branch). Count the fully redacted text before it is
             # condensed -- condensing can truncate, which would drop a placeholder
             # from the count even though the credential was still rewritten.
-            _cred_redactions += sum(thinking_mrkdwn.count(tag) for tag in CREDENTIAL_REDACTION_TAGS)
-            _url_redactions += thinking_mrkdwn.count(EXFILTRATION_REDACTION_TAG_PREFIX)
+            _thinking_creds, _thinking_urls = count_redaction_tags(thinking_mrkdwn)
+            _cred_redactions += _thinking_creds
+            _url_redactions += _thinking_urls
             thinking_block = _condense_thinking(thinking_mrkdwn)
             if thinking_ts:
                 try:
@@ -5540,14 +5588,46 @@ async def handle_message(
         # background task fails or returns SKIP, it unclaims the key so the next
         # message retries. A message arriving between claim and unclaim is
         # intentionally skipped (no duplicate).
-        if not _had_error and not _skip_writes and auto_title.try_claim(session_key):
-            track_background_task(
-                asyncio.create_task(
-                    _maybe_auto_title_slack(
-                        slack, sessions, channel, session_key, conversation_log, text, accumulated
+        if not _had_error and not _skip_writes and not auto_title.is_titled(session_key):
+            # The ``is_titled`` peek above is a cheap synchronous membership test on
+            # the same tracker ``try_claim`` checks below: once a key is claimed or
+            # titled the claim cannot be taken again, so without the peek the pin's
+            # thread hop would be paid and then discarded on every later message of
+            # every already-named conversation.
+            #
+            # Pin BEFORE claiming, and both before the task is scheduled. The pin
+            # read suspends on a thread, so claiming first would leave the claim
+            # held across that await with nothing scheduled yet to release it: a
+            # cancellation there (``!stop``) would strand it, and the claim is
+            # process-wide, so this key could not be auto-titled again until the
+            # gateway restarts. The pin still precedes ``create_task``, which is
+            # what closes the scheduling-tick window -- see ``pin_record``.
+            #
+            # The pin itself is the one taken under the permit, well above here:
+            # reading it at this point would sit after the release and after the
+            # Slack round-trips in between, which is the window a replacement
+            # record slips through. ABSENT is the one state worth re-reading, and
+            # only because a key with no record has no replacement to confuse:
+            # this turn's own row has landed by now, so the re-read is what makes a
+            # brand-new conversation nameable from its first exchange.
+            _title_pin = _title_pin_held
+            if _title_pin is None or _title_pin.state == auto_title.RECORD_ABSENT:
+                _title_pin = await auto_title.pin_record(conversation_log, session_key)
+            if auto_title.try_claim(session_key):
+                track_background_task(
+                    asyncio.create_task(
+                        _maybe_auto_title_slack(
+                            slack,
+                            sessions,
+                            channel,
+                            session_key,
+                            conversation_log,
+                            text,
+                            accumulated,
+                            pin=_title_pin,
+                        )
                     )
                 )
-            )
     finally:
         # If the verdict was deferred to the footer and this tail is torn down
         # (a raise or cancellation in a decoration) before the footer books it,
@@ -5576,8 +5656,14 @@ async def _maybe_auto_title_slack(
     conversation_log: ConversationLog | None,
     user_text: str,
     assistant_text: str,
+    *,
+    pin: auto_title.RecordPin,
 ) -> None:
-    """Generate and set a Slack thread title after the first response."""
+    """Generate and set a Slack thread title after the first response.
+
+    ``pin`` is captured by the CALLER before this task is scheduled, and is
+    required rather than defaulted -- see ``auto_title.pin_record``.
+    """
 
     async def _set_thread_title(title: str) -> None:
         await slack.set_thread_title(channel, session_key, title)
@@ -5588,6 +5674,7 @@ async def _maybe_auto_title_slack(
         session_key,
         user_text,
         assistant_text,
+        pin=pin,
         source="slack",
         resources=f"{channel}:{session_key}",
         set_channel_title=_set_thread_title,

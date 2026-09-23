@@ -55,6 +55,7 @@ import logging
 import os
 import shutil
 import time
+import traceback
 import weakref
 from collections import deque
 from collections.abc import Callable, Collection, Iterator
@@ -474,6 +475,40 @@ def remove_unit(kind: str, unit_id: str, *, guard: "Callable[[Path], bool]") -> 
                     history_gone,
                     failures,
                 )
+                if kind == KIND_SESSION:
+                    # Some of this unit's history is gone, which is why the in-memory
+                    # edge is suspect -- but "some" is not "the opening record", and the
+                    # two ways it can be wrong call for different answers. The disk
+                    # decides, by the same reading a fresh scan of this unit would make.
+                    # Same import-here reason as the removed path below.
+                    from kiro_crew.crew_log.session_tree import opened_record
+                    from kiro_crew.crew_log.session_tree_projection import (
+                        forget_unit,
+                        retract_unit_parent,
+                    )
+
+                    surviving = None
+                    try:
+                        ordered = segment_paths(kind, unit_id)
+                        if ordered:
+                            header, entry, _announced = read_head(ordered[0])
+                            surviving = opened_record(directory, header, entry)
+                    except OSError:
+                        # Cannot read it, so cannot prove anything survives. Treated as
+                        # gone, which is the conservative direction: a dropped edge
+                        # comes back on the next seed, a kept one that names nothing
+                        # readable stays wrong until the process restarts.
+                        surviving = None
+                    if surviving is None:
+                        # Nothing here still yields a record at all.
+                        forget_unit(unit_id)
+                    elif surviving.parent_slot is None:
+                        # The CREATING segment went while later ones survive, so a scan
+                        # now contributes this slot with NO parent. Dropping the whole
+                        # record instead would orphan this unit's CHILDREN, which cite
+                        # its slot: a slot with no record reads as a creator that never
+                        # existed, rather than one whose own creator is unknown.
+                        retract_unit_parent(unit_id)
             else:
                 logger.warning(
                     "crew log retention: %s log %r not removed; its history is intact",
@@ -498,6 +533,20 @@ def remove_unit(kind: str, unit_id: str, *, guard: "Callable[[Path], bool]") -> 
         # Every file this owns is gone. A directory that will not go is residue,
         # not retained history, so the removal still counts -- but say so.
         logger.debug("crew log retention: %s log %r directory not removed", kind, unit_id)
+    if kind == KIND_SESSION:
+        # The session tree projection holds this unit's lineage edge in memory, and
+        # the disk it was folded from has stopped holding it. Dropped HERE, at the one
+        # point the removal is established, rather than in the sweep: ``remove_unit``
+        # is also reached by a direct delete, and a projection updated only by the
+        # retention pass would keep serving an edge into a unit that is gone.
+        #
+        # Deliberately after the ``rmdir``, which is allowed to fail: what makes the
+        # record wrong is that the unit's SEGMENTS are gone, and an empty directory
+        # left standing is residue that answers no record either way. Imported here
+        # because the projection imports this module for the root and the replay.
+        from kiro_crew.crew_log.session_tree_projection import forget_unit
+
+        forget_unit(unit_id)
     return REMOVE_REMOVED
 
 
@@ -580,6 +629,21 @@ def unit_header_slot(kind: str, unit_id: str) -> "str | None":
     return slot if isinstance(slot, str) and slot else None
 
 
+def unprovable_session_units() -> int:
+    """How many session-kind units under the root have a header that cannot be proved.
+
+    A slot-keyed fold reaches its units through their headers, so a unit this
+    cannot read is a unit no fold will see; a caller that must know its fold was
+    complete asks this first.
+    """
+    try:
+        root = _checked_crew_log_root(KIND_SESSION)
+        names = sorted(child.name for child in root.iterdir())
+    except (CrewLogError, OSError):
+        return 0
+    return sum(1 for name in names if _proved_header(root / name) is None)
+
+
 #: The cached slot map, the root identity it was built from, and the children that
 #: scan could NOT prove. Replaced WHOLE, so a reader loads one reference and sees
 #: either the old triple or the new one; two threads racing rebuild it twice, which
@@ -609,7 +673,7 @@ def _slot_root_fingerprint(root: Path, names: "list[str]") -> "tuple[Any, ...]":
     return (str(root), stat.st_dev, stat.st_ino, stat.st_mtime_ns, tuple(names))
 
 
-def session_units_for_slot(slot: str) -> "tuple[str, ...]":
+def session_units_for_slot(slot: str, *, strict: bool = False) -> "tuple[str, ...]":
     """Every session crew log whose HEADER names *slot*, oldest unit first.
 
     The slot-keyed read path. A slot owns one ACP session id AT A TIME rather than
@@ -620,6 +684,14 @@ def session_units_for_slot(slot: str) -> "tuple[str, ...]":
     rewritten, and inside the fenced tree, so it does not move when a mapping does.
     A unit whose header cannot be PROVED to be its own is left out rather than
     attributed to a slot it may not belong to (see :func:`_proved_header`).
+
+    *strict* is for a caller that VALIDATES against the listing rather than reading
+    it, and it refuses on both ways the listing can come back incomplete: a scan that
+    could not be made at all, and a child that cannot be proved while already holding
+    entries (:func:`_unproven_holding_content`). Without it a read takes the shorter
+    listing, which is the right answer for a read -- it says nothing false about what
+    it could see -- and the wrong one for a write, which would validate against a
+    record missing whatever that unit recorded.
 
     Ordered by the header's ``createdAt``, then by unit id so a tie is stable.
     That is the order the units were opened in, and therefore the order their
@@ -632,16 +704,42 @@ def session_units_for_slot(slot: str) -> "tuple[str, ...]":
     """
     if not slot:
         return ()
+    return session_units_by_slot(strict=strict).get(slot, ())
+
+
+def session_units_by_slot(*, strict: bool = False) -> "dict[str, tuple[str, ...]]":
+    """Every session crew log with a provable slot-naming header, grouped by slot.
+
+    The index :func:`session_units_for_slot` looks one slot up in; a caller that
+    must look ACROSS slots (a rebuild searching every other slot's units for entries
+    naming its board) reads the whole map once instead of scanning per slot. Same
+    order within a slot, same cache, same treatment of unprovable children.
+
+    *strict* carries the validating caller's contract down to the scan that decides
+    it, because the refusal belongs where the incompleteness is seen rather than
+    where the listing is used. It means the same thing either way in: a scan that
+    could not be made at all, and a child that cannot be proved while already
+    holding entries, are both refused instead of being answered with a listing that
+    is quietly short.
+    """
     global _slot_index
     try:
         root = _checked_crew_log_root(KIND_SESSION)
         names = sorted(child.name for child in root.iterdir())
     except (CrewLogError, OSError):
-        return ()
+        # No store, or one that could not be scanned. A read takes the empty listing;
+        # a caller that would VALIDATE against the listing passes ``strict`` and gets
+        # the failure instead, because an empty listing taken for a scan that failed
+        # would let it validate against a record that is not there.
+        if strict:
+            raise
+        return {}
     fingerprint = _slot_root_fingerprint(root, names)
     cached = _slot_index
     if cached is not None and cached[0] == fingerprint and not _any_now_provable(root, cached[2]):
-        return cached[1].get(slot, ())
+        if strict:
+            _refuse_unprovable_unit(root, cached[2])
+        return cached[1]
     rows: "dict[str, list[tuple[int, str]]]" = {}
     unproven: list[str] = []
     for name in names:
@@ -673,7 +771,57 @@ def session_units_for_slot(slot: str) -> "tuple[str, ...]":
         rows.setdefault(unit_slot, []).append((order, unit_id))
     by_slot = {key: tuple(unit for _order, unit in sorted(found)) for key, found in rows.items()}
     _slot_index = (fingerprint, by_slot, tuple(unproven))
-    return by_slot.get(slot, ())
+    if strict:
+        _refuse_unprovable_unit(root, tuple(unproven))
+    return by_slot
+
+
+def _unproven_holding_content(root: Path, unproven: "tuple[str, ...]") -> "str | None":
+    """The first child that cannot be proved AND already holds log content.
+
+    What the strict listing needs beyond the scan. A child ``_proved_header`` could
+    not prove is one of two different things, and only one of them is safe to leave
+    out of the listing:
+
+    * ``create`` has made the directory and not yet published the header. It holds no
+      entries at all, so a listing without it is missing nothing that could be folded.
+    * an established unit whose header will not read right now -- a transient
+      ``OSError``, a link at the name, a segment that will not parse. It may hold any
+      number of entries, so a caller that VALIDATES against the listing (the crew
+      ledger's one-editor rule) would pass against a record missing them.
+
+    "Holds content" is the same test ``create`` itself applies: the header is
+    published atomically, so a partial one never reaches the name, and a zero-byte
+    file "carries no header and no entries". A directory that will not answer at all
+    is reported rather than guessed about -- whether it holds entries is exactly what
+    could not be established.
+    """
+    for name in unproven:
+        directory = root / name
+        if is_link(directory):
+            return name
+        try:
+            segments = [
+                child for child in directory.iterdir() if _segment_first_seq(child) is not None
+            ]
+        except OSError:
+            return name
+        if any(_has_content(segment) for segment in segments):
+            return name
+    return None
+
+
+def _refuse_unprovable_unit(root: Path, unproven: "tuple[str, ...]") -> None:
+    """Raise when a strict listing cannot account for a child that holds entries."""
+    blocked = _unproven_holding_content(root, unproven)
+    if blocked is None:
+        return
+    raise CrewLogError(
+        f"session crew log {blocked!r} holds entries its header cannot prove, "
+        "so the listing is incomplete",
+        code=CODE_BAD_HEADER,
+        field="id",
+    )
 
 
 def _any_now_provable(root: Path, unproven: "tuple[str, ...]") -> bool:
@@ -2115,7 +2263,9 @@ class CrewLog:
                         if hashed == records:
                             return (digest.hexdigest(), hashed)
         except Exception:
-            logger.debug("crew log raw prefix for %s could not be read", self._id, exc_info=True)
+            log_exception_text(
+                logger, logging.DEBUG, "crew log raw prefix for %s could not be read", self._id
+            )
         return (digest.hexdigest(), hashed)
 
     def raw_records_through(self, seq: int) -> int | None:
@@ -2170,8 +2320,8 @@ class CrewLog:
                             # is not in this log and no count describes it.
                             return None
         except Exception:
-            logger.debug(
-                "crew log prefix boundary for %s could not be read", self._id, exc_info=True
+            log_exception_text(
+                logger, logging.DEBUG, "crew log prefix boundary for %s could not be read", self._id
             )
             return None
         return None
@@ -2490,6 +2640,21 @@ class CrewLog:
 _restrict_failed: set[str] = set()
 
 
+def log_exception_text(log: logging.Logger, level: int, msg: str, *args: object) -> None:
+    """Log the active exception with its traceback RENDERED to text, never as ``exc_info``.
+
+    Every caller sits in a frame that holds a ``CrewLog`` handle (a method's ``self``, a
+    local ``handle``), and a handle's write lease is released by a finalizer when the
+    handle is dropped. An ``exc_info`` triple on the record keeps the traceback, the
+    traceback keeps that frame, and a handler that keeps records (a ``MemoryHandler``, a
+    test harness) then keeps the handle -- and its lease -- for as long as it keeps the
+    record. A string keeps nothing; the render is skipped when the level is off.
+    """
+    if not log.isEnabledFor(level):
+        return
+    log.log(level, msg + "\n%s", *args, traceback.format_exc().rstrip())
+
+
 def _mkdir_private(directory: Path) -> None:
     """Create *directory* and its parents owner-only.
 
@@ -2523,10 +2688,11 @@ def _mkdir_private(directory: Path) -> None:
         key = str(directory)
         if key not in _restrict_failed:
             _restrict_failed.add(key)
-            logger.warning(
+            log_exception_text(
+                logger,
+                logging.WARNING,
                 "Cannot restrict %s to owner-only; it may be readable by other users",
                 directory,
-                exc_info=True,
             )
 
 

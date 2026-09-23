@@ -234,7 +234,7 @@ def _step_env(workflow_name: str, step_name: str) -> dict[str, str]:
 
 # The three steps of the blocking-finding adjudication stage, in both GPT lanes.
 ADJ_EXTRACT = "Extract blocking findings for adjudication"
-ADJ_MODEL = "Opus 4.8 adjudication (blocking findings only)"
+ADJ_MODEL = "Opus 5 adjudication (blocking findings only)"
 ADJ_GATE = "Adjudicate the blocking verdict (script arithmetic, fail closed)"
 
 
@@ -511,7 +511,7 @@ class TestLineReviewHumanOverrides:
         assert '.user.login == "github-actions[bot]"' in workflow
         assert "steps.human_override.outputs.active != 'true'" in workflow
         assert "✅ human override accepted" in workflow
-        assert "Human judgment by $OVERRIDE_ACTOR overrides Opus 4.8" in workflow
+        assert "Human judgment by $OVERRIDE_ACTOR overrides Opus 5" in workflow
         assert "/ai-review override fable $HEAD:" in workflow
 
     @pytest.mark.parametrize(
@@ -911,7 +911,7 @@ class TestPrReadiness:
             "build.yml|Build",
             "code-review.yml|Code Review",
             "dynamic/github-code-scanning/codeql|CodeQL",
-            "claude-review.yml|Opus 4.8 Review",
+            "claude-review.yml|Opus 5 Review",
             "codex-review.yml|GPT 5.6 Review",
             "design-review.yml|Design Review",
         ):
@@ -952,18 +952,21 @@ class TestPrReadiness:
         # to THIS PR and attempt: the third field is the external_id prefix and
         # the fourth is the triggering workflow (Fast Gate) whose newest run +
         # attempt defines "current".
-        assert '"checkrun:Opus 4.8 Review|Opus 4.8 Review|opus-pr-|fast-gate.yml"' in workflow
+        assert '"checkrun:Opus 5 Review|Opus 5 Review|opus-pr-|fast-gate.yml"' in workflow
         assert '"checkrun:GPT 5.6 Review|GPT 5.6 Review|gpt-pr-|fast-gate.yml"' in workflow
         assert '"checkrun:Design Review|Design Review|design-pr-|fast-gate.yml"' in workflow
         assert '"checkrun:UX Review|UX Review|ux-pr-|fast-gate.yml"' in workflow
-        assert "commits/$SHA/check-runs?check_name=$enc" in workflow
+        # One read of the head's check-runs serves all seven lanes; the
+        # external_id match, not a check_name filter, names the lane.
+        assert "commits/$SHA/check-runs?per_page=100" in workflow
+        assert "check-runs?check_name=$enc" not in workflow
         # The blanket fork skip and the maintainer-review verdict are gone.
         assert '"GPT 5.6 Review (fork PR)"' not in workflow
         assert 'state="maintainer_review"' not in workflow
         assert "AI reviews could not run" not in workflow
         # Stage-2 fork reviewers re-trigger readiness on completion so the
         # green verdict actually lands.
-        assert "Fork Opus 4.8 Review" in workflow
+        assert "Fork Opus 5 Review" in workflow
         assert "Fork GPT 5.6 Review" in workflow
         assert "github.event.workflow_run.event == 'workflow_run'" in workflow
 
@@ -3571,7 +3574,7 @@ FORK_SWEEP_LANES = (
         "Finalize check-run (advisory)",
     ),
     ("fork-gpt-review.yml", "GPT 5.6 Review", "gpt", "Finalize check-run (fail closed)"),
-    ("fork-opus-review.yml", "Opus 4.8 Review", "opus", "Finalize check-run (fail closed)"),
+    ("fork-opus-review.yml", "Opus 5 Review", "opus", "Finalize check-run (fail closed)"),
     ("fork-ux-review.yml", "UX Review", "ux", "Finalize check-run (advisory)"),
 )
 
@@ -3749,7 +3752,7 @@ class TestClaudeReviewCodeOnlyScope:
         assert "exit 1" in script  # an empty diff is a real signal, not a pass
         assert "${{ runner.temp }}/pr.diff" in same
         # The prefetch must precede the first agentic step.
-        assert same.index("Prefetch the reviewable diff") < same.index("- name: Opus 4.8 discovery")
+        assert same.index("Prefetch the reviewable diff") < same.index("- name: Opus 5 discovery")
         # The shared prompts must NOT hardcode a diff source: each lane names its
         # own, so the acquisition step belongs to the caller.
         for stage in ("opus-discovery", "opus-validate"):
@@ -3793,8 +3796,8 @@ class TestOpusTwoStageArchitecture:
     def test_both_lanes_run_discovery_then_validation(self) -> None:
         for lane in self.LANES:
             workflow = _workflow(lane)
-            discover_at = workflow.index("- name: Opus 4.8 discovery")
-            validate_at = workflow.index("- name: Opus 4.8 validation")
+            discover_at = workflow.index("- name: Opus 5 discovery")
+            validate_at = workflow.index("- name: Opus 5 validation")
             assert discover_at < validate_at, lane
             # The gate, the transcript capture and the posted comment all read
             # `steps.review`, so VALIDATION must own that id -- if discovery took
@@ -3807,7 +3810,7 @@ class TestOpusTwoStageArchitecture:
         for lane in self.LANES:
             workflow = _workflow(lane)
             assert ".review-candidates.md" in workflow, lane
-            validate_at = workflow.index("- name: Opus 4.8 validation")
+            validate_at = workflow.index("- name: Opus 5 validation")
             shim = workflow[validate_at:]
             assert "UNTRUSTED EVIDENCE" in shim, lane
             # No interpolation of the discovery transcript into the next prompt.
@@ -5354,6 +5357,111 @@ class TestForkReviewersAreStageTwoOfFastGate:
         assert "never a security" in flat, name
 
 
+class TestLedgerWriterGateFailsClosed:
+    """Execute the ACTUAL ledger writer-gating permission read with ``gh`` stubbed.
+
+    An empty ``perm`` matches no ``case`` arm, so a permission read that FAILED
+    resolves its author to non-writer and drops that writer's disposition
+    records from the ledger -- the reviewer then re-litigates findings a
+    repository writer already ruled on, on a green run with no annotation.
+    """
+
+    DISPOSITION = (
+        '[{"body":"<!-- ai-review-disposition target=gpt head=abc -->",'
+        '"user":{"login":"someone"}}]'
+    )
+
+    def _writer_gate_block(self) -> str:
+        script = _step_script(_workflow("codex-review.yml"), "Write review prompt")
+        start = script.index('disp_authors="')
+        end = script.index('ledger_full="')
+        return script[start:end]
+
+    def _run_gate(self, tmp_path: Path, perm_mode: str):
+        bash = _bash()
+        if bash is None:
+            pytest.skip("the writer gate is Bash; skip where Bash is absent")
+        attempts = tmp_path / "gh-attempts"
+        gh = tmp_path / "gh"
+        stub = f'#!/bin/sh\nprintf x >> "{attempts}"\n'
+        if perm_mode == "write":
+            stub += "printf 'write\\n'\n"
+        elif perm_mode == "notfound":
+            stub += 'echo "gh: Not Found (HTTP 404)" >&2\nexit 1\n'
+        else:
+            stub += 'echo "gh: Internal Server Error (HTTP 500)" >&2\nexit 1\n'
+        gh.write_text(stub, encoding="utf-8", newline="\n")
+        gh.chmod(0o755)
+        sleep_stub = tmp_path / "sleep"
+        sleep_stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8", newline="\n")
+        sleep_stub.chmod(0o755)
+        out_file = tmp_path / "writers.json"
+        script = (
+            f"comments_json='{self.DISPOSITION}'\n"
+            + self._writer_gate_block()
+            + f'\nprintf \'%s\' "$writers" > "{out_file}"\n'
+        )
+        result = subprocess.run(
+            [bash, "-e", "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env={
+                "PATH": _stub_path(tmp_path),
+                "GH_TOKEN": "",
+                "GITHUB_TOKEN": "",
+                "GH_CONFIG_DIR": str(tmp_path),
+                "LC_ALL": "C",
+                "REPO": "example/repo",
+                "PR": "1",
+                "TMPDIR": str(tmp_path),
+            },
+            cwd=tmp_path,
+        )
+        return result, attempts, out_file
+
+    def test_a_readable_writer_is_gated_in(self, tmp_path: Path):
+        result, attempts, out_file = self._run_gate(tmp_path, "write")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(out_file.read_text(encoding="utf-8")) == ["someone"]
+        assert attempts.read_text(encoding="utf-8") == "x"
+
+    def test_a_404_stays_a_legitimate_non_writer(self, tmp_path: Path):
+        # The API answering "not a collaborator" is a real negative: exclude the
+        # author, without a retry and without failing the step.
+        result, attempts, out_file = self._run_gate(tmp_path, "notfound")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(out_file.read_text(encoding="utf-8")) == []
+        assert attempts.read_text(encoding="utf-8") == "x"
+
+    def test_an_unreadable_permission_fails_closed(self, tmp_path: Path):
+        result, attempts, out_file = self._run_gate(tmp_path, "transient")
+        assert result.returncode != 0, "an unreadable permission passed as non-writer"
+        assert "::error::" in result.stdout
+        # Bounded: a permanently failing API must not hold the job open.
+        assert attempts.read_text(encoding="utf-8") == "xxx"
+        assert not out_file.exists(), "the ledger was gated on a permission never read"
+
+    def test_permission_read_no_longer_swallows_its_status(self):
+        block = "\n".join(
+            line
+            for line in self._writer_gate_block().splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        assert "collaborators/$author/permission" in block
+        # The read spans a continuation line and its redirection sits on the
+        # SECOND one, so judge THAT line: a check scoped to the line naming the
+        # endpoint passes while the exit status is still swallowed.
+        redirection = _line_containing(block, "--jq '.permission'")
+        assert "2>/dev/null" not in redirection
+        assert "|| true" not in redirection
+        # An explicit 404 stays a legitimate negative, so it must be matched by
+        # name rather than folded into the unknown-failure arm.
+        assert "HTTP 404|Not Found" in block
+        assert "for attempt in 1 2 3; do" in block
+
+
 class TestProtectedCheckNameHasOnePublisherPerPrType:
     """A required review status must never be satisfied by the OTHER lane's run.
 
@@ -5378,7 +5486,7 @@ class TestProtectedCheckNameHasOnePublisherPerPrType:
     # (same-repo workflow, protected check name, Stage-2 fork workflow)
     PAIRS = (
         ("codex-review.yml", "GPT 5.6 Review", "fork-gpt-review.yml"),
-        ("claude-review.yml", "Opus 4.8 Review", "fork-opus-review.yml"),
+        ("claude-review.yml", "Opus 5 Review", "fork-opus-review.yml"),
         ("design-review.yml", "Design Review", "fork-design-review.yml"),
         (
             "first-principles-review.yml",
@@ -5957,7 +6065,7 @@ class TestBlockAdjudicationContract:
             # Read-only tools, and no `gh`: this stage must not be able to post
             # its own verdict anywhere, only return text the script parses.
             assert '--allowedTools "Read,Grep,Glob"' in with_["claude_args"], lane
-            assert "us.anthropic.claude-opus-4-8" in with_["claude_args"], lane
+            assert "--model us.anthropic.claude-opus-5" in with_["claude_args"], lane
             assert "Bash" not in with_["claude_args"], lane
 
     def test_the_fork_lane_tells_the_adjudicator_the_head_is_not_on_disk(self) -> None:
@@ -6005,7 +6113,7 @@ class TestBlockAdjudicationContract:
             assert "all downgraded on adjudication" in comment, lane
             # Downgraded findings are still SHOWN. The signal was real; only its
             # authority to block the merge was removed.
-            assert "Adjudication (Opus 4.8)" in comment, lane
+            assert "Adjudication (Opus 5)" in comment, lane
             assert "codex-adjudication.md" in comment, lane
 
     def test_the_adjudication_step_never_fails_the_job_open(self) -> None:

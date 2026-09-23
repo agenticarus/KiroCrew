@@ -404,6 +404,163 @@ def _slots_serialization_note(slots_data: object, *, path: str = "slots-broadcas
         return f"[{path}] slot projection is not JSON-serializable (offender walk failed)"
 
 
+#: Guards :func:`_request_lineage_seed` so a burst of slot frames arriving before the
+#: projection is seeded costs ONE seed rather than one per frame.
+_lineage_seed_lock = threading.Lock()
+_lineage_seed_in_flight = False
+
+
+def _attach_slot_parents(rows: "list[dict]") -> None:
+    """Give every slot row its ``parent`` -- ``{slot, key}`` or ``None``. IN PLACE.
+
+    This is what lets the chat sidebar nest a session under the one that opened it
+    through ``session_create``: the sidebar already receives the slots broadcast, so
+    the edge rides a frame it gets anyway rather than a route it would have to poll.
+
+    The SHAPE is byte-identical to the Sessions table's ``parent`` -- same two keys,
+    same meaning, same ``key: None`` for a creator that is not running or sits on a
+    cycle -- because one moved ``nestsUnder`` serves both views and a second shape
+    would be a second way to nest the same gateway. What differs, necessarily, is the
+    KEY SPACE: ``key`` names the creator's row IN THIS PAYLOAD, so here it is the bare
+    slot key and on the memory payload it is the full ``dashboard:`` session key.
+    ``nestsUnder`` resolves ``parent.key`` against its own payload's keys, so that is
+    the invariant it needs; a session key here would name no row and every child would
+    silently detach.
+
+    Whole-population work, so it lives after the per-slot loop rather than inside
+    :meth:`DashboardState.serialize_slot`: resolving a citation to a LIVE creator needs
+    every row's key, which one slot does not have.
+
+    NO DISK, and no blocking, because this runs on the event loop. The lineage is read
+    only when the projection is ALREADY seeded for the store now configured; otherwise
+    every row ships ``parent: None`` for this frame and the seed is handed to the
+    maintenance pool. Seeding is a checkpoint load plus a names-only listing, or on the
+    very first boot of this build one full scan -- work measured in milliseconds but
+    still disk, and disk on this loop stalls every other request and the heartbeat
+    behind it.
+
+    It does NOT broadcast when the seed lands, and that is deliberate. Every path that
+    would -- ``push_slots_update``, the trailing timer, a frame of its own -- either
+    writes the coalescer's clock or adds a frame, and both are load-bearing elsewhere: a
+    request inside ``suspend_slots_push`` needs that window open so its own flush
+    broadcasts INLINE and a broadcast failure reaches its caller, and the create path
+    pins exactly one coalesced frame per change.
+
+    Instead the frame SAYS it is provisional: while the projection is not seeded for this
+    store, every row carries ``lineage_pending: true``, and a client that sees it reads
+    the slot list again shortly. That keeps the recovery on the read side, where it costs
+    neither contract, and it closes the case a "next ordinary broadcast" cannot: an IDLE
+    gateway, where nothing is running and no further frame is coming, so an unnested cold
+    start would otherwise persist until the user happened to act. The flag is set only
+    when a later read would genuinely answer differently -- never with the crew log off,
+    and never after a failure this cannot promise will clear.
+
+    Nor is the seed started at boot, which would close that one-frame window: seeding is
+    bound to one store and re-runs when the data home changes, so a process serving
+    several homes would queue a full cold scan per bind onto the shared maintenance pool.
+
+    Never raises, and every row gets the key either way. A sidebar that cannot paint is
+    a worse failure than a sidebar that does not nest, and a row silently MISSING the
+    key would make the frontend's ``parent === undefined`` mean two different things.
+    """
+    if not rows:
+        return
+    parents: dict = {}
+    # Set ONLY when a later read would answer differently: the projection is not seeded
+    # for this store yet and a seed has been asked for. With the crew log off, or after a
+    # failure this cannot promise will clear, the flag stays off -- a client must never be
+    # told to come back for an answer that will never change.
+    pending = False
+    try:
+        from kiro_crew.crew_log import emit as crew_log_emit
+
+        # Checked BEFORE the storage import, the way the memory payload's ``_lineage``
+        # does it. With the crew log off there are no records to read and never will
+        # be, so seeding would scan a store nobody is writing -- and every row's answer
+        # is the same ``None`` either way.
+        if not crew_log_emit.enabled():
+            for row in rows:
+                row["parent"] = None
+            return
+
+        from kiro_crew.crew_log.session_tree_projection import projection
+        from kiro_crew.dashboard.session_memory import lineage_parents
+
+        proj = projection()
+        if proj.seeded_for_current_store:
+            parents = lineage_parents(rows, proj.nodes())
+        else:
+            _request_lineage_seed()
+            # Say that this frame's answer is PROVISIONAL, so a reader can come back for
+            # the real one. Without it a cold start is indistinguishable from a store
+            # with no lineage at all, and an idle sidebar -- nothing running, no frame
+            # coming -- paints unnested and stays that way until the user happens to act.
+            # The seed does not broadcast when it lands (see above), so the recovery has
+            # to be a READ the client chooses to repeat, not a frame this pushes.
+            pending = True
+    except Exception:
+        # Includes the crew log being off, in which case there are no records and no
+        # lineage to report -- not an error, and not worth a warning on a hot path.
+        logger.debug("slot lineage could not be resolved; slots ship without parents")
+    for row in rows:
+        key = row.get("key")
+        row["parent"] = parents.get(key) if isinstance(key, str) else None
+        # Omitted rather than sent as False, the same distinction `parent` keeps: the
+        # ordinary frame carries no flag at all, so nothing is added to the steady state.
+        if pending:
+            row["lineage_pending"] = True
+
+
+def _request_lineage_seed() -> None:
+    """Seed the session-tree projection on the maintenance pool. Returns immediately.
+
+    One seed in flight at a time. The guard is an in-flight flag rather than a
+    once-per-process latch, because the projection legitimately needs re-seeding when
+    the data home changes underneath the process -- a latch would leave the sidebar
+    permanently un-nested after a pod or a relocated home, which is the bug the flag
+    avoids while still collapsing a burst of frames into one seed.
+
+    Never raises. A pool that will not take the job leaves the flag clear so the next
+    caller can try, and until some seed succeeds every row simply ships no parent.
+
+    A no-op with the crew log off: there are no records to fold, so seeding would only
+    scan a store nobody is writing.
+    """
+    global _lineage_seed_in_flight
+    try:
+        from kiro_crew.crew_log import emit as crew_log_emit
+
+        if not crew_log_emit.enabled():
+            return
+    except Exception:
+        return
+    with _lineage_seed_lock:
+        if _lineage_seed_in_flight:
+            return
+        _lineage_seed_in_flight = True
+
+    def _seed() -> None:
+        global _lineage_seed_in_flight
+        try:
+            from kiro_crew.crew_log.session_tree_projection import projection
+
+            projection().ensure_seeded()
+        except Exception:
+            logger.debug("session tree projection could not be seeded", exc_info=True)
+        finally:
+            with _lineage_seed_lock:
+                _lineage_seed_in_flight = False
+
+    try:
+        from kiro_crew.executors import maintenance_executor
+
+        maintenance_executor().submit(_seed)
+    except Exception:
+        with _lineage_seed_lock:
+            _lineage_seed_in_flight = False
+        logger.debug("lineage seed could not be scheduled", exc_info=True)
+
+
 def _slots_ws_frame(
     slots: object,
     *,
@@ -878,6 +1035,18 @@ _DEFAULT_PORT = DASHBOARD_PORT
 _SSE_INTERVAL_SECS = 5
 _NOTIFICATIONS_FILE = "notifications.jsonl"
 _MAX_PERSISTED_NOTIFICATIONS = 200
+
+# Fraction of the recency cap reserved for UNSERVABLE notification lines -- a line
+# ``_servable_note`` rejects, so ``_load_notifications`` can never serve it. Such a
+# line is kept rather than destroyed, but in its own window: see
+# ``_maybe_trim_notifications`` for why a shared window turns an append into an
+# eviction.
+#
+# A fraction rather than a second full cap. Two full windows put the post-trim file
+# exactly AT the trim threshold, so every later append would re-read and re-write the
+# whole file; and this window is a sample of recent damage for a human to look at, not
+# history the product serves, so it does not need history's budget.
+_UNSERVABLE_NOTIFICATION_CAP_DIVISOR = 4
 _AUTO_COMPACT_NOTICE = "🔄 Auto-compacted at {pct:.0f}%."
 #: The notice for the arm that REPLACES the session instead of summarizing it. A
 #: separate template because ``_AUTO_COMPACT_NOTICE`` would announce a summary that
@@ -1404,6 +1573,18 @@ COMPACTION_RECOVERY_PREFIX = "[Context compacted — automatic recovery]"
 # say "automatic recovery" like the five above: a person pressed the button, and
 # the card must not claim the system recovered by itself.
 MANUAL_RESUME_RECOVERY_PREFIX = "[Continue — requested by the user]"
+# Prefix on the continuation injected when a content-filter refusal landed AFTER
+# the turn had already dispatched tool calls and agent.refusal_fallback_model
+# names a different model. The user's message is NOT replayed there -- the
+# completed tool calls would run a second time -- so the session is moved to the
+# fallback model and asked to carry on from the completed work, the same
+# continuation a person gets from Continue. Body: _REFUSAL_FALLBACK_RESUME_MSG
+# in chat_utils. Named into the *_RECOVERY_PREFIX family so
+# test_recovery_card_prefixes.py's drift guard sees it. The VALUE names the
+# cause (a model's filter) and the remedy (another model); it says neither
+# "requested by the user" (nobody pressed anything) nor "automatic recovery"
+# (nothing faulted -- the model declined).
+REFUSAL_FALLBACK_RECOVERY_PREFIX = "[Content filter — continuing on the fallback model]"
 # Prefix on the continuation injected when a Stop hook returns a block decision
 # (`{"decision": "block", "reason": ...}` on exit-0 stdout). The reason IS the
 # instruction, handed back as the next turn so a hook can steer the session
@@ -2331,6 +2512,7 @@ class _ChatSlot:
         "_mcp_report_session_id",
         "_on_message",
         "_on_question_retired",
+        "_coordinator_approvals",
         "_has_reader_flag",
         "_stop_state_raw",
         "_stop_generation",
@@ -2472,6 +2654,7 @@ class _ChatSlot:
         "_steer_send_ids",
         "_steer_user_origin",
         "_steer_admissions",
+        "_steer_decision_strips",
         "_steer_audience_fences",
         "_steer_attachment_meta",
         "_wait_state",
@@ -2788,6 +2971,12 @@ class _ChatSlot:
         # is invisible to a second window, and to a /pending response already in
         # flight — either would re-render a card whose answer has been sent.
         self._on_question_retired: object | None = None
+        # Live ApprovalCoordinator records owned by this slot, wired by
+        # DashboardState like _on_message. A sub-agent spawn gate or a tool
+        # approval inside a running sub-agent parks its future on the STATE
+        # registry, never on _approval_futures, so the projection has to ask
+        # the state to learn that this slot is waiting.
+        self._coordinator_approvals: Callable[[str], list[dict]] | None = None
         self._has_reader_flag: bool = False  # True when HTTP SSE stream is draining
         self._stop_state_raw: str = "idle"  # 'idle' | 'soft_pending' | 'killing'
         # Monotonic count of stop INITIATIONS (idle → active edges of
@@ -3419,6 +3608,16 @@ class _ChatSlot:
         # key, which puts it on the drain's fail-closed floor: checked against every
         # currently held constraint rather than against a baseline built at teardown.
         self._steer_admissions: dict[str, dict] = {}
+        # The `message.steer` decision row that chose the STEER path for an
+        # in-flight steer, keyed by the same message text as the maps above and
+        # kept in the same LOCKSTEP. Only the requeue reads it: the receipt is
+        # stamped on the persisted row by the steer path itself and on the queue
+        # entry by `queue_for_next_turn`, but a steer the turn's teardown requeues
+        # takes neither of those writers -- the teardown is a different coroutine
+        # that never sees the caller's argument -- so without this map the one
+        # outcome a decision did choose lands as a queue entry with no receipt.
+        # Absent for a manual steer, which has none to carry.
+        self._steer_decision_strips: dict[str, dict] = {}
         # Admission snapshots of the peer steers that influenced THIS turn, keyed by
         # an opaque token. The turn consults them before publishing its CROSS-SURFACE
         # reply leg and withholds it when a constraint newly holds:
@@ -4373,7 +4572,7 @@ class _ChatSlot:
             "total": len(links),
         }
 
-    def to_dict(self, *, include_check_status: bool = False, dashboard_user: bool = False) -> dict:
+    def _summary_source_links(self) -> list[dict]:
         # Skip extraction itself when the chips are off, not just the two fields
         # the projection derives from it: `_pr_source_links()` scans the transcript
         # under a per-call parse budget, and paying for a payload nothing renders
@@ -4384,11 +4583,39 @@ class _ChatSlot:
             session_card_source_links_enabled,
         )
 
-        source_links = self._pr_source_links() if session_card_source_links_enabled() else []
+        return self._pr_source_links() if session_card_source_links_enabled() else []
+
+    def source_links_view(
+        self, *, include_check_status: bool = False, dashboard_user: bool = False
+    ) -> list[dict]:
+        """The ``source_links`` field ``to_dict`` emits for one audience.
+
+        ``include_check_status`` and ``dashboard_user`` change NOTHING in the
+        slot summary except this field (``slot_projection.SlotProjection.to_dict``
+        reads them only through ``project_source_links``). The broadcast uses
+        that: it serializes each slot once and swaps this field per audience
+        instead of re-running the projection body (last-message markdown strip,
+        credential redaction, options parse) three times per slot on the event
+        loop. The source-link transcript scan itself is memoized per slot
+        revision, so it was never the repeated cost.
+        """
+        return _project_source_links(
+            _budgeted_source_links(self._summary_source_links()),
+            include_check_status,
+            dashboard_user=dashboard_user,
+        )
+
+    def to_dict(self, *, include_check_status: bool = False, dashboard_user: bool = False) -> dict:
+        source_links = self._summary_source_links()
+        coordinator_approvals = self._coordinator_approvals
+        coordinator_pending: list[dict] = (
+            coordinator_approvals(self.key) if coordinator_approvals is not None else []
+        )
         return self._projection.to_dict(
             self,
             include_check_status=include_check_status,
             source_links=source_links,
+            coordinator_pending=coordinator_pending,
             prompt_roles=_PROMPT_ROLES,
             redact=_redact,
             parse_options=_parse_options,
@@ -4472,6 +4699,23 @@ class DashboardState:
         owner_id: str = "",
     ):
         self.sessions = sessions
+        # The decisions seam's LLM lane needs ONE callable that runs a prompt on a
+        # tool-less background session, and ``decisions/`` deliberately imports
+        # nothing above itself -- so the wiring happens here, where the session
+        # manager first exists. Here rather than in ``server.py`` because both the
+        # gateway and the standalone dashboard construct this object, and a lane
+        # wired on only one of those paths is a lane that answers on one boot and
+        # refuses on the other. Guarded: a lane that cannot be wired must not stop
+        # the dashboard from booting, and an unwired lane already has a defined
+        # behaviour -- every judged tick fires exactly as the ungated timer does.
+        try:
+            from kiro_crew.decisions import impl_llm
+
+            impl_llm.set_runner_factory(
+                lambda model: impl_llm.build_session_runner(sessions, model=model)
+            )
+        except Exception:
+            logger.debug("decisions: LLM lane runner not registered", exc_info=True)
         self.crons = crons
         self.lessons = lessons
         self.start_time = start_time
@@ -5799,6 +6043,28 @@ class DashboardState:
             redact_secret=redact_credentials,
         )
 
+    def pending_coordinator_approvals(self, slot_key: str) -> list[dict]:
+        """Live coordinator approvals owned by *slot_key*, oldest first.
+
+        A record counts only while its state-level future is still open: a
+        resolved or expired approval whose ``finally`` has not yet popped the
+        record must not keep the slot in the Needs Approval lane. An approval
+        with no owning slot belongs to no slot and is never returned.
+        """
+        if not slot_key:
+            return []
+        records = getattr(self, "_pending_approvals", None) or {}
+        futures = getattr(self, "_approval_futures", None) or {}
+        pending: list[dict] = []
+        for approval_id, record in records.items():
+            if record.get("slot") != slot_key:
+                continue
+            future = futures.get(approval_id)
+            if future is None or future.done():
+                continue
+            pending.append(record)
+        return pending
+
     def _audit_and_broadcast_approval(
         self,
         session_key: str,
@@ -6252,6 +6518,7 @@ class DashboardState:
         slot._tab_id = uuid.uuid4().hex[:12]
         slot._on_message = self._broadcast_chat_message
         slot._on_question_retired = self._broadcast_question_retired
+        slot._coordinator_approvals = self.pending_coordinator_approvals
         slot._app = app
         # ``origin`` must be declared by the layer that actually knows it, and
         # an undeclared non-app slot stays UNTAGGED ("") rather than being
@@ -7577,6 +7844,61 @@ class DashboardState:
             )
             d["subagents_running"] = bool(subs and subs.running_agents_for(f"dashboard:{s.key}"))
             out.append(d)
+        _attach_slot_parents(out)
+        return out
+
+    def serialize_slot_views(
+        self, *, owner: bool
+    ) -> tuple[list[dict], list[dict], list[dict] | None]:
+        """One serialization pass, three audience views of the slot list.
+
+        Returns ``(bare, dashboard_user, owner)``; ``owner`` is ``None`` when
+        ``owner`` is False (no owner socket to build it for).
+
+        The three views the broadcast ships differ ONLY in each slot's
+        ``source_links`` field -- the audience gates are read nowhere else in the
+        summary (see ``_ChatSlot.source_links_view``). Serializing the list three
+        times therefore ran the per-slot projection body (last-message markdown
+        strip, credential redaction, options parse) and the source-link
+        budgeting three times for identical output, synchronously on the
+        event loop: measured at ~200 ms per pass on a sidebar of ~80 tabs, so a
+        broadcast stalled the loop for ~600 ms. Those stalls read as host pressure
+        to the adaptive concurrency controller (``loop_lag >= 250 ms`` is a
+        sufficient-alone decrease signal) and pinned the subagent cap at its floor
+        on an idle machine. Serialize once, then re-project only the one field.
+
+        The derived dicts are shallow copies: every other value is shared with
+        the bare list. Nothing mutates a slot payload after serialization (the
+        bare list is ``json.dumps``-ed for SSE and the WS frames are built from
+        the lists as-is), so sharing is safe and avoids a deep copy per audience.
+        A payload whose key has no live slot (a patched ``serialize_slots`` in
+        tests, or a slot closed between the two loops) is carried over unchanged.
+        """
+        bare = self.serialize_slots()
+        return (
+            bare,
+            self._reproject_slots(bare, dashboard_user=True),
+            self._reproject_slots(bare, include_check_status=True) if owner else None,
+        )
+
+    def _reproject_slots(
+        self,
+        slots_data: list[dict],
+        *,
+        include_check_status: bool = False,
+        dashboard_user: bool = False,
+    ) -> list[dict]:
+        out: list[dict] = []
+        for payload in slots_data:
+            slot = self._slots.get(payload.get("key", ""))
+            if slot is None or "source_links" not in payload:
+                out.append(payload)
+                continue
+            view = dict(payload)
+            view["source_links"] = slot.source_links_view(
+                include_check_status=include_check_status, dashboard_user=dashboard_user
+            )
+            out.append(view)
         return out
 
     def _drop_orphaned_mcp_report(self, slot: "_ChatSlot") -> None:
@@ -7737,6 +8059,13 @@ class DashboardState:
         Called from an app startup hook: that is the earliest point the loop
         exists, so every later reader finds it already bound instead of racing to
         latch a copy from whichever thread happens to arrive first.
+
+        Deliberately does NOT seed the session-lineage projection. Seeding is bound to
+        one store and re-runs whenever the data home changes, so a process that binds
+        several states over several homes -- a test run, a pod host -- would queue one
+        full cold scan per bind onto the shared maintenance pool and starve everything
+        else waiting on it. The seed is requested lazily instead, by the first slots
+        frame that finds the projection cold (see :func:`_attach_slot_parents`).
         """
         self._serving_loop = loop
 
@@ -7803,8 +8132,13 @@ class DashboardState:
         # allowed that route. Keep the broadcast list bare and put
         # the public-repo enrichment only on the WS path, where
         # ``_serialize_for_client`` re-filters app tokens.
-        slots_data = self.serialize_slots()
-        slots_data_ws = self.serialize_slots(dashboard_user=True)
+        #
+        # One serialization pass for all three audiences -- see
+        # ``serialize_slot_views`` for why three passes stalled the event loop.
+        owner_ws_clients = getattr(self, "_owner_ws_clients", None)
+        slots_data, slots_data_ws, owner_slots = self.serialize_slot_views(
+            owner=bool(owner_ws_clients)
+        )
         # The evidenced way this broadcast fails is a non-serializable value in
         # slot state: the dump raises, and the bare TypeError
         # names neither the slot nor the field. Serialize up front and annotate
@@ -7884,9 +8218,7 @@ class DashboardState:
         # invalidation, so a subset here leaves the owner without them. Both frames
         # are built by `_slots_ws_frame`, so a key cannot reach one and not the
         # other.
-        owner_ws_clients = getattr(self, "_owner_ws_clients", None)
-        if owner_ws_clients:
-            owner_slots = self.serialize_slots(include_check_status=True)
+        if owner_ws_clients and owner_slots is not None:
             self._send_ws_owners(
                 _slots_ws_frame(
                     owner_slots,
@@ -8449,6 +8781,69 @@ def sweep_expired_notifications(log: list[dict[str, Any]], *, now: float | None 
     return removed
 
 
+def _read_notification_lines(path: Path) -> list[str]:
+    """Every line of the notifications file, terminators intact.
+
+    ``newline=""`` disables the newline translation text mode applies by default. With
+    translation on, a read turns a CRLF or a bare CR into a bare LF, so a caller that
+    writes those lines back silently rewrites bytes it meant to preserve: the snapshot
+    dedupe key for a timestamp-less row is its RAW bytes, so a rewritten terminator
+    makes the row differ from its source record, and a later merge appends a duplicate
+    instead of collapsing it. A bare CR is worse than a terminator change, because it
+    is the byte that split a record into the fragments the merge deliberately keeps.
+
+    Line BOUNDARIES are identical either way: ``str.splitlines`` breaks on CR, LF and
+    CRLF whether or not the read translated them. Only the retained bytes differ, so
+    reading this way changes what is preserved and never what counts as a line.
+    """
+    with open(path, encoding="utf-8", newline="") as handle:
+        return handle.read().splitlines(keepends=True)
+
+
+def _servable_note(line: str) -> dict[str, Any] | None:
+    """The note a persisted JSONL line yields, or ``None`` when none can be served.
+
+    The single acceptance test for a notification row, shared by the loader and by the
+    append-time trim so the two cannot drift apart. A line the loader would skip must
+    not occupy a slot in the trim's live window: it would displace a servable row, and
+    the rewrite that follows deletes that row permanently.
+
+    Parsing to a JSON object is not sufficient on its own. ``normalize_note`` raises
+    for an object whose ``channel`` is unhashable, so such a row parses here and is
+    still unservable, and a trim that asked only ``isinstance(row, dict)`` would count
+    it as live history.
+
+    Redaction is part of acceptance rather than the caller's job, for two reasons. Rows
+    written before delivery-time redaction existed may carry unredacted LLM-derived
+    content and are served to SSE clients straight from the loader's list; and the
+    redactor is one of the two steps that can reject a row, so leaving it out of the
+    test would reopen the divergence this function closes.
+
+    The note is normalized and redacted in place. A caller that writes the file back
+    writes the ORIGINAL bytes, never this dict, so nothing here migrates what is on
+    disk.
+
+    Leading and trailing whitespace is stripped HERE rather than by a caller, because
+    ``str.strip()`` removes whitespace ``json`` does not accept -- a no-break space, for
+    one -- so a caller that strips and a caller that does not reach opposite verdicts on
+    the same row. This stripping decides only whether a row can be served; it never
+    reaches disk, so it is not the stripping hazard the snapshot dedupe key avoids,
+    where a stripped key makes two distinct byte sequences collide and deletes one.
+    """
+    try:
+        note = normalize_note(json.loads(line.strip()))
+        for key, value in note.items():
+            if key != "ts":
+                note[key] = _redact_note_value(value)
+        return note
+    except Exception:  # noqa: BLE001 -- skip the bad row, not the whole file
+        # normalize_note/_redact_note_value can raise on valid-JSON rows with
+        # unexpected shapes (e.g. a top-level array); keep the per-line skip
+        # semantics instead of losing all history to a caller's outer except.
+        logger.debug("Skipping malformed notification row", exc_info=True)
+        return None
+
+
 def _load_notifications() -> list[dict[str, Any]]:
     """Load persisted notifications from disk (newest last)."""
     path = _notifications_path()
@@ -8456,26 +8851,11 @@ def _load_notifications() -> list[dict[str, Any]]:
         return []
     try:
         entries: list[dict[str, Any]] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
+        for line in _read_notification_lines(path):
+            parsed = _servable_note(line)
+            if parsed is None:
                 continue
-            try:
-                parsed = normalize_note(json.loads(line))
-                # Redact at load: rows written before delivery-time redaction
-                # existed may carry unredacted LLM-derived content; they are
-                # served to SSE clients straight from this list.
-                for key, value in parsed.items():
-                    if key != "ts":
-                        parsed[key] = _redact_note_value(value)
-                entries.append(parsed)
-            except Exception:  # noqa: BLE001 — skip the bad row, not the whole file
-                # normalize_note/_redact_note_value can raise on valid-JSON
-                # rows with unexpected shapes (e.g. a top-level array); keep
-                # the per-line skip semantics instead of losing all history
-                # to the outer except.
-                logger.debug("Skipping malformed notification row", exc_info=True)
-                continue
+            entries.append(parsed)
         # RFC Phase 5: drop expired passive rows BEFORE the recency cap.
         # Sweeping after truncation loses data: with more than N rows on
         # disk, newer expired-passive rows would displace older LIVE rows
@@ -8563,24 +8943,52 @@ def _maybe_trim_notifications(path: Path) -> None:
     displacement hazard as the load path: trimming the
     raw tail first would retain newer expired-passive rows while deleting
     older LIVE rows, permanently losing history after the next load-time
-    sweep. Unparseable lines are kept (never destroy on ambiguity).
+    sweep.
+
+    The recency cap counts only LIVE lines: a line ``_servable_note`` accepts and this
+    sweep does not find expired, which is exactly what ``_load_notifications`` goes on
+    to serve. Both paths ask that one predicate, so the trim cannot come to disagree
+    with the loader about what counts as history. An UNSERVABLE line, one the predicate
+    rejects, is still kept, because destroying a line on ambiguity is worse than
+    holding one nobody can read. It is kept in a separate, smaller window so that it
+    cannot displace a live notification.
+
+    Two windows rather than one, because one shared window turns an append into an
+    eviction. An unservable line has no dedupe key, so a merge appends it instead of
+    collapsing it, which puts it among the NEWEST lines; a single newest-N window over
+    the combined list then discards valid older notifications in its favour, and the
+    rule meant to avoid destroying data is what destroys it. Neither the framing that
+    produces unparseable fragments nor the withheld dedupe key is the thing to change:
+    both are deliberate, and both are what stop a fragment being skipped as a false
+    duplicate and its bytes lost.
+
+    Retained lines keep their original file order AND their exact bytes, terminator
+    included, so a fragment stays beside the neighbours that explain it, a final line
+    with no terminator stays final instead of gluing onto the row written after it, and
+    a CRLF or bare-CR row still matches the raw dedupe key its source record carries.
     """
     try:
-        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        lines = _read_notification_lines(path)
         if len(lines) <= _MAX_PERSISTED_NOTIFICATIONS * 2:
             return
-        keep: list[str] = []
-        for line in lines:
-            try:
-                row = json.loads(line)
-            except Exception:
-                keep.append(line)
+        live: list[int] = []
+        unservable: list[int] = []
+        for index, line in enumerate(lines):
+            row = _servable_note(line)
+            if row is None:
+                unservable.append(index)
                 continue
-            if isinstance(row, dict) and sweep_expired_notifications([row]) == 1:
+            if sweep_expired_notifications([row]) == 1:
                 continue  # expired passive row -- drop before the cap
-            keep.append(line)
-        kept = keep[-_MAX_PERSISTED_NOTIFICATIONS:]
-        path.write_text("".join(kept), encoding="utf-8")
+            live.append(index)
+        # Never zero. A zero cap does not empty the window, it removes the bound:
+        # ``unservable[-0:]`` is the WHOLE list, so a small cap would silently
+        # retain every unservable line instead of a recent sample of them.
+        unservable_cap = max(
+            1, _MAX_PERSISTED_NOTIFICATIONS // _UNSERVABLE_NOTIFICATION_CAP_DIVISOR
+        )
+        kept = sorted(set(live[-_MAX_PERSISTED_NOTIFICATIONS:]) | set(unservable[-unservable_cap:]))
+        path.write_text("".join(lines[index] for index in kept), encoding="utf-8", newline="")
     except Exception:
         pass
 

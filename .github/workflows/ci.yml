@@ -54,7 +54,14 @@ jobs:
   changes:
     name: Detect changed surface
     runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
-    timeout-minutes: 5
+    # 15, not 5: the job's own work is seconds, but its `fetch-depth: 0`
+    # checkout (paths-filter and the leaf resolver diff against the merge base
+    # with local git) is a full-history fetch of a large repository, and on a
+    # slow hosted runner that fetch alone has run past 5 minutes and had the
+    # job CANCELLED mid-checkout. Every test lane `needs` this job, so that one
+    # cancel skipped the whole matrix and failed Coverage Gate with nothing to
+    # read (#13111). The budget covers a slow fetch; a hung one still ends.
+    timeout-minutes: 15
     # dorny/paths-filter runs with `token: ''` (below), so it detects changes
     # with local git instead of the REST API and needs no pull-requests:read.
     # Job-level permissions REPLACE the top-level grant, so contents:read is
@@ -2424,6 +2431,27 @@ jobs:
           # fails here instead of shipping a gate that passes everything.
           npm run lint:phantom-classes -- --test
           npm run lint:phantom-classes
+
+      - name: Check no file restyles more ui/ primitives than the baseline allows
+        # `shadcn/no-restyle` stays off in eslint.config.js: the tree carries a
+        # few hundred call sites that restyle ui/ primitives and the eslint gate
+        # is a hard zero. Off means the backlog can grow silently, so this step
+        # runs the rule through its own config and holds each file at the count
+        # recorded in website/scripts/restyle-baseline.json — a rise or a new
+        # file fails; a fall fails too until `--update-baseline` records it, so
+        # progress is locked in rather than left to a log line. That flag never
+        # raises a number. Whole-tree, no base ref: the baseline is committed,
+        # so the gate is complete for regression without a diff. Not eslint's
+        # own bulk suppressions: the Node API editors use ignores that file, and
+        # the CLI loads it for every config, so the i18n eslint run would fail
+        # on "unused" entries (both measured; see the script header).
+        working-directory: website
+        run: |
+          # Self-test first: it plants one restyled primitive and asserts the
+          # rule fires under this config, so a plugin or parser change that
+          # silences the rule fails here instead of passing every count as 0.
+          npm run lint:restyle-ratchet -- --test
+          npm run lint:restyle-ratchet
 
   # Prove `npm ci` still works on the OLDEST Node the frontend claims to support.
   # Every other job here runs the .nvmrc toolchain (Node 24 / npm 11), and npm 11

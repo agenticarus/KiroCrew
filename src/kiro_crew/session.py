@@ -107,6 +107,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 if TYPE_CHECKING:
@@ -145,6 +146,7 @@ from kiro_crew.config.paths import config_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.executors import maintenance_executor, subprocess_executor
 from kiro_crew.mcp_gateway.abort import schedule_abort
+from kiro_crew.member_memory_auth import prune_legacy_member_pid_bindings
 from kiro_crew.messaging.link import (
     UNBIND_REASON_SESSION_DESTROYED,
     UNBIND_REASON_UNSPECIFIED,
@@ -176,6 +178,7 @@ from kiro_crew.session_allocation import (  # noqa: F401
 from kiro_crew.session_allocation import (
     _collect_parent_runtime_kwargs,
 )
+from kiro_crew.session_allocation import parent_work_scratch_dir as _parent_work_scratch_dir
 from kiro_crew.session_background import (
     BackgroundRuntimeDeps,
     BackgroundSessionRuntime,
@@ -489,6 +492,7 @@ _STUCK_TURN_REPORT_SECS = 300.0
 _SUBAGENT_PREFIX = "subagent:"
 _CHANNEL_PREFIX = "channel:"
 _SIDE_PREFIX = "side:"
+_THREAD_PREFIX = "thread:"
 
 #: Every value the ``kirocrew.session.pool.decision`` counter can report. A
 #: warm-pool claim either happens or is refused for exactly one reason; keeping
@@ -518,6 +522,10 @@ _STATELESS_PREFIXES = (
     _CHANNEL_PREFIX,
     "secretary:",
     _SIDE_PREFIX,
+    # A reply thread on a crewmate chat message re-seeds its whole envelope on
+    # every cold start (``chat_threads.build_thread_message``), so a resumed
+    # kiro-cli transcript would only duplicate it.
+    _THREAD_PREFIX,
     # Workflow authoring sessions are one-request scratch contexts. Explicit
     # destruction reaps the provider; stateless classification additionally
     # prevents a resume lookup or map write before that teardown completes.
@@ -991,6 +999,21 @@ class _Session:
     approval_policy: str = ""  # "" (interactive) | "auto" (auto-approve all tools)
     agent: str = ""  # kiro agent name used for this session
     capability_member: str = ""
+    # The model this session's allocation SELECTED, as handed to the provider.
+    # Stamped at registration from the same local the factory receives, so the id
+    # sent and the id readable here are one value and cannot diverge.
+    #
+    # It exists because a caller that pins nothing at any of its own tiers passes
+    # ``model=None`` and the allocation resolves one itself, inside a call whose
+    # return says only which provider, whether it is new, and whether it resumed.
+    # A caller recording what it asked for therefore has nothing to record for that
+    # allocation, while the session runs on a concrete id. Read through
+    # ``SessionManager.allocation_requested_model``.
+    #
+    # ``""`` means this allocation resolved nothing, or a registration site that
+    # does not resolve models made the session. Both are "no selection to report",
+    # which is what a consumer of the empty value states.
+    requested_model: str = ""
     loaded_capabilities: LoadedCapabilities | None = None
     # Slack message queue: FIFO of (msg_ts, text, kwargs) waiting for the semaphore
     queue: deque[tuple[str, str, dict]] = field(default_factory=deque)
@@ -1271,6 +1294,7 @@ class SessionManager:
                 data_home=data_home
             ),
             prune_session_pid_mappings=lambda: _prune_stale_session_pid_files(),
+            prune_member_pid_bindings=lambda: prune_legacy_member_pid_bindings(),
             prune_pycache=lambda: prune_pycache(),
             collect_active_pids=lambda sessions: _collect_active_pids(
                 cast(dict[Any, Any], sessions)
@@ -2045,6 +2069,10 @@ class SessionManager:
         """Delegate stale-backend runtime retirement."""
         await self._background_runtime._retire_stale_backend_bg_runtime()
 
+    async def _reap_idle_stale_bg_runtime(self) -> bool:
+        """Delegate the periodic idle-and-stale retirement of the shared runtime."""
+        return await self._background_runtime.reap_idle_stale_bg_runtime()
+
     async def _provider_backed_bg_session(self) -> "_ProviderBgSession":
         """Return the serialized provider-backed background adapter."""
         return cast(
@@ -2124,6 +2152,10 @@ class SessionManager:
     def _parent_runtime_kwargs(self, parent_session_key: str) -> dict:
         """Return the parent runtime security and backend posture."""
         return _collect_parent_runtime_kwargs(cast(Any, self), parent_session_key)
+
+    def parent_work_scratch_dir(self, parent_session_key: str) -> Path | None:
+        """The ``$KIROCREW_SCRATCH`` directory of the exact parent's session tree, or None."""
+        return _parent_work_scratch_dir(cast(Any, self), parent_session_key)
 
     def is_session_sharing_eligible(self, parent_session_key: str) -> bool:
         """Return whether the exact parent can share a runtime."""
@@ -2404,6 +2436,34 @@ class SessionManager:
     def consume_needs_reinjection(self, key: str) -> bool:
         """Consume a live session's reinjection marker."""
         return self._compaction.consume_needs_reinjection(key)
+
+    def allocation_requested_model(self, key: str) -> str:
+        """Return the model *key*'s live allocation selected, or ``""``.
+
+        The selection a caller makes is the caller's to record. This answers the
+        tier BELOW every caller: an allocation handed ``model=None`` resolves an
+        id from config itself, hands it to the provider, and reports only the
+        provider, ``is_new`` and ``resumed`` — so the caller's own record of what
+        was asked for is blank while the session runs on a concrete model. Reading
+        the stamp the allocation left is what closes that, and it is the SAME
+        value the provider received, not a second resolution.
+
+        A caller composes this OVER its own selection (``this or own``) rather
+        than under it. ``is_new`` with ``resumed`` false says the caller consumed a
+        fresh first-turn observation, NOT that the caller allocated the session: a
+        prewarmed session that started fresh arms exactly that observation, so a
+        claim of one is indistinguishable from a cold start in the return value.
+        This stamp is the allocation's own selection by construction and is right
+        for both cases; the caller's own resolution is right only for the cold
+        start, since on a prewarmed claim it re-resolves a config that may have
+        moved since the session was allocated.
+
+        ``""`` for an unknown key, a session with no selection, and a session made
+        by a registration site that resolves no models. All three are "nothing to
+        report", which is what an empty value says.
+        """
+        session = self._sessions.get(self._fold_key(key))
+        return session.requested_model if session is not None else ""
 
     def provider_switch_replay_pending(self, key: str) -> bool:
         """Return whether a live session still owes conversation replay.

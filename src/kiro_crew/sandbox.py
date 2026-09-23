@@ -100,6 +100,8 @@ _MOUNT_SOURCE_MAX_AGE_SECONDS = 24 * 3600
 # that observed a vanish rescans newly appeared pids; past this many passes
 # coverage is reported as unproven instead of looping.
 _PIN_SCAN_MAX_PASSES = 3
+_MOUNT_TABLE_CACHE_MAX_ENTRIES = 256
+_MOUNT_TABLE_CACHE_MAX_BYTES = 64 * 1024 * 1024
 
 
 class _PinScanCoverage:
@@ -258,6 +260,15 @@ _MD_NOTEBOOK_STAGING_LEAF: str = f"{MD_NOTEBOOK_APP_NAME}-staging"
 
 #: Crew-home leaves with no legitimate in-sandbox reader — bind-masked in every mode.
 _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
+    # Gateway diagnostics: recorded host and gateway state, plus loop-stall dumps.
+    # The gateway process writes these; an agent reads them through the owner-gated
+    # /api/debug routes and the kirocrew-debug MCP tools, which redact on the way
+    # out. The raw rows do not: they carry frame labels, folded stacks and process
+    # detail that the read path scrubs, so a sandboxed session reading the files
+    # directly would collect exactly what the routes exist to filter. Whole
+    # DIRECTORY rather than a leaf file, because the day files rotate by name and
+    # the append pins the directory itself.
+    "diag",
     # Channel credentials. Already file-masked in cc/strict via ``_CC_FILES``; listing
     # it here extends the same treatment to standard, where a spawned command could
     # otherwise read every Slack/Discord token off disk.
@@ -305,11 +316,14 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     "tasks",
     # The per-process scratch root (``agent_scratch``): every kiro-cli session
     # and every shared runtime gets ``<home>/scratch/<label>-<rand>`` as its
-    # ``$KIROCREW_SCRATCH`` / ``TMPDIR``. Masked as a WHOLE so one session cannot open
-    # another's scratch; each spawn passes its OWN directory back through
+    # ``TMPDIR``. Masked as a WHOLE so one session tree cannot open another's
+    # scratch; each spawn passes its OWN directory back through
     # ``extra_private_dirs`` (``acp/client.py``, ``acp/runtime.py``) -- a
-    # window INSIDE the mask, not a lift of it -- so the child keeps read-write
-    # on exactly the one directory that is its own.
+    # window INSIDE the mask, not a lift of it -- and a spawn made on behalf of
+    # an existing session tree (a companion runtime, a dedicated subagent
+    # process, a recycled runtime's successor) passes the TREE's work directory
+    # as a second such window, so ``$KIROCREW_SCRATCH`` names one place for the
+    # whole tree. Siblings from other trees stay hidden either way.
     "scratch",
     # The Notes state files below are OWNED by the md-notebook backend, which is itself
     # a sandboxed spawn (`apps/backend.py`), so the mask alone would break the app: the
@@ -8306,30 +8320,62 @@ def _mount_pinned_source_names(
     # foreign-uid forgiveness) — for a different name shape, instead of a
     # second scan that gets those cases subtly wrong.
     match = matcher or (lambda name: name.startswith(_MOUNT_SOURCE_PREFIX))
-    # Fast pre-filter per line; only valid for the default shape, since a
-    # custom matcher may accept names without the prefix.
-    line_hint = _MOUNT_SOURCE_PREFIX if matcher is None else None
+    # Fast pre-filter, applied to the whole table before any line is split;
+    # only valid for the default shape, since a custom matcher may accept
+    # names without the prefix.
+    line_hint = _MOUNT_SOURCE_PREFIX.encode() if matcher is None else None
+    # Mount tables already parsed this scan, by their exact bytes. Every
+    # thread of a group shares its leader's mount namespace unless it
+    # ``unshare``d one, so the thousands of sibling reads the coverage
+    # accounting requires are near-duplicates of a few dozen distinct tables:
+    # measured 12.5k tasks, 1.3M mountinfo lines, 18 distinct tables on one
+    # host. Identical bytes contribute identical pins, so a table is split
+    # into lines and matched once; a repeat costs the read alone (which
+    # releases the GIL) and no Python-level per-line work. The read itself is
+    # still issued for every task, so the OSError each caller keys its
+    # coverage accounting on is unaffected.
+    # Cache only a bounded number and volume of distinct tables. Once either
+    # limit is reached, tables already present still deduplicate while every
+    # uncached table is parsed directly without being retained.
+    parsed_tables: set[bytes] = set()
+    parsed_table_bytes = 0
+    cache_full = False
 
     def _collect(mountinfo_path: str) -> None:
         """Add every matching bind SOURCE named in one mountinfo to ``pinned``.
 
-        Propagates ``OSError`` exactly as ``open`` would, so each caller decides
-        what an unreadable task means for coverage. A source removed while
-        still bound reads ``.../name//deleted``; the suffix is stripped so the
-        real name is what pins.
+        Propagates ``OSError`` exactly as ``open`` and a read would, so each
+        caller decides what an unreadable task means for coverage. A source
+        removed while still bound reads ``.../name//deleted``; the suffix is
+        stripped so the real name is what pins.
         """
-        with open(mountinfo_path, encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                if line_hint is not None and line_hint not in line:
-                    continue
-                fields = line.split()
-                if len(fields) > 3:
-                    source = fields[3]
-                    if source.endswith("//deleted"):
-                        source = source[: -len("//deleted")]
-                    source = os.path.basename(source)
-                    if match(source):
-                        pinned.add(source)
+        nonlocal cache_full, parsed_table_bytes
+        with open(mountinfo_path, "rb") as fh:
+            data = fh.read()
+        if line_hint is not None and line_hint not in data:
+            return
+        if data in parsed_tables:
+            return
+        for line in data.decode("utf-8", errors="replace").splitlines():
+            if line_hint is not None and _MOUNT_SOURCE_PREFIX not in line:
+                continue
+            fields = line.split()
+            if len(fields) > 3:
+                source = fields[3]
+                if source.endswith("//deleted"):
+                    source = source[: -len("//deleted")]
+                source = os.path.basename(source)
+                if match(source):
+                    pinned.add(source)
+        if not cache_full:
+            if (
+                len(parsed_tables) >= _MOUNT_TABLE_CACHE_MAX_ENTRIES
+                or parsed_table_bytes + len(data) > _MOUNT_TABLE_CACHE_MAX_BYTES
+            ):
+                cache_full = True
+            else:
+                parsed_tables.add(data)
+                parsed_table_bytes += len(data)
 
     # Coverage accounting for ``coverage``. A task of this uid (or the overflow
     # uid) that could not be read is never re-read (it is in ``seen``), so it
@@ -12394,6 +12440,78 @@ def _read_cgroup_counters(path: Path) -> dict[str, int]:
     return counters
 
 
+def read_cgroup_int(path: str | Path) -> int | None:
+    """Read a single-value cgroup file (``memory.high``, ``memory.max`` and kin).
+
+    The one reader for every single-integer cgroup file the product consults,
+    here and in ``subagent``'s memory probe. ``None`` when the file is absent,
+    unparseable, or holds the ``max`` sentinel the kernel writes for "no
+    limit" -- every caller treats all three the same way, as "this bound does
+    not constrain".
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text.isdigit():
+        return None
+    return int(text)
+
+
+# Last ``memory.events`` ``high`` counter seen by ``agents_slice_throttling``.
+# Separate from ``_SLICE_MEMHIGH_EVENTS_SEEN``: that one paces a once-per-episode
+# WARNING from the reconcile worker, this one answers a yes/no question for a
+# caller that is about to commit a cold start. Sharing the baseline would let
+# either reader consume the other's climb.
+_SLICE_THROTTLE_PROBE_SEEN: int | None = None
+
+# ``time.monotonic()`` of the most recent counter advance any probe observed.
+# The advance itself is consumed by the probe that reads it (the baseline moves
+# to the new value), so a second probe moments later would otherwise read a
+# stable counter and answer ``False`` while the episode is still under way. The
+# timestamp makes the edge a shared, time-bounded fact instead of a
+# one-reader event: every probe inside the hold window agrees.
+_SLICE_THROTTLE_EDGE_AT: float | None = None
+_SLICE_THROTTLE_EDGE_HOLD_SECS = 60.0
+
+
+def agents_slice_throttling() -> bool:
+    """Whether the kernel is throttling the agents slice right now.
+
+    Two signals, either suffices. ``memory.current >= memory.high`` is the
+    kernel's own definition of "over the soft ceiling"; under sustained
+    pressure reclaim holds usage AT the ceiling rather than above it, so the
+    equality is the steady state, not an edge. The ``memory.events`` ``high``
+    counter climbing since this function's previous read is the second signal:
+    the kernel increments it every time it throttles, so during an episode it
+    advances between any two probes even when reclaim has momentarily pushed
+    usage under the line. The first read only baselines the counter. An
+    observed advance is held for ``_SLICE_THROTTLE_EDGE_HOLD_SECS`` so that
+    concurrent callers (two cold starts racing one counter tick) all read the
+    same verdict instead of the first one consuming the edge.
+
+    ``False`` whenever there is nothing to read (not Linux, no slice); an
+    unmeasurable host is never reported as throttled.
+    """
+    global _SLICE_THROTTLE_PROBE_SEEN, _SLICE_THROTTLE_EDGE_AT
+    slice_dir = _agents_slice_cgroup_dir()
+    if slice_dir is None:
+        return False
+    counter = _read_cgroup_counters(slice_dir / "memory.events").get("high")
+    previous = _SLICE_THROTTLE_PROBE_SEEN
+    now = time.monotonic()
+    if counter is not None:
+        _SLICE_THROTTLE_PROBE_SEEN = counter
+        if previous is not None and counter > previous:
+            _SLICE_THROTTLE_EDGE_AT = now
+    high = read_cgroup_int(slice_dir / "memory.high")
+    current = read_cgroup_int(slice_dir / "memory.current")
+    if high is not None and current is not None and current >= high:
+        return True
+    edge_at = _SLICE_THROTTLE_EDGE_AT
+    return edge_at is not None and (now - edge_at) < _SLICE_THROTTLE_EDGE_HOLD_SECS
+
+
 # Last-seen slice-level OOM counters, so only NEW kills are reported. Seeded
 # lazily from the current values on first read: kills that predate this
 # process must not fire a spurious warning at boot.
@@ -12625,6 +12743,35 @@ def resource_limit_preexec() -> "Callable[[], None] | None":
     return _RESOURCE_PREEXEC  # type: ignore[return-value]
 
 
+_EXTRACTOR_PREEXEC: object = _UNSET
+
+
+def extractor_resource_limit_preexec() -> "Callable[[], None] | None":
+    """Legacy ``preexec_fn`` for :data:`RLIMIT_PROFILE_EXTRACTOR`, shim-less hosts only.
+
+    Same fixed ceiling ``_rlimit_spec`` emits for the profile, applied post-fork
+    through :func:`kiro_crew.security.apply_resource_limits`. ``None`` off POSIX,
+    where ``preexec_fn`` must not be passed.
+    """
+    global _EXTRACTOR_PREEXEC
+    if _EXTRACTOR_PREEXEC is _UNSET:
+        if os.name != "posix":
+            _EXTRACTOR_PREEXEC = None
+            return None
+        from kiro_crew.security import apply_resource_limits
+
+        _EXTRACTOR_PREEXEC = apply_resource_limits(
+            {
+                "resource_limits": {
+                    "max_memory_mb": _EXTRACTOR_MAX_AS_BYTES // (1024 * 1024),
+                    "max_cpu_seconds": _EXTRACTOR_MAX_CPU_SECS,
+                    "max_open_files": _EXTRACTOR_MAX_NOFILE,
+                }
+            }
+        )
+    return _EXTRACTOR_PREEXEC  # type: ignore[return-value]
+
+
 # Cached ``--rlimits=`` argv fragment for the process-group supervisor. Same
 # policy as ``resource_limit_preexec``, delivered post-exec instead of post-fork.
 _RESOURCE_SUPERVISOR_ARGV: object = _UNSET
@@ -12784,6 +12931,21 @@ except OSError:  # pragma: no cover - only if the install is truncated
 RLIMIT_PROFILE_TOOL = "tool"
 RLIMIT_PROFILE_BUILD = "build"
 RLIMIT_PROFILE_SESSION_HOST = "session_host"
+# A first-party document parser fed untrusted bytes (``pdf_extract_child``). Its
+# ceiling is FIXED, not read from ``resource_limits``: the ``tool`` profile only
+# applies RLIMIT_AS when an operator sets ``max_memory_mb`` (default 0), and a
+# parser whose allocation precedes any length check needs a memory bound that
+# is on by default. RLIMIT_AS caps VIRTUAL address space, which is why ``tool``
+# leaves it opt-in (Node/V8 reserves far more than it touches); this child is
+# pure CPython plus ``pdfplumber``, measured at ~270 MB VmPeak on a one-page
+# document, so 1 GiB is headroom for a large document and a hard stop for a
+# Flate bomb. RLIMIT_CPU ends a parse that never finishes; NOFILE matches the
+# ``tool`` default. Biases the OOM killer like ``tool``: this is the process to
+# lose.
+RLIMIT_PROFILE_EXTRACTOR = "extractor"
+_EXTRACTOR_MAX_AS_BYTES = 1024 * 1024 * 1024
+_EXTRACTOR_MAX_CPU_SECS = 60
+_EXTRACTOR_MAX_NOFILE = 1024
 # No limits and no OOM bias: the interactive terminal is the user's own shell,
 # not agent-executed code, and never carried either.
 RLIMIT_PROFILE_NONE = "none"
@@ -12792,6 +12954,7 @@ RLIMIT_PROFILE_NONE = "none"
 _PROFILE_OOM_BIAS = {
     RLIMIT_PROFILE_TOOL: True,
     RLIMIT_PROFILE_BUILD: True,
+    RLIMIT_PROFILE_EXTRACTOR: True,
     # session_host_preexec raises NOFILE and does nothing else -- notably it does
     # NOT bias the OOM score, and a trusted session host should not be the
     # preferred kill target.
@@ -12827,6 +12990,13 @@ def _rlimit_spec(profile: str) -> str:
         # pipe pairs for a whole tree of MCP servers, and the tool-grade 1024 cap
         # EMFILE-crashed it.
         return "RLIMIT_NOFILE:hard"
+    if profile == RLIMIT_PROFILE_EXTRACTOR:
+        # Fixed policy, independent of ``resource_limits``: see the constants.
+        return (
+            f"RLIMIT_AS:{_EXTRACTOR_MAX_AS_BYTES},"
+            f"RLIMIT_CPU:{_EXTRACTOR_MAX_CPU_SECS},"
+            f"RLIMIT_NOFILE:{_EXTRACTOR_MAX_NOFILE}"
+        )
 
     cfg: dict | None = None
     try:
@@ -12946,6 +13116,8 @@ def _preexec_for_profile(profile: str) -> "Callable[[], None] | None":
         return session_host_preexec()
     if profile == RLIMIT_PROFILE_BUILD:
         return build_resource_limit_preexec()
+    if profile == RLIMIT_PROFILE_EXTRACTOR:
+        return extractor_resource_limit_preexec()
     return resource_limit_preexec()
 
 

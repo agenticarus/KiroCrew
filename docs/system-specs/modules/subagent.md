@@ -96,7 +96,7 @@ pool default changes.
 
 | Constant | Value | Purpose |
 |----------|-------|---------|
-| `_MAX_CONCURRENT` | 3 | Legacy fallback / auto-size floor. `agent.max_subagents` defaults to `0` = auto-size the cap (floor 3, ceiling `agent.subagent_auto_max`, default 32); a positive value pins a fixed cap. The cap is re-derived on every config reload, not only at boot — see [`reconfigure`](#reconfigurecfg--max_concurrentnone--live-config). Session-shared subagents are cost-sampled as the runtime's measured RSS divided by the live shared-session count on that PID (`_live_shared_count`), so the memory term no longer binds and the cap rises to the provider-concurrency ceiling. |
+| `_MAX_CONCURRENT` | 3 | Legacy fallback / auto-size floor. `agent.max_subagents` defaults to `0` = auto-size the cap (floor 3, ceiling `agent.subagent_auto_max`, default 32); a positive value pins a fixed cap. The cap is re-derived on every config reload, not only at boot — see [`reconfigure`](#reconfigurecfg-apply_limitscfg-max_concurrentnone-live-config). Session-shared subagents are cost-sampled as the runtime's measured RSS divided by the live shared-session count on that PID (`_live_shared_count`), so the memory term no longer binds and the cap rises to the provider-concurrency ceiling. |
 | `_TIMEOUT_SECS` | 10800 | Hard timeout per subagent (3 hours), from `constants.SUBAGENT_TIMEOUT_SECS` |
 | `_ON_DONE_TIMEOUT` | 1200 | Outer cap: max total seconds for semaphore wait + injection (20 minutes) |
 | `INJECTION_TIMEOUT` | 900 | Inner cap: max seconds for a single `stream_and_collect` call (15 minutes); default `_DEFAULT_INJECTION_TIMEOUT = 900.0`, tunable via `KIROCREW_INJECTION_TIMEOUT` (float seconds, clamped to `_ON_DONE_TIMEOUT`) |
@@ -138,7 +138,13 @@ per operating system (see `dynamic-subagent-sizing.md`):
   A finite limit with unreadable or invalid usage contributes zero headroom:
   spare capacity cannot be established. Measured zero usage retains the full
   limit as headroom. Missing discovery retains the conventional root-path
-  fallback; ancestors hidden above a mount cannot be measured.
+  fallback; ancestors hidden above a mount cannot be measured. The agents
+  slice's own ceiling (`min(memory.high, memory.max) - memory.current` on
+  `kirocrew-agents.slice`, read via `_agents_slice_available_gb()`) is a
+  second clamp: the slice is a sibling of the gateway's cgroup, not an
+  ancestor, and the walk never reads `memory.high`, so the slice term is what
+  lets the posture go `critical` on a bare host whose `MemAvailable` is still
+  large while the kernel is already throttling every agent at that ceiling.
 - **macOS** — reclaimable memory (free + inactive + speculative + purgeable
   pages) via the Mach `host_statistics64` syscall through `ctypes`/`libSystem`
   (`_macos_vm_reclaimable_pages`), combined with the `os.sysconf` page size.
@@ -146,14 +152,17 @@ per operating system (see `dynamic-subagent-sizing.md`):
   probe runs on the gateway event loop at startup and the spawn-audit guard
   rejects unrouted subprocess spawns. A reload re-runs it off the loop
   (`asyncio.to_thread`), since by then the loop is serving turns.
-- **Other (e.g. Windows)** — no probe yet; returns `-1.0` and the cap fails
-  open to the legacy floor of 3.
+- **Windows** — available physical memory from
+  `platform_compat.host_available_mib`, converted from MiB to GiB. An unreadable
+  result returns `-1.0` and fails open to the legacy floor of 3.
+- **Other** — no probe yet; returns `-1.0` and fails open to the legacy floor of 3.
 
 Hard floor: the auto-sized cap is always ≥ 3 — `compute_max_subagents` clamps to
 `[3, hard_cap]` and the config loader clamps `subagent_auto_max` UP to 3 (with a
 warning + `config_bounds_clamped` SEL event, mirroring the > 64 ceiling clamp).
-Applies only to auto-sizing (`max_subagents=0`); an explicit `max_subagents` pin
-is unrestricted (any 0..64).
+Applies only to auto-sizing (`max_subagents=0`). Zero remains the auto-size
+sentinel; an explicit `max_subagents` pin is clamped to 3..64 (and dashboard
+writes must also fit under the configured `subagent_auto_max`).
 
 The per-spawn `spawn_min_memory_gb` admission gate (`check_memory_available`)
 uses the same cgroup headroom on Linux and native memory readers on macOS and
@@ -296,7 +305,10 @@ gateway starts bounded at `min(user_max, agent.adaptive_initial)` and earns its
 way up.
 
 ### `spawn(task, parent_session_key="") -> SubagentInfo | None`
-Spawns a background agent. Returns `SubagentInfo` or `None` if at capacity. Uses atomic `_running_count` to prevent race conditions. `parent_session_key` tracks the originating session for completion injection.
+Spawns a background agent. Accepted running or queued work returns a stable
+`SubagentInfo`; a legacy in-memory capacity refusal can return `None`. Uses atomic
+`_running_count` to prevent race conditions. `parent_session_key` tracks the
+originating session for completion injection.
 
 Admission order (`subagent_manager/admission/gate.py::spawn_impl`):
 1. Policy refusals that leave no durable trace: empty task, memory identity,
@@ -704,7 +716,7 @@ class SubagentInfo:
 5. Streams through ACP with context injection, tool approval cascade, and turn counting
 6. On completion (in `_run` finally block): fire `subagent_done` WS event immediately (before slow reset + on_done), then `sessions.release()` → `_running_count -= 1` → `sessions.reset()` → call `on_done` callback
 7. On timeout: `error = "Timed out after 180 minutes"`
-8. On turn limit: `error = "turn_limit:{turn_limit}"` (default 100)
+8. On turn limit: `error = "turn_limit:{turn_limit}"` (default 1000)
 9. On `CancelledError`: three-way, by cancellation source (see **Terminal-State Contract** below) — user stop → neutral `user_stopped` record (NO error); shutdown / spent one-shot → `error = "cancelled"`; any other (unexpected) cancel → one-shot auto-continue via `_schedule_cancel_recovery`
 
 **Early WS event firing**: `subagent_done` WS event is fired in the `_run` finally block BEFORE the slow `reset()` + `on_done()` path. This ensures the dashboard receives completion status within seconds, not 30-90s later when `stream_and_collect` finishes processing.
@@ -800,7 +812,7 @@ An unmarked `CancelledError` (see intentional-cancel rule) triggers `_schedule_c
 - **A synthesized reap error names only the cause the observed state supports.** The wall clock fires at the configured deadline, but a run parked on a never-answered spawn approval has reached no execution deadline: `turns == 0`, `_pid is None`, `_exec_started is None`, and the dashboard's approval window is still open. So `_force_reap`'s error synthesis tests `_awaiting_approval and _exec_started is None` **first** and reports the unanswered spawn approval, before the `startup_timeout` and generic-deadline arms. The predicate is captured **above** the intentional cancel, because the flag's owner clears it in a `finally` the cancel schedules; reading it at the record site would hold only while no `await` sits in between.
 - `_sigkill_session`: best-effort SIGKILL when graceful reset hangs
 - After decrementing `_running_count`, `_force_reap` calls `_drain_queue()` so the freed slot immediately starts a queued spawn. Normal completion pumps the queue via its `finally` block, but that block is gated on `not info.reaped`; a reap sets `reaped=True` and decrements the count itself, so without this explicit drain a queued spawn would sit stranded until an unrelated agent finished or a new spawn arrived.
-- Wired up in `gateway.py` after `SubagentManager` init
+- Wired up in `slack/gateway.py` after `SubagentManager` init
 
 ### Idle-Stall Detection
 
@@ -894,7 +906,7 @@ display context before it enters the broadcast digest text.
 ## Completion Injection
 
 Subagent results are routed back to the **originating session** via
-`_subagent_done` in `gateway.py`. The `parent_session_key` on `SubagentInfo`
+`_subagent_done` in `slack/gateway.py`. The `parent_session_key` on `SubagentInfo`
 tracks which session spawned the subagent.
 
 ### Two-Level Timeout
@@ -902,7 +914,7 @@ tracks which session spawned the subagent.
 | Timeout | Location | Duration | Scope |
 |---|---|---|---|
 | Outer cap | `subagent.py _run()` | 1200s (20 min) | Semaphore wait + injection combined |
-| Inner cap | `gateway.py _subagent_done()` | 900s (`INJECTION_TIMEOUT`, tunable via `KIROCREW_INJECTION_TIMEOUT`) | Single `stream_and_collect` call |
+| Inner cap | `slack/gateway.py _subagent_done()` | 900s (`INJECTION_TIMEOUT`, tunable via `KIROCREW_INJECTION_TIMEOUT`) | Single `stream_and_collect` call |
 
 On timeout (inner or outer):
 1. Kill stuck kiro-cli process via `sessions.reset()`
@@ -912,7 +924,7 @@ On timeout (inner or outer):
 
 ### Prompt-Busy Recovery
 
-`_inject_with_retry()` in `gateway.py` makes up to 3 attempts (1 initial + 2 retries) of `stream_and_collect` on AcpError. Between retries: cancels orphaned prompt, exponential backoff. On `PromptBusyExhaustedError`: kills provider, queues failure event. Note: the 1200s outer cap (`_ON_DONE_TIMEOUT`) bounds total wall-clock time, so not all retries may fire if earlier attempts consume the budget.
+`_inject_with_retry()` in `slack/gateway.py` makes up to 3 attempts (1 initial + 2 retries) of `stream_and_collect` on AcpError. Between retries: cancels orphaned prompt, exponential backoff. On `PromptBusyExhaustedError`: kills provider, queues failure event. Note: the 1200s outer cap (`_ON_DONE_TIMEOUT`) bounds total wall-clock time, so not all retries may fire if earlier attempts consume the budget.
 
 **Reconnect recovery**: `subscribe_subagents` in `ws.py` restores both managed and native subagent cards. Managed subagents are authoritative in `SubagentManager`: running records replay as `subagent_snapshot`, and recently completed records replay as `subagent_done`. Managed results remain disk-backed and are not copied into inline Redux card payloads.
 
@@ -1071,7 +1083,7 @@ Specified in [taskq.md](taskq.md); this section is the manager's side of it.
   can reach the refusal is one a re-dispatch entered under a newer generation, and
   re-arming would ask the pump for a lane slot on another owner's row once a second
   until the waiter's own bound gave up. `resume_reserve` reserves nothing while gateway admission is CLOSED (the
-  updater's boundary, [session.md](session.md) § Update pause): the run stays
+  updater's boundary, [session.md](session.md) § APIs (`pause_turn_admission_for_update`)): the run stays
   parked with its wait intact and the next wake asks again, because a slot taken
   behind the census the updater just read is work a restart would interrupt
   mid-turn. The window refill answers the same gate — a row hydrated into
@@ -1371,13 +1383,16 @@ Caller sites:
 - `task_executor.py`: passes `session_key` and `agent` (no `subagent_id`)
 - `chat_runner.py` / `llm_helpers.py`: unchanged (parent context, defaults to None)
 
-## Skill Integration
+## Prompt and CLI integration
 
-`skills/subagent/SKILL.md` (project-level) triggers on keywords: `background`, `spawn`, `bg`, `subtask`, `parallel`, `separately`, `concurrently`. Instructs the LLM to use `kirocrew spawn "task"` via bash to spawn subagents.
+Delegation guidance is injected from `src/kiro_crew/config/prompt.md`; no dedicated
+`skills/subagent/SKILL.md` ships.
 
-### CLI: `kirocrew spawn "task"`
+### CLI: `kirocrew spawn run "task"`
 
-POSTs to `http://localhost:5476/api/spawn` (dashboard API). Returns immediately with subagent ID. Gateway runs the task async and posts result to Slack when done.
+Posts to the dashboard API on the configured `--port`. By default it polls until
+the run finishes and prints the result; `--async` returns immediately with the
+subagent ID. `kirocrew spawn list` lists current runs.
 
 ### MCP Tool: `spawn_run`
 
@@ -1394,7 +1409,8 @@ spawn_run(task="grep the 2 GB build log for the first traceback", solo_reason="b
 spawn_run(tasks=["search docs for X", "check pipeline status", "review CR-123"])
 ```
 
-All agents spawn at once. The tool returns immediately with agent IDs.
+All tasks are submitted in one call; admission, staggering, and the concurrency
+cap decide when each starts. The tool returns immediately with stable agent IDs.
 Results arrive as `[Subagent completion event]` messages in the session,
 processed by the LLM automatically.
 
@@ -1464,7 +1480,12 @@ Parameters:
 - `solo_details` (str, optional for legacy reasons): concrete benefit and ownership; required by the three new reasons and retained as model-declared evidence.
 - `cwd` (str, optional): absolute path to launch subagent in. Must be under a configured `subagent_cwd_allowed_roots` entry (default: `~/workspace`, `~/workspaces`, `~/workplace`, `~/workplaces`). Validated via realpath + prefix match. Pool skipped when cwd is set. These roots are a least-privilege allowlist and are never widened automatically: a persisted list whose roots all fail to exist on the host rejects every cwd, and the operator must edit `agent.subagent_cwd_allowed_roots` (or delete the key to take the shipped default). Neither the loader nor the guard stats the configured roots.
 - `max_turns` (int, optional): override tool-call budget for this spawn (default: config or 1000)
-- `agent` (str, optional): agent name for the subagent
+- `agent` (str, optional): one agent template applied to every task.
+- `agents` (list[str], optional): per-task agent templates; length must match `tasks`.
+- `crew` (str, optional): target Crew Member whose memory and provider template apply to every task; delegated tasks must be enabled.
+- `target_member` (str, optional): explicit Crew Member selector; it must not conflict with `crew`.
+- `model` (str, optional): batch-wide model override; a non-empty effective model pin forces a dedicated process.
+- `keep` (bool, optional): request guaranteed resumability on a dedicated process and extend retention; ordinary runs remain continuable best-effort during their result-retention window.
 - `reasoning_effort` (str, optional): per-call reasoning-effort override (`low`/`medium`/`high`/`xhigh`/`max`), batch-wide like `model`. Precedence: per-call value → `agent.role_efforts['subagent']` pin → provider default; `""`/absent changes nothing. Like a model/effort role pin, a non-empty value forces the dedicated-process path (the parent's shared runtime cannot switch effort per session), so a wide fan-out pays a full process per subagent — and that cost is paid even when the resolved model turns out not to support effort (the level is then dropped at the provider factory). Carried through the stagger queue and the retry endpoint like the context-group flags. NOT inherited by `spawn_continue` — a continuation resolves effort fresh (role pin, else default), the same parity as `model`. When the requested effort cannot take effect, the gateway says so: `/api/spawn` resolves the model the factory's effort gate will see (per-call value, else the subagent role pin, else the selected member's own model pin, the provider template's pin, and the global fallback) and returns an `effort_dropped` reason on the success response, which the tool renders as one attributed line per distinct verdict — subagents sharing an identical verdict (the usual case, since the value is batch-wide) are collapsed into a single line naming all of them, while differing verdicts keep their own attributed lines — including the default case where nothing is pinned and the model resolves to "auto". When the effort WILL apply, the response instead carries an `effort_applied` note naming the resolved model and the family-specific settings key (`reasoning` for GPT, `output_config` for Claude) it is delivered under, rendered the same way — so both outcomes of a requested effort are visible in the tool result. A role-pinned effort that will be dropped (no per-call effort involved) still surfaces in the gateway log at warning level, since the tool caller never asked for it — that warning is emitted by the provider factory's effort gate itself (`config/loader.py`), the single authority that drops the level, so one log line covers every surface that funnels through it (spawn, dashboard slot, cron) and cannot drift from the decision it reports on. The provider factory remains the single dropping authority; the report never rejects or alters a spawn. Per-TASK variation inside one call is deliberately not supported (see issue #2140).
 - `include_memory` / `include_lessons` / `include_project` (bool, optional, default `true`): which switchable context groups the subagent inherits, applied to every task in a batch spawn. All-on is byte-identical to the injection a normal session gets, so a caller that omits them changes nothing. `include_memory=false` drops preferences, projects, daily history, semantic and episodic memory, and prior-session provenance — the normal choice for fan-out whose task text is self-contained. `include_lessons=false` additionally drops the user's learned corrections and profile, so keep it on for any subagent that writes code, edits files, or runs git. `include_project=false` drops the docs pointer and the project-directory line. It also drops the injected steering block, but ONLY on the Claude Code backend: on the ACP/kiro backend `kiro-cli --agent` loads the agent's `resources` (including steering globs) itself, which Kiro Crew cannot suppress from here, so steering still reaches an ACP sub-agent regardless of this flag. The conduct group — critical output-format rules, date, agent identity, runtime, workspace identity, and the skills index — is never switchable, because a subagent without it cannot discover its own capabilities or format what it reports back. A subagent is told by name which groups were withheld (`[CONTEXT SCOPE]`) so it reports the gap rather than guessing. Resolved once at spawn, carried through the capacity-queue round-trip and `POST /api/spawn/{id}/retry` like `approval_mode`/`silent`/`keep`. `spawn_continue` does not take the flags but does **inherit** them from the run it continues: a continuation rebuilds session context (`get_or_create` reports `is_new=True` even when it restores the session via `session/load`), so without inheritance a scoped-down run would regain a group on its follow-up turn. See `memory-skills-hooks.md` § Switchable context groups for the section-by-section mapping.
 
@@ -1480,7 +1501,7 @@ loop after the live selection snapshot, never prepares capabilities, and never
 changes submission, allocation, governance, or the captured memory binding.
 
 Response semantics:
-- An ID means the submission was accepted. A running subagent returns its durable agent ID; capacity/stagger queueing returns a temporary `qN` receipt that is replaced by the durable ID when the queue drains. Use `spawn_list` or the completion event to discover the durable ID rather than treating the receipt as a result path.
+- An ID means the submission was accepted. Running and queued work return the same stable agent ID; capacity or stagger queueing preserves that ID when the row drains. Treat it as an identifier, not a result path.
 - An explicit HTTP error response means the submission was rejected and is reported as `failed to start`; rejected work is never described as queued.
 - A transport failure has unknown acceptance status because the gateway may have accepted the work before the response failed. The response warns against automatic retries and directs callers to wait and recheck `spawn_list` or completion events first. An empty immediate `spawn_list` result is inconclusive because the stagger queue is not listed. If the request was truly lost, accepted siblings may remain held until the `_WAVE_STUCK_SECS` backstop (1800s / 30 minutes) reconciles the wave.
 - If every submission is explicitly rejected (with no transport uncertainty), the response states that none of the requested subagents were started and does not promise completion events or suggest polling.
@@ -1493,27 +1514,29 @@ Exposed via `kirocrew-core` MCP server. Unlike fire-and-forget `spawn_run`,
 parallel, waits until all of them finish, then returns their collected
 results inline to the calling tool invocation.
 
-Each sub-agent runs as its own KiroCrew-owned ACP session (via
+Each sub-agent runs as its own Kiro Crew-owned ACP session (via
 `SubagentManager`), so its text and tool calls stream live to the Activity
 tab (`subagent_spawn` / `subagent_chunk` / `subagent_tool` / `subagent_done`
 WS events) while the parent blocks.
 
 Native kiro-cli `subagent`/`use_subagent` crews run inside the parent's
-kiro-cli process rather than as KiroCrew-owned sessions. KiroCrew surfaces
+kiro-cli process rather than as Kiro Crew-owned sessions. Kiro Crew surfaces
 those in the Activity tab too, by observing kiro-cli's sub-agent
 notifications — one card per sub-agent, with each inner tool call and its
 output attributed to the right card.
 
 ```python
 spawn_sub_agents(agents=[
-    {"agent_or_mode": "gpu-multiagent-explorer", "prompt": "list python modules"},
-    {"agent_or_mode": "gpu-multiagent-explorer", "prompt": "summarize last 5 commits"},
+    {"prompt": "list python modules"},
+    {"prompt": "summarize last 5 commits"},
 ])
 ```
 
 Parameters:
 - `agents` (list[dict], required): each item is `{prompt: str, agent_or_mode?: str}`. `prompt` is truncated to `MAX_MEDIUM_STRING`; `agent_or_mode` to `MAX_SHORT_STRING`. Entries with an empty prompt are skipped.
 - `cwd` (str, optional): absolute path to launch all sub-agents in. Must be under a configured `subagent_cwd_allowed_roots` entry (default: `~/workspace`, `~/workspaces`, `~/workplace`, `~/workplaces`), same validation as `spawn_run`.
+- `solo_reason` / `solo_details` (optional): the same solo-delegation evidence as `spawn_run`; `parent_parallel` is refused because this tool blocks.
+- `include_memory` / `include_lessons` / `include_project` (bool, optional, default `true`): the same batch-wide context switches as `spawn_run`.
 
 Blocking poll semantics:
 - Each sub-agent is spawned via `POST /api/spawn` (with `parent_session`), then the handler polls `GET /api/spawn/{id}` every 2s until every sub-agent reports `done` (or `error`).
@@ -1536,7 +1559,7 @@ Folder-per-agent persistence at `~/.kiro/crew/subagents/{id}/`:
 ```
 ~/.kiro/crew/subagents/{id}/
   state.json      # {task, parent_session_key, started, pid}
-  result.txt      # full result text (written on completion)
+  result.txt      # result text (APPENDED per streamed chunk, not on completion)
   tombstone.json  # {error, elapsed, timestamp} (written on failure/orphan)
 ```
 
@@ -1547,6 +1570,14 @@ On startup, `SubagentManager` scans `~/.kiro/crew/subagents/` and reconciles:
 1. **PID alive** → kill process group, deliver result if available, tombstone if not
 2. **PID dead + result.txt exists** → deliver result to parent session
 3. **PID dead + no result** → write tombstone with "orphaned" error
+
+A surviving `result.txt` is not by itself a result. It is appended per streamed
+chunk, so it is non-empty from the agent's first token and a size check cannot
+tell a finished answer from an opening sentence. The run records
+`result_complete` in `state.json` when its stream reaches the complete event;
+reconciliation classifies the file on that flag alone — `result_available` with
+it, `partial_result` without — and the `partial_result` notice tells the parent
+the text is an unfinished fragment rather than pointing it at a result to read.
 
 **Orphan delivery is wired** (not a stub): the gateway registers `on_orphan_notify` (session injection — rides the parent slot's batched pending-failures drain) and `on_orphan_dm` (fallback). The DM fallback collects every undelivered orphan across the reconciliation scan and sends ONE digest message (`"N subagent(s)…"`) — never N pings; a lone orphan keeps the plain per-agent message.
 
@@ -1756,12 +1787,12 @@ behavior. `tail` is appropriate for agents that summarize at the end
 each end with a middle elision marker.
 
 Unknown `agent.completion_keep` values cause `kirocrew gateway` to fail
-at startup via `_validated_completion_keep` in `config/loader.py`. The
+at startup via `_validated_completion_keep` in `config/sections.py`. The
 dashboard PATCH endpoint enforces the same enum via
 `_EDITABLE_CONFIG["agent.completion_keep"]`.
 
 The values are threaded into `SubagentManager.__init__` from
-`gateway.py` (`completion_keep=`, `completion_keep_chars=` constructor
+`slack/gateway.py` (`completion_keep=`, `completion_keep_chars=` constructor
 kwargs sourced from `cfg.agent.*`), and a later write to either field is
 adopted live by `reconfigure` through `update_completion_keep`. User-facing docs:
 [`src/kiro_crew/docs/configuration.md`](../../../src/kiro_crew/docs/configuration.md),
@@ -1824,10 +1855,10 @@ User-typed `spawn <task>`, `bg <task>`, `spawn list`, `spawn status` are interce
 
 ## Session sharing (shared AcpRuntime)
 
-When `agent.session_sharing` is enabled (default **on** for the kiro backend) and
-the parent session is kiro-backed, subagents no longer spawn a fresh `kiro-cli`
-process each. Instead they open an additional ACP session on a **shared
-`AcpRuntime`** — one process multiplexes the parent session plus all of its
+When `agent.session_sharing` is enabled (default **on**) and the parent uses a
+backend in `ACP_BACKENDS_SESSION_SHARING` (currently `kiro` or `codex`), subagents
+open an additional ACP session on a **shared `AcpRuntime`** instead of spawning a
+fresh process each. One process multiplexes the parent session plus all of its
 subagents. Startup drops from ~3–5 s to ~200 ms and per-subagent memory from
 ~400 MB to near-zero.
 
@@ -1835,7 +1866,9 @@ Decision + lifecycle:
 
 - `SubagentManager._should_use_session_sharing(info)` gates the path: config flag
   on, parent session eligible (`SessionManager.is_session_sharing_eligible`), and
-  no backend-specific overrides (`model` / `allowed_tools` / `bare`).
+  no per-spawn `model` / `allowed_tools` / `bare` override. `_run_inner` additionally
+  forces a dedicated process for an effective model or reasoning-effort pin, a
+  retained conversation, or a member capability context.
 - `_create_shared_session()` resolves the parent's `AcpRuntime` via
   `_get_parent_runtime()` (falling back to `SessionManager.get_subagent_runtime()`
   — a companion runtime), calls `runtime.create_session()`, and wraps the handle
@@ -1864,8 +1897,148 @@ Decision + lifecycle:
   subagents may still use. The runtime is killed when the parent session ends
   (`SessionManager.release_subagent_runtime`).
 
-Non-kiro (alternate ACP backend) parents are never eligible and always use the
-legacy `AcpClient` per-process path regardless of the flag.
+Backends outside `ACP_BACKENDS_SESSION_SHARING` are not eligible and use the
+per-process path regardless of the flag.
+
+### One `$KIROCREW_SCRATCH` per session tree
+
+A parent and every process spawned on its behalf read and write ONE work
+directory under one name, however the run was placed. `agent_scratch` allocates
+scratch per PROCESS and the sandbox masks the whole scratch root, re-exposing
+each process only its own directory (`extra_private_dirs`); on their own, that
+gave a dedicated subagent process and a companion runtime an EMPTY
+`$KIROCREW_SCRATCH`, so a brief the parent staged there was unreadable to the
+child (the case `docs/architecture/context-management.md` used to document as a
+limitation), and a `_bg` runtime recycled for age or RSS mid-task handed every
+session it took over an empty directory as well.
+
+The mechanism is one extra window plus one env value, applied at three seams:
+
+- **What is inherited.** `work_scratch_dir`, declared on the `LLMProvider`
+  ABC with a `None` default (harness-parity H14, like `tool_search_settings`)
+  and answered by `AcpProvider` / `AcpSessionProvider` from the process that
+  actually serves the session (`AcpRuntime.work_scratch_dir`,
+  `AcpClient.work_scratch_dir`): the directory it exposes as
+  `$KIROCREW_SCRATCH` — the one it inherited when it joined a tree, else its
+  own allocation. `session_allocation.parent_work_scratch_dir(owner, parent_key)`
+  reads the capability off the parent's live provider, never probes a client
+  attribute (`None` when the parent has none).
+- **How a spawn takes it.** `AcpRuntime(shared_scratch=…)` and
+  `AcpClient(shared_scratch=…)`, threaded through `AcpProvider` and the `_acp`
+  provider factory. `AcpProvider` keeps the value itself, because on the kiro
+  backend `_start_kiro_runtime_impl` REPLACES the placeholder `AcpClient` with
+  an `AcpRuntime` it constructs (twice: the first spawn and the resume
+  respawn), and that runtime is the process the dedicated subagent runs in.
+  At spawn the path is re-validated by
+  `agent_scratch.shared_scratch_window` (a plain directory directly under the
+  managed root, never a link, never re-created when swept — a stale path is
+  dropped and the spawn keeps its own directory alone) and marked ACTIVE for
+  the sweep's grace window (its directory mtime is refreshed under
+  `_SWEEP_LOCK`, the lock the sweep also takes for its final look-and-delete):
+  the allocator may already be dead and the tree idle past the grace window —
+  the crash-recovery case — and an hourly sweep landing between the mount and
+  the adoption would otherwise delete it. The sweep's own rule (a fresh mtime is
+  a live user, whoever owns it) then holds the tree for the hour a spawn needs
+  seconds of; nothing is released, a second heir simply refreshes again, and the
+  lock never covers marker I/O. If the refresh itself fails (`os.utime` raises)
+  the window is handed out only when the sweep could not take the tree anyway —
+  a live owner, or an absent/garbled marker — and refused for a dead-owner tree,
+  since mounting one without the hold is the deletion-under-a-mount this exists
+  to prevent; the spawn then falls back to its own directory. It is mounted as
+  a SECOND
+  `extra_private_dirs` window beside the process's own, and named by
+  `KIROCREW_SCRATCH` (`agent_scratch.scratch_env(own, shared=…)`). `TMPDIR` /
+  `TMP` / `TEMP` and `KIRO_CHAT_LOG_FILE` stay on the process's own directory:
+  temp files are per-process by construction and two live processes appending
+  to one kiro-cli log is the sharing the log pin exists to prevent.
+- **Who passes it.** A companion runtime gets it from
+  `_collect_parent_runtime_kwargs`; a dedicated subagent process from
+  `subagent_manager/run.py`, which adds `shared_scratch` to the `get_or_create`
+  kwargs (and which is also the signal that skips the warm pool —
+  `pool_decision = "bypass_shared_scratch"` — because a pooled child's mounts were
+  fixed when it was pre-spawned with no parent); a shared-session subagent needs
+  nothing, it already runs in the parent's process. The `_bg` runtime's
+  replacement in `session_background.get_bg_session` inherits its predecessor's
+  `work_scratch_dir`, recorded on `BackgroundRuntimeState.inherited_scratch` from
+  every runtime seen in the slot and from each replacement the moment it takes
+  the slot (a backend switch retires a runtime without another acquisition
+  reading it as a predecessor) — state rather than a call-local, because the
+  stale runtime is detached and the slot cleared before the replacement spawns,
+  and a replacement that fails to spawn must not leave the next call with
+  nothing to hand on. The marker lives inside a directory mounted read-write
+  into every agent the predecessor served, so it can be replaced with a link
+  or garbage from inside the sandbox; when a replacement's spawn refuses to
+  join it (`SharedScratchJoinError`, the subclass the spawners raise at their
+  adopt site and nowhere else — a failure on the replacement's OWN marker is a
+  plain `ScratchBoundaryError` and keeps the inherit, since that tree still
+  holds the sessions' work), `get_bg_session` abandons the inherit and
+  spawns with the replacement's own directory — the sessions lose their staged
+  files to the tampering, the tree stays on disk unowned for a human, and the
+  `_bg` slot is never locked out of a runtime.
+- **Every process seam is enumerated.** A seam that starts a kiro-cli process
+  and forgets `shared_scratch` reproduces the bug with no red test, so
+  `test_subagent_shared_scratch.py::TestEveryProcessSpawnSeamIsAccountedFor`
+  scans `src/` for every `AcpRuntime(` / `AcpClient(` construction: each passes
+  `shared_scratch=` (or a caller-filled `**kwargs`) or is listed as a standalone
+  process with the reason it has no session tree to join (the review-sage
+  worker pool, the knowledge LLM pool). A new construction site fails the test
+  until it is placed.
+
+Ownership names every user. Each process that mounts a tree it did not allocate
+ADDS itself to the tree's `.owner` marker once live (`agent_scratch.adopt_owner`;
+one pid per line, read-modify-write under a process-wide lock, dead pids pruned
+on the way, and `sweep_dead_scratch` keeps a directory while ANY named pgroup
+lives). Naming only one side is wrong whichever process dies first: a parent
+that crashes under running dedicated children, or a successor that fails beside
+its draining predecessor, would leave a dead-only marker over a live user and
+the sweep reads dead-plus-idle as reclaimable. Outcomes: `"refused"` (a link
+where the marker belongs) reaps the spawn exactly as the own-directory marker
+does; `"stale"` (the append failed AND the old marker could not be cleared) reaps
+too, since that is precisely the deletion-under-a-live-process state;
+`"unwritable"` leaves the tree UNOWNED — never swept, a visible leak rather than
+a loss — and warns. `"garbled"` (a marker this module did not write: not
+integers, oversized, not a regular file) also only warns and proceeds: the sweep
+skips such a tree for good, so mounting it risks a leak and never a deletion,
+and a fatal answer would let any agent process the tree is mounted into veto
+every later spawn on it by scribbling over the marker. The marker is read to
+EOF under the size cap, never in one `read`: a short read hands back a prefix,
+and a prefix naming only dead pids reads as a dead owner over the live pid the
+tail names. It is opened `O_NONBLOCK`: a FIFO planted at the marker's name
+passes the link check and `O_NOFOLLOW`, and a blocking open with no writer
+would park the sweep or a spawn's adopt forever; non-blocking, the open returns
+and the `fstat` regular-file check rejects it.
+
+A ROOT that respawns is still its tree. An `AcpClient` whose process exited and
+is respawned by `ensure_ready`, an `AcpRuntime` respawned on the same object,
+and an `AcpProvider` restarting the kiro runtime that served a session all
+promote the directory the previous process exposed to `shared_scratch` and join
+it like any inherited tree (validated, dropped if swept, adopted once live) —
+the children spawned before the restart mounted that directory, and the work
+staged in it is what the session was doing. `AcpProvider` records the tree off
+the LIVE runtime once it takes over (`runtime.work_scratch_dir`), not the value
+it was constructed with: an inherited window that was swept is dropped by the
+spawn, and a restart that re-sent the swept path would drop it again and start a
+third tree, losing what the first runtime staged.
+
+Lifetime, stated on purpose: the `_bg` runtime's tree now chains across every
+recycle, so it lives as long as the gateway (and any agent process that outlives
+it), where a per-process directory used to rotate with each recycle. Only the
+work products under `$KIROCREW_SCRATCH` chain; `TMPDIR` temp files and the
+kiro-cli log stay on each process's own directory and still rotate per recycle,
+and `cap_kiro_cli_logs` still bounds the logs. Work products are what a session
+deliberately keeps for its own duration, so their lifetime is the session
+tree's — the accepted trade for a directory that never vanishes under a live
+session. For the `_bg` runtime specifically that tree is the gateway's: every
+dashboard session's work products accumulate in one directory under
+`<data home>/scratch/` for as long as the gateway (or any agent process that
+outlives it) runs, and nothing in-tree prunes or size-caps it — a bound would
+delete a live session's files, which is the defect this mechanism removes. The
+operator monitors disk for it as for the rest of the data home
+(`src/kiro_crew/docs/troubleshooting.md` names the path and the remedy); the
+directory is reclaimed by the ordinary liveness sweep once the gateway and its
+runtimes are gone, and a gateway restart starts a fresh one. Siblings from OTHER trees stay masked either way: the mask is a
+per-tree boundary, and this widens the window to the tree, never lifts the
+mask. Pinned by `test/test_subagent_shared_scratch.py`.
 
 ### Parent end ends the children, on every backend
 
@@ -1874,9 +2047,9 @@ them onto one process, because killing that process is what ends them — a side
 effect, not a decision. A harness running one process per child has no entry in
 `_subagent_runtimes`, so the reap reaches nothing and its children outlive the
 conversation that asked for them, each holding an agent process and that process's
-MCP fleet until its own `agent.subagent_timeout_secs` expires. Seven of the eight
-registered backends take that path; only kiro is in
-`ACP_BACKENDS_SESSION_SHARING`.
+MCP fleet until its own `agent.subagent_timeout_secs` expires. Backends outside
+the positively named sharing set take that path; the set currently contains
+`kiro` and `codex`.
 
 So every lifecycle site that releases a companion runtime also ends the parent's
 runs, through the two halves above. The boundary is not re-derived per surface:

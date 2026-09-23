@@ -1104,6 +1104,20 @@ class RunEventCoordinator(ManagerComponent):
             extra_kwargs["allowed_tools"] = info.allowed_tools
         if info.cwd:
             extra_kwargs["cwd"] = info.cwd
+        # A dedicated process joins its parent's session tree: the parent's
+        # ``$KIROCREW_SCRATCH`` is mounted beside the child's own scratch and is
+        # what the child's ``$KIROCREW_SCRATCH`` names, so a brief the parent
+        # staged there is readable (agent_scratch). Inert on the shared-runtime
+        # arm, where the child already runs in the parent's process; None when
+        # the parent has no live provider or spawned without scratch. Also the
+        # signal that skips the warm pool, whose mounts were fixed at pre-spawn.
+        if info.parent_session_key:
+            resolve_scratch = getattr(self._manager._sessions, "parent_work_scratch_dir", None)
+            shared_scratch = (
+                resolve_scratch(info.parent_session_key) if resolve_scratch is not None else None
+            )
+            if shared_scratch is not None:
+                extra_kwargs["shared_scratch"] = shared_scratch
 
         # ── Session sharing: reuse parent's shared AcpRuntime ──
         # When enabled and eligible, subagents get a session on the parent's
@@ -2234,6 +2248,26 @@ class RunEventCoordinator(ManagerComponent):
         # Cap disk file and trim memory — gateway decides how much to show based on mode.
         if info.result_path:
             cap_result_file(Path(info.result_path))
+        # The stream reached a successful EVENT_COMPLETE, so result.txt now holds
+        # the whole answer. Nothing else on disk says so: write_result_chunk
+        # appends per streamed chunk, so the file is non-empty from the first
+        # token and a reader after a restart cannot tell a finished answer from an
+        # opening sentence. A non-success completion leaves the flag unset, and
+        # so does a stream that never delivered a complete event at all — the
+        # generator can simply stop between chunks when the transport dies, and
+        # the absent stop reason alone classifies as a normal end of turn, which
+        # would mark the fragment complete. The explicit ``_complete_event``
+        # check is what tells those two apart. Recorded here because this is the
+        # only point that knows. Written after cap_result_file so the flag
+        # describes the file as it will be read. A restart landing between the
+        # complete event and this write leaves a finished result unflagged — it
+        # under-claims, which is the safe direction for a signal whose whole
+        # purpose is not to overstate.
+        await self._manager._write_state_off_loop(
+            info,
+            "result complete",
+            result_complete=_complete_event is not None and _stop.is_success,
+        )
         # Flag whether the completion-event copy will drop content, so the gateway
         # emits a summary + result_path pointer (read on demand) instead of a lossy
         # blob. The full transcript stays in result.txt for the TTL grace window.

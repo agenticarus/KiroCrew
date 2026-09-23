@@ -36,6 +36,7 @@ from kiro_crew.dashboard.state import (
     MANUAL_RESUME_RECOVERY_PREFIX,
     POSTTOKEN_RECOVERY_PREFIX,
     PROMISE_ONLY_RECOVERY_PREFIX,
+    REFUSAL_FALLBACK_RECOVERY_PREFIX,
     SUBAGENT_COMPLETION_PREFIXES,
     DashboardState,
     _ChatSlot,
@@ -146,18 +147,25 @@ async def run_config_write(fn, /, *args, **kwargs):
         return result
 
 
-async def drained_to_thread(fn, /, *args):
-    """``asyncio.to_thread`` that a cancellation cannot abandon mid-mutation.
+async def run_to_completion(aw):
+    """Await *aw* so that a cancellation cannot abandon it part-way.
 
-    A plain ``await to_thread(...)`` raises ``CancelledError`` at the await
-    while the worker THREAD keeps running — a handler that then performs
-    cleanup (releasing a lock, removing a staging directory) races its own
-    still-running worker. Shielding the task keeps the await alive until the
-    worker actually finishes, then re-raises the cancellation, so control only
-    ever returns with no mutation in flight. Shared by the agents handler's
-    config writers and the files handler's workspace-copy staging.
+    The awaitable runs as its own task behind ``asyncio.shield``; a
+    ``CancelledError`` delivered to the CALLER is remembered and the caller
+    keeps waiting until the task finishes, then the cancellation is re-raised.
+    The loop, not a single re-await, is what makes that hold under repeated
+    cancellation (a graceful shutdown escalating after its timeout): each
+    re-shield absorbs one more cancel, and only a finished task ends it.
+
+    For a multi-phase write -- a channel saver's config.json commit followed by
+    its ``.env`` credential write, the MCP gateway toggle's persist followed by
+    its live apply -- a cancellation between the phases would leave the stored
+    state and the effective state disagreeing; wrapping the whole transaction
+    here is what keeps the pair consistent. Cancellation is deferred, never
+    swallowed: the caller still unwinds with ``CancelledError`` afterwards, and
+    an exception from the task propagates as usual.
     """
-    task = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    task = asyncio.ensure_future(aw)
     cancelled: asyncio.CancelledError | None = None
     while True:
         try:
@@ -166,12 +174,26 @@ async def drained_to_thread(fn, /, *args):
         except asyncio.CancelledError as exc:
             if task.cancelled():
                 raise
-            # OUR await was cancelled, not the worker: remember it, keep
-            # draining the still-running thread.
+            # OUR await was cancelled, not the task: remember it, keep waiting
+            # for the still-running work.
             cancelled = exc
     if cancelled is not None:
         raise cancelled
     return result
+
+
+async def drained_to_thread(fn, /, *args):
+    """``asyncio.to_thread`` that a cancellation cannot abandon mid-mutation.
+
+    A plain ``await to_thread(...)`` raises ``CancelledError`` at the await
+    while the worker THREAD keeps running — a handler that then performs
+    cleanup (releasing a lock, removing a staging directory) races its own
+    still-running worker. :func:`run_to_completion` keeps the await alive until
+    the worker actually finishes, then re-raises the cancellation, so control
+    only ever returns with no mutation in flight. Shared by the agents handler's
+    config writers and the files handler's workspace-copy staging.
+    """
+    return await run_to_completion(asyncio.to_thread(fn, *args))
 
 
 # Per-turn compaction-failure backoff. See
@@ -614,7 +636,7 @@ def _emit_agent_assignment(slot_key: str, agent: str, outcome: str = "applied") 
     )
 
 
-def _validate_tool_name(tool_name: str, *, is_shell: bool = False) -> str:
+def _validate_tool_name(tool_name: str, *, is_shell: bool = False, canonical_name: str = "") -> str:
     """Validate and sanitize tool display names for hook matching.
 
     ``is_shell`` is the provider-agnostic signal (set at the provider boundary)
@@ -623,11 +645,22 @@ def _validate_tool_name(tool_name: str, *, is_shell: bool = False) -> str:
     on this flag rather than a hardcoded set of provider tool_kind literals
     (e.g. "execute"/"Bash") stops the cap from silently re-breaking long shell
     commands on every engine migration or tool rename.
+
+    ``canonical_name`` is the adapter-authored tool identity that travelled
+    beside the title (``AcpEvent.tool_name``, read from the harness's own
+    ``_meta`` channel, never from the title or the model's ``description``).
+    The length cap protects the case where the title IS the only identity a
+    hook can match on; when a canonical identity is present the title is
+    content (a ``read`` title embeds the paths it reads, exactly as a shell
+    title embeds its command line), so the cap is skipped for it as it is for
+    ``is_shell``. Sanitisation and the empty check apply regardless: only the
+    length predicate is relaxed. A backend that publishes no identity leaves
+    ``canonical_name`` empty and keeps the loud refusal.
     """
     sanitized = sanitize_string(tool_name)
     if not sanitized:
         raise ValueError("Tool name cannot be empty")
-    if not is_shell and len(sanitized) > MAX_TOOL_NAME_LEN:
+    if not is_shell and not canonical_name and len(sanitized) > MAX_TOOL_NAME_LEN:
         raise ValueError(f"Tool name exceeds max length {MAX_TOOL_NAME_LEN}")
     return sanitized
 
@@ -2979,6 +3012,33 @@ _MANUAL_CONTINUE_MSG = (
     "Do NOT re-run steps or tools that already completed successfully. If the "
     "request is genuinely complete, say so in one line instead of inventing "
     "further work."
+)
+# Injected INSTEAD of the user's message when a content-filter refusal landed
+# after the turn had already dispatched tool calls and agent.refusal_fallback_model
+# names a different model (chat_runner._refusal_fallback_retry). Replaying the
+# message would run those tool calls a second time, so the session -- moved to
+# the fallback model -- is asked to carry on from the completed work, which is
+# what a person gets by pressing Continue. The nudge goes to the SAME harness
+# session the refused turn ran on (the retention every Continue relies on), and
+# Kiro Crew itself never re-sends the message once a tool ran. Unlike
+# ``_MANUAL_RESUME_MSG`` it offers no restart clause: it is sent only when the
+# turn dispatched a tool, so "nothing was done yet" is never true of it, and a
+# model that cannot see the partial turn (a session that did not keep it) is
+# told to stop rather than start over -- failing safe instead of re-running the
+# writes.
+#
+# Deliberately silent about the content filter and the model swap: the FALLBACK
+# model reads this body, and telling it the request was just declined primes it
+# to decline too. The user learns both from the retry notice card beside it.
+# Not in ``_SYNTHETIC_RECOVERY_MSGS``: the retry turn is recognized by its queue
+# id, not by text, and the turn-start re-arm already skips recovery-kind entries.
+_REFUSAL_FALLBACK_RESUME_MSG = (
+    f"{REFUSAL_FALLBACK_RECOVERY_PREFIX}\n"
+    "The previous turn ended before it finished. Look at the conversation above, "
+    "work out what was already completed, and finish the user's most recent "
+    "request from there. Do NOT re-run steps or tools that already completed "
+    "successfully. If the completed work is not visible in the conversation "
+    "above, do NOT start the request over — say so and stop."
 )
 
 

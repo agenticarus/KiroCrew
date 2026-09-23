@@ -43,7 +43,10 @@ from kiro_crew import (
     platform_compat,
     windows_acl,
 )
-from kiro_crew.agent_sdk.backends import resolve_cc_permission_mode
+from kiro_crew.agent_sdk.backends import (
+    ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION,
+    resolve_cc_permission_mode,
+)
 from kiro_crew.agent_sdk.capabilities import MODEL_NAMESPACE_ACP, capabilities_for
 from kiro_crew.agent_spec_format import iter_agent_spec_files, parse_agent_spec_text
 
@@ -1554,23 +1557,21 @@ def update_config_locked(
     a stale snapshot saved after a locked update overwrites it with older
     values.  The lock fixes interleaving, not staleness.
 
-    A SECOND family of writers still bypasses this lock: writers that reach
-    ``config_path()`` through ``kiro_crew.agent._atomic_json_write``
-    (``messaging.py``'s per-channel savers, ``core.py``'s STT PUT, ``mcp.py``'s
-    gateway-enable). ``TestEveryConfigWriterIsLocked`` does not reach them --
-    it matches calls to :func:`write_config_atomically`, and these make none --
-    so they have their own ratchet,
-    ``TestTheAtomicJsonWriteConfigFamilyIsRatcheted`` in the same file, which
-    pins that family to a baseline that may only SHRINK.
+    A SECOND way to bypass this lock is to reach ``config_path()`` through
+    ``kiro_crew.agent._atomic_json_write``, which takes no sidecar lock at all.
+    ``TestEveryConfigWriterIsLocked`` does not see such a writer -- it matches
+    calls to :func:`write_config_atomically`, and that one makes none -- so
+    ``TestTheAtomicJsonWriteConfigFamilyIsRatcheted`` in the same file scans for
+    that spelling separately and pins its population to an EMPTY baseline: the
+    dashboard's per-channel savers (``messaging._LockedSectionWrite``), the STT
+    PUT and the MCP gateway-enable toggle all come through here.
 
-    That family relies on the in-process asyncio ``_get_config_lock()`` only,
-    which serializes same-loop callers and nothing else, so it can still
-    interleave with a holder of this lock.  Converting the remaining members is
-    follow-up work (``api_feishu_config_save`` and ``api_imessage_config_save``
-    are already through here and are the shape to copy); do not read either
-    ratchet's green as meaning the family is converted, only that it cannot
-    grow, and note that an ALIASED import of :func:`write_config_atomically`
-    would evade the sibling ratchet for the same matching reason.
+    Such a writer would rely on the in-process asyncio ``_get_config_lock()``
+    only, which serializes same-loop callers and nothing else, so it could still
+    interleave with a holder of this lock; ``api_feishu_config_save`` is the
+    shape to copy for a new handler.  Note that an ALIASED import of
+    :func:`write_config_atomically` would evade the sibling ratchet for the same
+    matching reason.
 
     Contract:
 
@@ -2945,6 +2946,9 @@ def _build_memory_config(memory_data: dict) -> MemoryConfig:
         history_max_days=_safe_nonnegative_int(memory_data.get("history_max_days", 365), 365),
         backup_enabled=_safe_bool(memory_data.get("backup_enabled", True), True),
         backup_keep=_safe_int(memory_data.get("backup_keep", 7), 7, 1, None),
+        persistence_enabled=_safe_bool(memory_data.get("persistence_enabled", True), True),
+        inject_memory=_safe_bool(memory_data.get("inject_memory", True), True),
+        inject_lessons=_safe_bool(memory_data.get("inject_lessons", True), True),
         migrated=memory_data.get("migrated", False),
     )
 
@@ -3110,6 +3114,7 @@ def _build_wakatime_config(wakatime_data: dict) -> WakaTimeConfig:
     return WakaTimeConfig(
         enabled=bool(wakatime_data.get("enabled", False)),
         api_base_url=str(wakatime_data.get("api_base_url", "") or ""),
+        send_heartbeats=_safe_bool(wakatime_data.get("send_heartbeats", False), False),
     )
 
 
@@ -3176,6 +3181,7 @@ def _build_slack_config(slack_data: dict) -> SlackConfig:
         reactions_enabled=bool(slack_data.get("reactions_enabled", True)),
         use_tunnel_url=bool(slack_data.get("use_tunnel_url", False)),
         show_thinking=bool(slack_data.get("show_thinking", True)),
+        dm_single_session=bool(slack_data.get("dm_single_session", False)),
         home_tab_sessions_per_kind=_safe_int(slack_data.get("home_tab_sessions_per_kind", 5), 5),
     )
 
@@ -5520,6 +5526,7 @@ class KiroCrewConfig:
             # caller passing it into the catch-all would be swallowed here and
             # the session would spawn on the backend's default with no error.
             permission_mode: str | None = None,
+            shared_scratch: Path | None = None,
             **_kwargs: object,
         ) -> AcpProvider:
             wdir = Path(cwd) if cwd else _session_work_dir(session_key)
@@ -5592,7 +5599,19 @@ class KiroCrewConfig:
             # dashboard slot's effort, or a sub-agent's resolved "subagent"
             # effort) still wins over all of it.
             _eff = reasoning_effort_override or self.resolve_session_effort(agent, crew_agent)
-            if m and _eff and is_valid_effort(_eff) and model_supports_effort(m):
+            # On a harness whose effort capability and vocabulary come from the
+            # option it ADVERTISES, neither check below can answer here. This
+            # factory runs before any session exists, the registry carries none of
+            # the operator's own model ids, and Crew's ladder does not list every
+            # level such a harness offers -- so both facts arrive with
+            # ``session/new``, and ``AcpProvider._resolve_effort`` validates the
+            # level against the advertised list once they do. The level is carried
+            # forward for a member and judged there. Judging it HERE drops it on
+            # every cold start, and the session then runs the adapter's own default
+            # while the dashboard still shows the level the operator picked.
+            _from_option = _backend in ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION
+            _registry_ok = is_valid_effort(_eff) and model_supports_effort(m)
+            if m and _eff and (_from_option or _registry_ok):
                 _eff_per_model[m] = _eff
             elif _eff and is_valid_effort(_eff):
                 # Single-authority drop warning: a valid requested effort is
@@ -5643,6 +5662,10 @@ class KiroCrewConfig:
                 mcp_gateway_overlay=_gw_overlay,
                 mcp_gateway_socket=_gw_socket,
                 permission_mode=resolve_cc_permission_mode(permission_mode, _backend),
+                # A dedicated subagent process joins its parent's session tree:
+                # the tree's work directory is mounted beside its own scratch
+                # and is what its ``$KIROCREW_SCRATCH`` names (agent_scratch).
+                shared_scratch=shared_scratch,
             )
 
         return _acp
@@ -6481,17 +6504,14 @@ def resolve_agent_bindings(
 
     # Existing V1 members keep their exact configured store binding.
     # Canonical member/store mismatches are rejected before legacy use.
-    store_name = (
-        execution_context.store.store_id
-        if execution_context is not None
-        else (
-            DEFAULT_MEMORY_STORE
-            if passthrough
-            else require_member_memory_store(
-                config, resolved_alias, require_directory=validate_memory_files
-            )
+    if execution_context is not None:
+        store_name = execution_context.store.store_id
+    elif passthrough:
+        store_name = DEFAULT_MEMORY_STORE
+    else:
+        store_name = require_member_memory_store(
+            config, resolved_alias, require_directory=validate_memory_files
         )
-    )
 
     kiro_agent = (
         execution_context.template_id

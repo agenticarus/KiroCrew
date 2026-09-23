@@ -1675,24 +1675,34 @@ export function useWebSocket() {
             if (!reconnectingRef.current) {
               dispatchMcNotification(APPROVAL_KIND)
             }
-            // Browser notification when tab not focused (permission must be granted via UI interaction elsewhere)
-            if (typeof Notification !== 'undefined' && document.hidden && Notification.permission === 'granted') {
-              // Android Chrome throws "Illegal constructor" for page-context
-              // Notification; an uncaught throw here kills the whole message
-              // handler, so the native toast is best-effort.
-              try {
-                new Notification(i18nT('hooks.useWebSocket.approval_required'), { body: data.tool || i18nT('hooks.useWebSocket.a_task_needs_your_decision'), silent: true, tag: 'kirocrew-approval' })
-              } catch {
-                /* unsupported platform */
-              }
-            }
-            dispatch(addNotification({
+            // No OS toast here. The addNotification below is what reaches the
+            // OS: useNativeNotification watches the unacked count and posts ONE
+            // toast per new note, tagged with its approval_id, only while the
+            // user is away from the window. A second constructor on this path
+            // carried a different tag, so the OS showed two banners for one
+            // approval.
+            //
+            // The owning slot rides on the note so the in-app banner's
+            // `targetsCurrentView` gate can tell "this chat is on screen" (the
+            // inline permission card below already shows it there) from "the
+            // user is on another surface" (the banner is the interrupt).
+            const approvalSlot = typeof data.slot === 'string' && data.slot ? data.slot : ''
+            const approvalNote = {
               kind: 'approval',
               title: i18nT('hooks.useWebSocket.tool_approval', { name: data.tool || i18nT('hooks.useWebSocket.unknown') }),
               body: approvalNotificationBody(data.source, data.tool_input, data.tool_purpose),
               ts: String(data.ts || Date.now() / 1000),
               approval_id: data.id,
-            } as Notification))
+              ...(approvalSlot ? { slot: approvalSlot } : {}),
+            } as Notification
+            dispatch(addNotification(approvalNote))
+            // The in-app banner hears LIVE arrivals only, same as the
+            // `notification` frame above: a reconnect catch-up replays
+            // approvals the bell already holds. While the window is focused
+            // this banner is the visible interrupt for a blocking approval
+            // (the OS toast stays quiet for a focused window); away from the
+            // window the toast takes over and `shouldBannerNote` skips it.
+            if (!reconnectingRef.current) dispatchLiveNotification(approvalNote)
             // Inject inline in the OWNING chat only. An approval with no
             // explicit slot has no owning conversation (an unowned cron /
             // taskrunner command): falling back to activeSlot planted the card
@@ -1701,7 +1711,7 @@ export function useWebSocket() {
             // 404'd as soon as the short background window elapsed. Unowned
             // approvals live on the global surface (notification feed) only —
             // the addNotification above already delivered it there.
-            const targetSlot = data.slot || ''
+            const targetSlot = approvalSlot
             if (targetSlot) {
               dispatch(sseChatMessage({
                 slot: targetSlot,
@@ -1846,7 +1856,7 @@ export function useWebSocket() {
               voiceProgressRef.current = null
             }
             if (!isPassiveNote && data.slot && (data.role === 'user' || data.role === 'inject' || data.role === 'subagent')) {
-              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', text: 'Thinking…', ts: Date.now() }))
+              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', ts: Date.now() }))
             }
             break
           case 'chat_message_update':
@@ -1969,7 +1979,7 @@ export function useWebSocket() {
               // The gateway generation that numbered the seqs (see floorForGen).
               if (typeof data.gen === 'string') entry.gen = data.gen
               if (store.getState().chat.slotStatusDetail[cs]?.kind !== 'streaming') {
-                dispatch(setSlotStatusDetail({ slot: cs, kind: 'streaming', text: 'Streaming', ts: Date.now() }))
+                dispatch(setSlotStatusDetail({ slot: cs, kind: 'streaming', ts: Date.now() }))
               }
               // A hidden window never runs the scheduled frame; past the
               // threshold, drain now so the buffer cannot hold a whole turn.
@@ -1996,10 +2006,10 @@ export function useWebSocket() {
               // tools run in parallel a refinement of one cannot inherit a
               // sibling's purpose.
               //
-              // `text` holds the PURPOSE ALONE and stays empty when the agent
+              // `purpose` holds the PURPOSE ALONE and stays empty when the agent
               // supplied none — the fallback to the tool title belongs to
               // toolStatusLabel, which owns the label rule. Storing the title
-              // in `text` instead would make the two indistinguishable here,
+              // in `purpose` instead would make the two indistinguishable here,
               // and a purpose-less call would then pin the initial stub title
               // ("Terminal") for the whole call instead of advancing to the
               // refined command.
@@ -2035,7 +2045,7 @@ export function useWebSocket() {
               dispatch(setSlotStatusDetail({
                 slot: data.slot,
                 kind: 'tool',
-                text: purpose || mergeInto?.text || '',
+                purpose: purpose || mergeInto?.purpose || '',
                 toolName: toolName || mergeInto?.toolName || '',
                 derivedTitle: derivedTitle || mergeInto?.derivedTitle || '',
                 ...(derivedAction
@@ -2318,7 +2328,7 @@ export function useWebSocket() {
             // made explicit.
             const detailKind = data.slot ? store.getState().chat.slotStatusDetail[data.slot]?.kind : undefined
             if (data.slot && detailKind !== 'streaming' && detailKind !== 'thinking') {
-              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', text: 'Thinking…', ts: Date.now() }))
+              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', ts: Date.now() }))
             }
             break
           }
@@ -2334,7 +2344,7 @@ export function useWebSocket() {
           }
           case 'chat_status':
             if (data.slot && data.status) {
-              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', text: data.status, ts: Date.now() }))
+              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', label: data.status, ts: Date.now() }))
             }
             break
           case 'chat_variant_switch':
@@ -2429,7 +2439,7 @@ export function useWebSocket() {
               emitSlotRead(data.slot, doneTs)
             }
             if (data.slot) {
-              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'idle', text: 'Ready', ts: Date.now() }))
+              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'idle', ts: Date.now() }))
             }
             if (data.slot) dispatch(refreshSlot(data.slot))
             if (data.slot) {

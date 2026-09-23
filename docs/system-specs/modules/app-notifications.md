@@ -152,10 +152,10 @@ Notification sound is produced entirely on the client and is independent of the
 notification feed, the bell badge, and OS notification-center toasts. The
 WebAudio layer is the **single source of sound**: `website/src/hooks/useNotificationSound.ts`
 synthesizes tones through the Web Audio API (no audio files) and is the only
-component that emits sound. Both page-context `Notification` constructors —
-`website/src/hooks/useNativeNotification.ts` (feed toast) and the approval toast
-in `website/src/hooks/useWebSocket.ts` — pass `silent: true`, so the OS toast
-never adds its own system chime on top of the WebAudio tone. A browser that
+component that emits sound. The feed toast's page-context `Notification`
+constructor (`website/src/hooks/useNativeNotification.ts`, see "OS toast"
+below) passes `silent: true`, so the OS toast never adds its own system chime
+on top of the WebAudio tone. A browser that
 ignores `silent` degrades to the prior double-sound behavior and no worse.
 
 ### Sound events
@@ -165,7 +165,8 @@ Two sound kinds are synthesized by the websocket layer. `TURN_DONE_KIND`
 entry, no toast, no badge). `APPROVAL_KIND` (`'approval'`, on an `approval`
 frame) is synthesized for sound, but the same approval frame *separately* adds an
 approval notification to the feed — so approval both chimes and shows a feed
-entry, and the two are independent. Both chimes are suppressed during reconnect
+entry, and the two are independent (the feed entry is also what carries the
+approval to the OS toast). Both chimes are suppressed during reconnect
 catch-up replay, and `shouldChimeOnTurnDone` also suppresses slot-less turn
 completions. A real feed `notification` frame fires `MC_NOTIFICATION_EVENT` with
 its own `kind`, except when the note is muted-channel (`silenced`) or `passive`.
@@ -208,6 +209,36 @@ key (a `null` key, i.e. `clear()`, is also honored) then reloads through
 `loadSoundSettings` so validation and clamping are reused. Notification playback
 is debounced to one tone per 300 ms.
 
+## OS toast (client)
+
+`website/src/hooks/useNativeNotification.ts` is the **single constructor** of a
+page-context `Notification` for a feed note. It watches the count of unacked,
+unsilenced notes in the Redux store and, when the count grows, posts one toast
+carrying the newest note's title and flattened body, tagged with its
+`approval_id` / `job_id` / `task_id` (or `kirocrew-notif`) so a burst about
+one subject replaces rather than stacks. An `approval` frame reaches the OS
+through the feed entry `useWebSocket` dispatches for it; the socket layer
+constructs no toast of its own. One event, one constructor, one tag: the OS
+collapses only equal tags, so a second constructor with its own tag is two
+banners for one approval.
+
+The toast fires **only while the user is away from the window**:
+`isWindowAway()` (`hooks/windowAway.ts`) is `document.hidden ||
+!document.hasFocus()`, both axes because Page Visibility reports an occluded or
+unfocused window as visible. While the window is visible and focused the in-app
+banner and the bell badge already show the note, and the toast stays quiet; a
+note that arrived while focused is not re-announced when focus later leaves.
+The same predicate is the in-app banner's `windowFocused` (its complement) and
+the chat-complete toast's away check, so a live note lands on exactly one of
+the two surfaces. The gate sits inside the permission-granted branch: the
+best-effort `requestPermission()` on an undecided permission runs regardless
+of focus.
+
+The opt-in "a background chat finished" toast (`hooks/chatCompleteNotify.ts`,
+constructed in `useWebSocket` on `chat_done`) is a separate, default-OFF
+surface with its own `kirocrew-chat-done:<slot>` tag; it shares only the away
+predicate.
+
 ## In-app banner (client)
 
 `website/src/components/notifications/NotificationBanner.tsx`, mounted once by
@@ -231,17 +262,21 @@ server-side.
 
 The banner listens to `MC_LIVE_NOTIFICATION_EVENT` (`hooks/notificationEvent.ts`),
 which `useWebSocket` fires for a `notification` frame received on a live
-connection. It never reads the Redux list: the boot `fetchNotifications`
+connection and for the feed note it synthesizes from an `approval` frame (the
+note carries the owning `slot`, so `targetsCurrentView` skips it while that
+chat is on screen and its inline permission card is visible; an approval with
+no slot banners on every surface). It never reads the Redux list: the boot `fetchNotifications`
 snapshot and reconnect refetches fill the store with history, and history is
 never bannered. `useWebSocket` withholds the event during a reconnect catch-up
-(`reconnectingRef`), the same window that mutes the turn-done chime.
+(`reconnectingRef`) for both frames, the same window that mutes the turn-done
+chime.
 
 ### Priorities
 
 | Priority | Banner |
 |---|---|
 | `critical` | stays until clicked, dismissed, or acted on; the live region is `role="alert"` while one is pending |
-| `default` | auto-hides after `BANNER_AUTO_HIDE_MS` (6 s). Every pending default card shares ONE timer, restarted by each default arrival and paused while the stack is hovered or holds focus |
+| `default` | auto-hides after `BANNER_AUTO_HIDE_MS` (6 s). Every pending default card shares ONE timer, restarted by each default arrival and paused while the stack is hovered or holds focus. The pointer and keyboard are tracked as two separate holds and the clock resumes only when BOTH have let go. A card's removal destroys ownership without firing the release event, so the holds are re-read after every change to the deck: FOCUS is owned by an element (held while the stack still contains the active one, released when its holder unmounts), the POINTER by the container (a removal does not move that boundary, so only a real pointer-leave — or an empty deck — releases it) |
 | `passive`, or `silenced` (`isSilencedNote`) | never |
 
 Auto-hide does **not** acknowledge: the note stays unread in the bell, and the

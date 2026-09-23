@@ -1012,7 +1012,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.message-font-size",
     "label": "Message Font Size",
     "labelKey": "pages.settings.chatPanel.message_font_size",
-    "description": "Font size for message text, in every session. Sidebar, session list and the rest of the interface are unaffected.",
+    "description": "Font size for the conversation, in every session: message text, code, tables, suggested replies and the message input. The Compact content width grows to match. Sidebar, session list and the rest of the interface are unaffected.",
     "tab": "chat",
     "type": "stepper",
     "occurrence": 1
@@ -1410,6 +1410,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "In a session that approves its own tool calls, this also sends the name and arguments of each call to Jev, which then puts a note on the ones it thinks are worth a look. Passwords and keys are replaced before anything is sent. It changes nothing about which tool calls are allowed. Off until you turn it on, even if the switch above is already on."
   },
   {
+    "id": "developer.artifact-deploy",
+    "label": "Artifact Deploy",
+    "labelKey": "pages.developer.featurePreviewsTab.artifact_deploy",
+    "description": "Publish an artifact to a public HTTPS URL in your own AWS account. Off by default: every deploy spends money in your account and serves the content on the open internet.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "developer.chat-on-a-crew",
     "label": "Chat on a crew",
     "labelKey": "pages.developer.featurePreviewsTab.chat_on_a_crew",
@@ -1464,6 +1473,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "developer.model-for-the-small-model-judge",
+    "label": "Model for the small-model judge",
+    "labelKey": "pages.developer.featurePreviewsTab.decisions_judge_model",
+    "description": "Only used when the judge above is the small model. Leave it on the judge agent's own model unless you want a cheaper one.",
+    "tab": "developer",
+    "type": "select",
+    "occurrence": 1
+  },
+  {
     "id": "developer.remote-crew-sessions",
     "label": "Remote crew sessions",
     "labelKey": "pages.developer.featurePreviewsTab.remote_instance_sessions",
@@ -1488,6 +1506,14 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Inbound webhook tokens, registered contexts, and run history. The API works; the page is not finished.",
     "tab": "developer",
     "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "developer.which-judge-answers",
+    "label": "Which judge answers",
+    "labelKey": "pages.developer.featurePreviewsTab.decisions_judge_provider",
+    "tab": "developer",
+    "type": "select",
     "occurrence": 1
   },
   {

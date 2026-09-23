@@ -7,6 +7,7 @@ import functools
 import logging
 import os
 import re
+import sys
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -25,14 +26,18 @@ from aiohttp import web
 # binds via sys.modules and defers attribute access to call time, which also
 # keeps tests' monkeypatching of handlers.redact_* effective (late binding).
 import kiro_crew.dashboard.handlers as _h
-from kiro_crew import session_directive
+from kiro_crew import agent_discovery, session_directive
 from kiro_crew.acp.client import _resolve_kiro_bin_for_spawn
 from kiro_crew.agent_discovery import (
     AmbiguousAgentSpecError,
     read_agent_spec_strict,
     spec_by_declared_name,
 )
-from kiro_crew.agent_spec_format import agent_spec_candidates, iter_agent_spec_files
+from kiro_crew.agent_spec_format import (
+    agent_spec_candidates,
+    is_agent_spec_name,
+    iter_agent_spec_files,
+)
 
 # The migration module owns the pre-migration leftover-tab spelling.
 from kiro_crew.channel_transcript_migration import _orphan_target_stem
@@ -66,7 +71,7 @@ from kiro_crew.history import (
 )
 from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.mcp_discovery import sync_discovered_servers
-from kiro_crew.messaging.link import canonical_key
+from kiro_crew.messaging.link import _in_namespace, canonical_key
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
     configured_sandbox_mode,
@@ -1142,6 +1147,63 @@ def _open_slot_transcript_keys(state: DashboardState) -> set[str]:
     return keys
 
 
+#: Session namespaces whose transcripts are a machine run rather than a conversation
+#: anyone addressed. This membership is a PRESENTATION judgement for one pane, not a
+#: shared roster: two other modules carry similar-looking tuples that answer different
+#: questions, and none of the three agree.
+#:
+#: * ``handlers/_shared.py`` — colon-only, wf-family only, to dispatch a memory-mode
+#:   lookup. Includes ``wf-scope``.
+#: * ``handlers/cron.py`` — colon-only, wf-family plus ``subagent``, to answer whether a
+#:   session is live and shared. Omits ``wf-scope``; suspected pre-existing gap in that
+#:   predicate rather than a deliberate exclusion.
+#: * this one — matches PERSISTED folded keys via ``_in_namespace``, adds ``secretary``
+#:   and ``channel``, and deliberately excludes ``cron``, ``side`` and ``taskrunner``
+#:   because each of those holds conversations a reader started.
+#:
+#: So do not hoist the three into one constant: it would force a shared meaning none of
+#: them has, and the next namespace would have to be correct for all three at once.
+#:
+#: It is spelled literally rather than derived from
+#: ``messaging.link._TELEMETRY_LOCAL_PREFIXES`` because that registry exists to bound
+#: telemetry label cardinality, and ``wf-unpooled``, ``wf-worker`` and ``wf-scope`` are
+#: all live session keys absent from it — a derived filter cannot see them.
+#:
+#: Absent on purpose:
+#:
+#: * ``dashboard`` and the channel namespaces (``slack``, ``discord``, …) — the
+#:   reader's own conversations.
+#: * ``cron`` — a job without ``hide_in_chat`` backs a real chat slot, and the key
+#:   does not record which kind wrote it.
+#: * ``side`` — the slot's own side panel, which the reader typed into; ``sel.py``
+#:   attributes ``side:`` to the ``dashboard`` surface for that reason.
+#: * ``taskrunner`` — ``POST /api/taskrunner/{id}/to-chat`` opens a real chat slot on
+#:   ``taskrunner:<task_id>:chat:<token>`` and titles it ``Plan: <task_id>``, so the
+#:   namespace holds conversations as well as runs and the key cannot reliably tell
+#:   them apart. Listing a plain ``taskrunner_`` run is the declared residual, and it
+#:   is the safe one: showing a machine row costs less than hiding a conversation.
+#:
+#: Anything not named here stays listed, which is the direction every residual in
+#: this filter points.
+_MACHINE_NAMESPACES: tuple[str, ...] = (
+    # fmt: off
+    "subagent", "secretary", "channel",
+    "wf", "wf-pool", "wf-unpooled", "wf-worker", "wf-author", "wf-scope"
+    # fmt: on
+)
+
+
+def _is_machine_only_session(key: str) -> bool:
+    """True when *key* sits in a namespace no user ever addressed directly.
+
+    Matched through ``_in_namespace`` because this reads a PERSISTED name:
+    ``history._safe_key`` folds ``subagent:<id>`` to the stem ``subagent_<id>``, so
+    the colon spelling every other subagent guard in the tree uses can never match
+    here. That fold is the whole defect this filter repairs.
+    """
+    return any(_in_namespace(key, ns) for ns in _MACHINE_NAMESPACES)
+
+
 async def api_sessions(request: web.Request) -> web.Response:
     """GET /api/sessions — list conversation session files.
 
@@ -1157,6 +1219,13 @@ async def api_sessions(request: web.Request) -> web.Response:
         both would silently skip the user's active conversations if this
         endpoint decided on their behalf. Only the caller rendering the
         complement of the open tabs asks for it.
+      - ``user_only``: when truthy, drop sessions whose key is in a machine-only
+        namespace (see :data:`_MACHINE_NAMESPACES`). Opt-in for the same reason as
+        ``exclude_open``: a subagent or workflow transcript is still a session the
+        memory-consolidation and recents callers must see. Only the sidebar's
+        Older-sessions pane asks, because it is the surface that presents these
+        rows as a LIST OF CONVERSATIONS — and a machine transcript carries no
+        title, so it renders its own storage key as the row label there.
 
     Returns ``{sessions, total, has_more}`` for pagination.
     """
@@ -1173,6 +1242,7 @@ async def api_sessions(request: web.Request) -> web.Response:
         offset = 0
     want_preview = (request.query.get("preview") or "").lower() in ("1", "true", "yes")
     exclude_open = (request.query.get("exclude_open") or "").lower() in ("1", "true", "yes")
+    user_only = (request.query.get("user_only") or "").lower() in ("1", "true", "yes")
     # list_sessions() globs, stats, and reads the first line of EVERY session file
     # in the history dir — O(all sessions). At 2000 sessions, that's ~200 ms of
     # blocking IO (measured: 208 ms / 2000 files on a dev host). Running that on
@@ -1192,6 +1262,8 @@ async def api_sessions(request: web.Request) -> web.Response:
             for s in all_sessions
             if s.get("key", "") not in open_keys and canon(s.get("key", "")) not in open_keys
         ]
+    if user_only:
+        all_sessions = [s for s in all_sessions if not _is_machine_only_session(s.get("key", ""))]
     # Count AFTER the exclusion so the page, ``total`` and ``has_more`` describe
     # one list. The client advances its offset by the number of rows it received,
     # so filtering on its side instead would skip or repeat rows across pages.
@@ -3533,7 +3605,149 @@ def _refuse_if_any_spec_is_unreadable(agents_dir: Path, agent_name: str) -> None
             ) from exc
 
 
+_SpecStatRevision = tuple[str, int, int, int, int, int, int]
+_AgentsDirRevision = tuple[int, tuple[_SpecStatRevision, ...], int]
+# Resolved policies keyed by agents directory, each entry pinned to the
+# stat-only revision of that directory it was read under. The read below
+# parses EVERY spec in the directory to find one declared name, and refuses
+# only after a second strict pass over all of them; a managed MCP server asks
+# for its policy on ordinary request traffic, so with a couple of thousand
+# installed specs each request costs the worker thread most of a second of
+# GIL-holding path validation and JSON parsing. An unchanged directory answers
+# from here for the price of one ``scandir``. Guarded by a lock: the reads run
+# on ``asyncio.to_thread`` workers.
+_TOOL_POLICY_CACHE_MAX_AGENTS = 256
+# Above this many spec entries the memo is not used, and the read costs what it costs on main.
+_TOOL_POLICY_REVISION_MAX_ENTRIES = 4096
+# ``st_ctime_ns`` is creation time on Windows, so entry metadata cannot prove
+# that an in-place rewrite did not happen; keep the memo disabled there.
+_TOOL_POLICY_MEMO_ENABLED = sys.platform != "win32"
+# Follow the racy-git precedent: metadata younger than this window is untrusted.
+_TOOL_POLICY_RACY_WINDOW_NS = 2_000_000_000
+_TOOL_POLICY_CACHE_LOCK = threading.Lock()
+_TOOL_POLICY_CACHE: dict[str, tuple[_AgentsDirRevision, dict[str, dict[str, Any] | None]]] = {}
+_TOOL_POLICY_REVISION_OVERFLOW_WARNED: set[str] = set()
+
+
+def _agents_dir_revision(agents_dir: Path) -> _AgentsDirRevision | None:
+    """Stat-only fingerprint of *agents_dir*; no spec is opened or parsed.
+
+    The directory's own mtime catches an entry added, removed, renamed or
+    re-linked; each spec entry's name, timestamps, size, identity and mode catch
+    ordinary in-place edits and metadata changes. In-process spec writers also
+    call :func:`~kiro_crew.agent_discovery.clear_list_agents_cache`, which
+    drops this cache too, closing the sub-tick window that made the sibling
+    catalog caches require explicit invalidation. An entry whose mtime or ctime
+    is within the last two seconds is not memoized, so a same-size rewrite that
+    lands in the same filesystem timestamp tick as the previous one cannot be
+    served stale (the racy-git rule).
+
+    A symlinked spec disables the memo because its entry metadata cannot see edits to its target.
+    On Windows the memo is disabled: ``st_ctime_ns`` is creation time there, so
+    entry metadata cannot prove an in-place rewrite did not happen.
+
+    Only entries with a recognised spec suffix (``is_agent_spec_name``) are
+    fingerprinted; that is a superset of what the spec scans parse (a Markdown
+    spec shadowed by its JSON twin is still fingerprinted), so the revision can
+    only be more sensitive than the scan, never less. Adding or removing a stray
+    file still invalidates through the directory mtime, but the stray file itself
+    is omitted from the entry tuples. A ``stat`` that fails records zeros: the
+    entry is still named, so its appearance and disappearance are revisions.
+    """
+    if not _TOOL_POLICY_MEMO_ENABLED:
+        return None
+    try:
+        dir_mtime = agents_dir.stat().st_mtime_ns
+    except OSError:
+        dir_mtime = 0
+    entries: list[_SpecStatRevision] = []
+    try:
+        with os.scandir(agents_dir) as it:
+            for entry in it:
+                if not is_agent_spec_name(entry.name):
+                    continue
+                if entry.is_symlink():
+                    return None
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                    entries.append(
+                        (
+                            entry.name,
+                            st.st_mtime_ns,
+                            st.st_ctime_ns,
+                            st.st_size,
+                            st.st_ino,
+                            st.st_dev,
+                            st.st_mode,
+                        )
+                    )
+                except OSError:
+                    entries.append((entry.name, 0, 0, 0, 0, 0, 0))
+                if len(entries) > _TOOL_POLICY_REVISION_MAX_ENTRIES:
+                    key = str(agents_dir)
+                    with _TOOL_POLICY_CACHE_LOCK:
+                        should_warn = key not in _TOOL_POLICY_REVISION_OVERFLOW_WARNED
+                        _TOOL_POLICY_REVISION_OVERFLOW_WARNED.add(key)
+                    if should_warn:
+                        logger.warning(
+                            "tool-policy memo disabled for %s: %d spec entries exceed %d",
+                            agents_dir,
+                            len(entries),
+                            _TOOL_POLICY_REVISION_MAX_ENTRIES,
+                        )
+                    return None
+    except OSError:
+        pass
+    now = time.time_ns()
+    cutoff = now - _TOOL_POLICY_RACY_WINDOW_NS
+    if dir_mtime > cutoff or any(entry[1] > cutoff or entry[2] > cutoff for entry in entries):
+        return None
+    return dir_mtime, tuple(sorted(entries)), agent_discovery.spec_cache_generation()
+
+
 def _read_managed_tool_policy_sync(agents_dir: Path, agent_name: str) -> dict[str, Any] | None:
+    """:func:`_read_managed_tool_policy_uncached`, answered from the cache while
+    *agents_dir* is unchanged. Blocking; runs on a worker like the read it wraps.
+
+    Only a resolved answer -- a policy, or ``None`` for an agent that has none
+    -- is cached. A refusal (:class:`ManagedToolPolicyUnreadable`,
+    :class:`~kiro_crew.agent_discovery.AmbiguousAgentSpecError`) is re-derived
+    on every call: it names an operator error the caller audits per request,
+    and the state it reports is the one a fix to the directory clears.
+
+    The revision is taken before and after the read. An answer is stored only
+    when the directory revision is the same before and after the read, so a
+    write that lands during the read is never memoized under the revision that
+    preceded it. Two threads missing at once read redundantly and
+    last-write-wins, the same answer from the same revision. One entry per
+    directory: a new revision replaces the whole answer set, and the set is
+    capped so a churn of agent names cannot grow it without bound.
+    """
+    key = str(agents_dir)
+    revision = _agents_dir_revision(agents_dir)
+    if revision is None:
+        return _read_managed_tool_policy_uncached(agents_dir, agent_name)
+    with _TOOL_POLICY_CACHE_LOCK:
+        cached = _TOOL_POLICY_CACHE.get(key)
+        if cached is not None and cached[0] == revision and agent_name in cached[1]:
+            return cached[1][agent_name]
+    policy = _read_managed_tool_policy_uncached(agents_dir, agent_name)
+    revision_after = _agents_dir_revision(agents_dir)
+    if revision_after is None or revision_after != revision:
+        return policy
+    with _TOOL_POLICY_CACHE_LOCK:
+        cached = _TOOL_POLICY_CACHE.get(key)
+        if cached is None or cached[0] != revision:
+            cached = (revision, {})
+            _TOOL_POLICY_CACHE[key] = cached
+        answers = cached[1]
+        if len(answers) >= _TOOL_POLICY_CACHE_MAX_AGENTS:
+            answers.clear()
+        answers[agent_name] = policy
+    return policy
+
+
+def _read_managed_tool_policy_uncached(agents_dir: Path, agent_name: str) -> dict[str, Any] | None:
     """Read one agent's ``managedToolPolicy`` from disk. Blocking.
 
     Split out so the whole filesystem transaction -- the existence probe, the

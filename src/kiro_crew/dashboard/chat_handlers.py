@@ -45,6 +45,7 @@ from kiro_crew.dashboard.chat_auto_tag import maybe_auto_tag
 from kiro_crew.dashboard.chat_delivery import (
     STEER_REQUEUED,
     STEER_STEERED,
+    TURN_ACTOR_META_KEY,
     attachment_meta,
     normalize_send_id,
     queue_for_next_turn,
@@ -941,6 +942,12 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
             slot,
             message,
             directive_user_origin=not bool(request_app),
+            # A queued turn reaches the runner through the DRAIN, so the dispatch
+            # keyword this handler passes for an IMMEDIATE send cannot carry the
+            # actor here. It rides the entry's meta instead, which is what
+            # `_actor_for_queue_items` reads; unstamped, the drain falls back to
+            # `user` and files an app's send as a person's.
+            turn_actor="app" if request_app else "",
             send_id=normalize_send_id(user_meta.get("sendId")) if user_meta else None,
             attachments=attachment_meta(user_meta),
             # The receipt travels whichever way the send went, including the one
@@ -978,6 +985,10 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         if _hold_sid:
             _hold_meta["sendId"] = _hold_sid
         _hold_meta.update(attachment_meta(user_meta))
+        if request_app:
+            # Same reason as the busy-slot queue above: this entry is drained
+            # later, so only its meta can name the actor.
+            _hold_meta[TURN_ACTOR_META_KEY] = "app"
         qid = slot.queue_append(
             message,
             meta=_hold_meta,
@@ -3125,6 +3136,23 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                 {"error": "slot changed during agent resolution", "code": "session_rebound"},
                 status=409,
             )
+    # An adopted slot's `workspace` field is the PEER's, read off its row, in
+    # place of the create default the peer-bound branch above skipped resolving.
+    # Same terms as `agent`: it is a mirror of what the crew committed for a
+    # session it runs -- exactly the value the forwarded agent/workspace picks
+    # write back into this field from the peer's answer. Left at the default, the
+    # slot projected and persisted a workspace name of this machine's choosing
+    # for a conversation whose turns run somewhere else.
+    #
+    # Kept apart from `workspace` on purpose: that variable is still THIS
+    # machine's workspace, and `default_project_dir(workspace)` below derives
+    # the local `project` (file search, @-mentions) from it. Feeding the peer's
+    # name through that lookup would resolve a same-named LOCAL workspace the
+    # crew never meant -- the very hazard that keeps `workspace` out of the
+    # agent-binding resolution for a peer-bound create. So the peer's value
+    # reaches the slot field only, and local `project` / `memory_store`
+    # resolution reads the local default it always did.
+    slot_workspace = peer_meta.get("workspace") or workspace
 
     # Whether this request will MINT a genuinely new slot, decided before
     # get_or_create_slot runs. `name` can address an already-open slot (the
@@ -3163,7 +3191,7 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
             slot = state.get_or_create_slot(
                 name,
                 agent=agent,
-                workspace=workspace,
+                workspace=slot_workspace,
                 model=model,
                 mode=_mode,
                 memory_mode=memory_mode,
@@ -4703,6 +4731,7 @@ async def stop_slot_turn(
             slot._steer_user_origin.pop(_discarded, None)
             slot._steer_admissions.pop(_discarded, None)
             slot._steer_attachment_meta.pop(_discarded, None)
+            slot._steer_decision_strips.pop(_discarded, None)
         slot._pending_steers.clear()
         state.push_slots_update()
         logger.info("Stop (force): hard-killing session for slot %s", name)
@@ -5130,13 +5159,13 @@ async def api_chat_slot_end_wait(request: web.Request) -> web.Response:
 
 
 async def api_chat_slot_interrupt(request: web.Request) -> web.Response:
-    """POST /api/chat/slots/{slot}/interrupt — interrupt current turn and
-    immediately process the next queued message.
+    """POST /api/chat/slots/{slot}/interrupt — run a selected queued message.
 
-    Unlike /stop which clears the queue, this preserves it so the dequeue
-    loop in chat_runner's finally block picks up the next message.
-    Optionally accepts {"queue_id": "..."} to promote a specific queued
-    message to the front before stopping.
+    A running parent turn is stopped while its queue is preserved for the normal
+    tail drain. An idle parent requires ``{"queue_id": "..."}`` and dispatches
+    that selected queue card directly; this is the explicit override for a user
+    who does not want to wait for attached subagents. A running parent accepts
+    ``queue_id`` optionally to promote one card before the preserved queue drains.
     """
     state: DashboardState = request.app["state"]
     name = request.match_info["slot"]
@@ -5155,7 +5184,86 @@ async def api_chat_slot_interrupt(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     if not slot.running:
-        return web.json_response({"ok": True, "info": "not running"})
+        if not slot._queue:
+            return web.json_response({"ok": True, "info": "not running"})
+        refusal = remote_bound_refusal(slot)
+        if refusal is not None:
+            return refusal
+        body, body_err = await read_bounded_json(request, allow_absent=True)
+        if body_err is not None:
+            return body_err
+        assert body is not None  # read_bounded_json returns (dict, None) on success
+        raw_queue_id = body.get("queue_id")
+        if raw_queue_id is not None and not isinstance(raw_queue_id, str):
+            return web.json_response(
+                {"error": "queue_id must be a string", "code": "invalid_queue_id"},
+                status=400,
+            )
+        queue_id = (raw_queue_id or "").strip() or None
+        # The idle bypass is the "run THIS selected card while attached
+        # subagents keep going" action, and nothing else. Requiring an explicit
+        # queue_id keeps `allow_user_during_subagents=True` and the dispatch
+        # itself bound to a card the user picked: without one there is no
+        # selection to justify bypassing the child-work hold, and dispatching
+        # whatever sits at the queue front would run — and acknowledge —
+        # unselected work the user never chose. Reject rather than fall back.
+        if queue_id is None:
+            return web.json_response(
+                {"error": "queue_id required for idle interrupt", "code": "invalid_queue_id"},
+                status=400,
+            )
+        async with slot._lock:
+            # The request body and lock acquisition both yield. A close followed
+            # by same-name recreation during either await must not let this stale
+            # object dispatch work into the replacement's session namespace.
+            if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_interrupt"):
+                return _slot_not_found()
+            if slot.running:
+                return web.json_response(
+                    {"error": "slot started running", "code": "slot_running"}, status=409
+                )
+            if slot._in_stage_execution:
+                return web.json_response(
+                    {"error": "slot is orchestrating", "code": "slot_orchestrating"},
+                    status=409,
+                )
+            if slot._stopping or slot._stop_state != "idle":
+                return web.json_response(
+                    {"error": "a stop is in progress", "code": "slot_stopping"}, status=409
+                )
+            # The body read above can race a cron/workflow rebind on this same
+            # live slot. Re-authorize the session the queued turn will use while
+            # holding the dispatch lock, immediately before starting it.
+            denied = _app_cancel_denied(
+                request, slot, "chat_interrupt", effective_session_key(slot)
+            )
+            if denied is not None:
+                return denied
+            started = await _start_next_queued_turn(
+                state,
+                slot,
+                allow_user_during_subagents=True,
+                required_queue_id=queue_id,
+            )
+        if not started:
+            return web.json_response(
+                {
+                    "error": "queued message is no longer available",
+                    "code": "queue_item_unavailable",
+                },
+                status=409,
+            )
+        sel().log_tool_invocation(
+            session_key=_history_key_for(name),
+            agent=getattr(slot, "agent", "") or "kirocrew",
+            source="dashboard",
+            tool_name="dashboard_interrupt",
+            tool_kind="command",
+            outcome="started",
+            metadata={"slot": name, "queue_id": queue_id},
+        )
+        state.push_slots_update()
+        return web.json_response({"ok": True, "outcome": "started"})
     # Idempotent guard: interrupt already in progress. State alone decides —
     # do NOT also require _stop_event_id: after the early soft_pending claim
     # below, a concurrent request can arrive before the stop card is created
@@ -5804,7 +5912,20 @@ class SlotCloseError(Exception):
 def _release_closed_execution(
     state: DashboardState, slot: "_ChatSlot", session_key: str, execution
 ) -> None:
-    """Release restricted identity after its last consumer and provider stop."""
+    """Release a restricted identity after its last consumer and provider stop.
+
+    A PERSISTENT session's vouch is deliberately retained across this close. The
+    close is non-destructive -- the conversation is saved and recreated from the
+    warm pool when the tab is resumed -- and the ordinary turn-start rebind
+    publishes nothing when the selection is unchanged, so withdrawing here leaves
+    a resumed member session unvouched and refuses its own-store dispatch until
+    its owner re-selects the agent. That refusal belongs to a restart, which
+    empties the map wholesale, not to closing a tab.
+
+    The retained population is bounded by the count cap rather than by a
+    withdrawal here, and eviction falls on the least recently USED entry, so a
+    closed session is the first entry reclaimed instead of a permanent row.
+    """
     from kiro_crew.execution_context import clear_session_execution
 
     if execution is not None and execution.memory_mode != "persistent":

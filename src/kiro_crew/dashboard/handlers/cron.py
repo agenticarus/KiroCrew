@@ -1797,6 +1797,16 @@ async def api_cron_run(request: web.Request) -> web.Response:
     # request into this critical section. (The lookup above awaits, so two
     # concurrent requests can both reach the guard — but only one can pass it,
     # because the guard and the assignment are not separated by an await.)
+    #
+    # A tracked task that has already finished is NOT a run in flight, whatever
+    # the markers say: a run whose task ends without reaching
+    # _run_job_isolated's finally leaves _executing and _running_tasks populated
+    # with nothing on that path to clear them, and this guard alone would then
+    # refuse every manual run of the job until the reaper sweep meets the
+    # finished task (it does the same release, once a sweep). Drop such
+    # leftovers first; the call is synchronous, so the check-and-set stays
+    # await-free, and a task still running keeps the 409 below.
+    state.crons.discard_finished_run(job_id)
     if job_id in state.crons._running_tasks or state.crons.is_running(job_id):
         return web.json_response({"error": "job is already running"}, status=409)
     task = asyncio.create_task(state.crons.run_job(job_id))  # type: ignore[arg-type]
@@ -2505,6 +2515,30 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         )
         return web.json_response(
             {"error": "Memory writes are not allowed in this session mode."},
+            status=403,
+        )
+    # Global persistence switch (memory.persistence_enabled).
+    # Enforced on the route rather than in the learn_add MCP handler so every
+    # transport that posts here (MCP tool, dashboard, direct HTTP) is covered
+    # by the one check. Reads and deletions stay available — the right to
+    # forget survives the switch.
+    if not KiroCrewConfig.load().memory.persistence_enabled:
+        _sel().log_api_access(
+            caller=sk,
+            operation="learn_add",
+            outcome="denied",
+            source="dashboard",
+            resources="persistence_disabled",
+            error="Persistent memory is disabled (memory.persistence_enabled).",
+        )
+        return web.json_response(
+            {
+                "error": "Lesson was NOT saved: persistent memory is disabled "
+                "(memory.persistence_enabled is false). Re-enable it with "
+                "`kirocrew config set memory.persistence_enabled true` to save "
+                "lessons again.",
+                "code": "persistence_disabled",
+            },
             status=403,
         )
     # Validate body fields against the SAME schema the learn_add MCP tool uses

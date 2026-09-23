@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import difflib
+import functools
 import hmac
 import json
 import logging
@@ -61,9 +62,11 @@ from kiro_crew.config.sections import (
     DECISION_BUCKET_MAX,
     DECISION_BUCKET_MIN,
     DECISION_MODEL_ROUTE_TIERS,
+    JUDGE_PROVIDERS,
     STT_LANGUAGE_AUTO,
 )
 from kiro_crew.context_management import RESULT_FILE_MAX_BYTES
+from kiro_crew.dashboard.chat_utils import drained_to_thread
 from kiro_crew.dashboard.handlers._shared import (
     _pip_install_channel_available,
     guard_owner_surface_routes,
@@ -837,29 +840,21 @@ async def api_stt_config(request: web.Request) -> web.Response:
         except Exception:
             return web.json_response({"error": "invalid JSON"}, status=400)
         path = config_path()
-        from kiro_crew.agent import _atomic_json_write  # noqa: F811
+        from kiro_crew.config.loader import ConfigReadError, update_config_locked  # noqa: F811
         from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
 
-        # Serialize the full read-modify-write behind the shared config lock so
-        # concurrent PUTs (or another config writer) can't interleave and clobber
-        # each other's fields, and write atomically (temp + fsync + os.replace)
-        # so a crash mid-write can't leave a corrupt config JSON — matching the
-        # established pattern used by the other config handlers in this module.
-        async with _get_config_lock():
-            try:
-                raw = await asyncio.to_thread(path.read_text, encoding="utf-8")
-                data = json.loads(raw)
-            except FileNotFoundError:
-                data = {}
-            except Exception:
-                # Fail loud on a corrupt config rather than proceeding with {}:
-                # an atomic write from a {} base would durably clobber every
-                # other user setting with an stt-only file. Matches the sibling
-                # config handler in this module, which returns 500 on an
-                # unparseable config instead of silently resetting it.
-                logger.warning("STT config PUT: config.json is unparseable", exc_info=True)
-                return web.json_response({"error": "failed to read config file"}, status=500)
-            stt_section = data.setdefault("stt", {})
+        # The whole read-modify-write runs inside ``update_config_locked``, which
+        # holds the advisory lock on the sidecar ``<path>.lock`` from its read to
+        # its atomic write (temp + fsync + os.replace), so a writer in ANOTHER
+        # PROCESS cannot land between the two and a crash mid-write cannot leave
+        # a corrupt file. The in-process ``_get_config_lock()`` serializes the
+        # PUTs of this gateway with its other config writers. ``fresh`` is the
+        # file as read under that lock, not a snapshot taken before it.
+        def _apply_stt(fresh: dict) -> dict:
+            stt_section = fresh.get("stt")
+            if not isinstance(stt_section, dict):
+                stt_section = {}
+                fresh["stt"] = stt_section
             if "enabled" in body:
                 stt_section["enabled"] = bool(body["enabled"])
             # Guard the type before either membership lookup.  The model catalog
@@ -934,8 +929,24 @@ async def api_stt_config(request: web.Request) -> web.Response:
             )
             if idle_evict is not None:
                 stt_section["idle_evict_secs"] = idle_evict
-            await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
-            await asyncio.to_thread(_atomic_json_write, path, data)
+            return fresh
+
+        async with _get_config_lock():
+            # Off-loop: file IO under a lock another process may hold. Drained,
+            # so a cancelled PUT cannot release the config lock while the thread
+            # is still rewriting the file.
+            try:
+                await drained_to_thread(
+                    functools.partial(update_config_locked, path, mutate=_apply_stt)
+                )
+            except ConfigReadError:
+                # Fail loud on a corrupt config rather than proceeding with {}:
+                # a write from a {} base would durably clobber every other user
+                # setting with an stt-only file. Matches the sibling config
+                # handler in this module, which returns 500 on an unparseable
+                # config instead of silently resetting it.
+                logger.warning("STT config PUT: config.json is unparseable", exc_info=True)
+                return web.json_response({"error": "failed to read config file"}, status=500)
         cfg = KiroCrewConfig.load()
 
     provider = cfg.stt.provider
@@ -2597,6 +2608,32 @@ for _tier in DECISION_MODEL_ROUTE_TIERS:
         "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
         "validate_fn": _validate_role_model,
     }
+
+
+# The wake judge's two per-point settings. In the editable set where
+# ``provider.*`` is not, and the difference is what each one decides: the endpoint
+# chooses WHERE collected state is sent and ``api_key`` is schema-sensitive, while
+# neither of these widens anything. Which judge answers is a choice between two
+# destinations the machine is already authorized for -- Jev behind the keystone,
+# or the model provider every turn already uses -- and the point itself is armed by
+# its own consent scope, not by either of these keys.
+#
+# ``provider`` is a closed enum, so a typo is a refusal rather than a silently
+# different judge. ``llm_model`` takes the same grammar and the same entitlement
+# validation as the ``agent.role_models.*`` pins and the ``decisions.model_route``
+# tiers, because the vocabulary is identically unknowable up front: the id must be
+# one the provider advertises to this account, and ``JUDGE_MODEL_DEFAULT`` INHERITS
+# (the judge keeps the model its agent already resolves).
+_EDITABLE_CONFIG["decisions.nudge_wake.provider"] = {
+    "type": "enum",
+    "values": list(JUDGE_PROVIDERS),
+}
+_EDITABLE_CONFIG["decisions.nudge_wake.llm_model"] = {
+    "type": "str",
+    "max_len": 64,
+    "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+    "validate_fn": _validate_role_model,
+}
 
 
 def _beacon_governance_pinned_off() -> bool:

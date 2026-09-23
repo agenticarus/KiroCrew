@@ -79,6 +79,20 @@ the peer's `POST /api/chat/slots` payload, while agent and model remain sparse
 explicit picks. Omitting the mode would let a local Incognito or Temporary row
 execute as Persistent on the peer and read or write memory the user disabled.
 
+A slot ADOPTED from a peer row (`POST /api/chat/slots` with `adopt_remote_slot`)
+inherits `agent`, `title`, `memory_mode` and `workspace` from that row
+(`remote_adopt.peer_row_metadata()`). `workspace` is a mirror of the value the
+peer committed for the session it runs, the same value the forwarded
+agent/workspace picks write back into the field afterwards, so the projection
+and the persisted record name the workspace the turns actually run in rather
+than this machine's create default. It is not a local binding: the peer-bound
+create skips this machine's agent-binding resolution, `default_project_dir` is
+still fed the local default (so `project` and `memory_store` never resolve from
+a peer's name), and the relay hands every turn to the peer before the local turn
+path reads the field. Every control in `remote_relay._PEER_CONTROL_SEGMENTS` is
+classified in `remote_adopt.ADOPT_SEEDED_CONTROLS` / `ADOPT_UNSEEDED_CONTROLS`,
+and a structural test fails for a new forwardable control until it is placed.
+
 Cross-boundary calls that were observable on `SessionManager` route back through
 the facade, and patchable module dependencies are resolved through injected
 call-time functions. Persistence remains owned by the existing `SessionMap`
@@ -167,7 +181,14 @@ member memory binding, history key, caller model and approval policy. An explici
 or resumed cwd wins; otherwise the member's configured workspace is used. A cwd
 that disagrees with the saved Parent identity refuses startup.
 When no caller model is supplied, allocation resolves the member's model pin by
-its canonical alias, including members that have not enrolled capabilities.
+its canonical alias, including members that have not enrolled capabilities. The id
+it hands the provider is stamped on the registered session, because the allocation
+returns only the provider and its first-turn observation: a caller recording what
+the session was asked to run reads that stamp
+(`SessionManager.allocation_requested_model`) rather than resolving a second time,
+so the id sent and the id recorded are one value. An empty stamp means the
+allocation resolved nothing, or that a registration site which resolves no models
+made the session.
 
 Enrolled allocations bypass warm and shared processes. Full-spec loading is
 supported by the dedicated Kiro backend; other harnesses refuse explicitly rather
@@ -292,7 +313,8 @@ prevent.
 Two conditions displace the cached `_bg_runtime`: a **backend switch** and
 **staleness** (`AcpRuntime._is_stale()` → `"age"` past 6h, or `"rss"` past
 500 MiB across the descendant tree). The displacement policy has ONE
-implementation, `_detach_bg_runtime_locked(runtime, cause)`: the runtime is
+implementation, `_detach_bg_runtime_locked(runtime, cause, *, park_only=False)`:
+the runtime is
 killed if idle, and **parked on `_draining_bg_runtimes` if it has live or
 initializing handles** — parked runtimes never receive a new session (only
 `_bg_runtime` is offered to callers), their in-flight work finishes untouched
@@ -326,9 +348,34 @@ Parked runtimes stay shielded from the orphan-PID sweep
 (`_companion_runtime_pids`), block the account-identity sweep's completeness
 (`_retire_kiro_bg_runtime`) while they drain, and are reaped by a periodic
 watchdog hook (`bg_drain_reap`) as the backstop for an idle gateway where no
-other trigger runs. `close_all()` detaches both holders atomically under
+other trigger runs.
+
+That same hook carries the **idle-staleness sweep**,
+`reap_idle_stale_bg_runtime()`, and it is not housekeeping. Both displacement
+triggers above live on the REUSE path in `get_bg_session()`, and the shared
+runtime's pid is sweep-shielded for its whole life, so a runtime that stops being
+reused is never asked `_is_stale()` again and is reaped by nothing else: it lives
+until the gateway restarts. Measured on an operator host: 11 agent runtimes
+holding 6.0 GB, six of them 14.5 h old and five of those over the 500 MiB
+ceiling, against 4 live slots. The sweep asks the question off the reuse path,
+under `_bg_runtime_lock`, and retires only a runtime with NO active or
+initializing session.
+
+It PARKS rather than kills, through `_detach_bg_runtime_locked(..., park_only=True)`,
+and that flag exists for one reason: `get_bg_session()` pins the runtime under
+the lock, RELEASES the lock, and only then calls `create_session`, which is where
+`_session_inits_in_flight` rises. A kill inside that window surfaces as
+`AcpRuntimeDead` on a caller that did nothing wrong; parking cannot, because the
+drain reaper re-probes on a later tick, by which time the pinned start has either
+registered (busy — it stays parked) or failed. The slot is re-read after the
+awaited staleness probe, so a concurrent displacement that replaced it is never
+acted on with the old reading. Both probes fail toward PRESERVING the runtime: a
+session or staleness probe that raises retires nothing.
+
+`close_all()` detaches both holders atomically under
 `_bg_runtime_lock` and kills the detached snapshot; its counterpart `_closing`
-gate in `get_bg_session()` refuses to spawn or park once shutdown has started.
+gate in `get_bg_session()` — and in the idle-staleness sweep — refuses to spawn
+or park once shutdown has started.
 Note there is currently no dashboard edit surface for
 `agent.acp_backend`, but a file or CLI edit does not wait for the next gateway
 start: the config watcher dispatches it as a `_FACTORY_CONFIG_PATHS` change, so
@@ -1327,6 +1374,10 @@ The `side:` prefix is included so
 `/side` conversations never resume across KiroCrew restarts — each cold-start
 triggers `is_first_turn=True` in `build_side_message` which re-seeds the
 parent snapshot + accumulated side history.
+The `thread:` prefix (a reply thread on a crewmate chat message,
+[history](history.md#reply-threads-on-crewmate-chat-messages-dashboardchat_threadspy))
+is included for the same reason: `build_thread_message` re-seeds the whole
+envelope on a cold session.
 
 **Lifecycle:**
 - `get_or_create()`: looks up mapping → if found and `.json` file exists,
@@ -2036,6 +2087,15 @@ Legacy bare-thread Slack keys are unaffected — they keep the
 `canonical_key`/`legacy_key` shim. The DM channels are recent, so the key shape
 carries no prior persisted history to migrate.
 
+Slack does not use this key shape even for its own DMs. `slack.dm_single_session`
+gives a 1:1 DM one session by keying it `slack:<channel_id>`
+(`slack.transport_dispatch.flat_dm_session_key`) rather than by minting a
+four-segment bucket: a two-segment Slack key is what the existing thread keys
+already are, so the fold shim, the thread index and every caller that
+reverse-derives from a Slack key keep working unchanged. It carries no
+generation suffix, so the idle/daily rotation above does not apply — a flat DM
+relies on ordinary context compaction instead.
+
 ### Mid-turn messages (steer / queue)
 
 `SessionManager.is_busy(key)` reports whether a turn holds the session
@@ -2096,6 +2156,30 @@ so absence clears it.
   `_dirty_gen` to spot a concurrent mark: without it a refused pass would drop
   window rows it never wrote, and the queue signal cannot cover them once the
   overtaking writer has satisfied it.
+
+- **Run now dispatches an idle queued card; it does not cancel child work.**
+  `POST /api/chat/slots/{slot}/interrupt` keeps its stop-and-preserve behavior
+  while the parent turn is running. When the parent is idle, the endpoint
+  **requires** an explicit `queue_id` naming the selected card: it revalidates
+  that exact card and starts it directly. A missing, empty, or non-string
+  `queue_id` on the idle path is rejected with `400 invalid_queue_id` — the
+  bypass exists only to run a card the user chose, so it never falls back to the
+  queue front or dispatches unselected work. The running path leaves
+  `queue_id` optional: a running-parent interrupt is a stop-and-preserve, and
+  the `queue_id` there only promotes the matching card to the front, so a value
+  that matches no card is a no-op rather than a refusal.
+  This explicit action bypasses only the background-subagent user-message hold;
+  an active stage, a stop in progress, or a remote-bound slot still refuses it.
+  Attached subagents keep running, and their later completion injections use the
+  ordinary busy-slot queue. If admission revalidation removed the selected card,
+  the endpoint returns `409 queue_item_unavailable` so the client releases its
+  pending-action latch instead of treating a no-op as accepted. Interrupt requests
+  that produce a command outcome are audited to the SEL as a
+  `dashboard_interrupt` command: the idle dispatch logs `outcome="started"`, a
+  running press logs the `stop_turn` outcome (`soft` / `hard` / `idle`), and a
+  superseded or already-in-progress press logs `outcome="noop"`. Requests
+  rejected before a command outcome, including validation and idle-dispatch
+  race refusals, are recorded by the generic mutating-API audit instead.
 
 - **Only a plain user prompt is durable.** An entry carrying a `kind` is an
   injection whose producer is gone (a cron notification names an event, and a
@@ -2670,6 +2754,27 @@ a trust root on its own; publication therefore also writes a
   it would trade a disk saving against the read-then-unlink window in which a
   new owner's `publish_session_pid` can land, and losing a live mapping costs
   that session its identity until its next turn republishes.
+- **Legacy per-pid member-memory bindings**
+  (`SessionCleanup._sweep_member_pid_bindings` →
+  `member_memory_auth.prune_legacy_member_pid_bindings`):
+  `<crew home>/member-memory-bindings/pids/<pid>.json` and
+  `<pid>.namespace.json` are records a routing path this version no longer
+  carries wrote one of per agent process. Nothing deleted them and no sweep
+  collected them, so they accumulate for the install's life — measured on an
+  operator host at 165,975 files spanning nine days and 24 MB of directory
+  inode, of which 165,816 named no live process. The same periodic tick that
+  retracts session-pid mappings now collects them, on the maintenance executor
+  for the same `no-blocking-call-on-event-loop` reason (the directory is same-uid
+  agent-writable). A record goes only when it is BOTH older than
+  `_LEGACY_PID_BINDING_MIN_AGE_SECS` (24 h) AND its pid names no live process:
+  age alone would race a record just written, and a dead-pid test alone would
+  delete a record whose number has been recycled away from a still-running owner,
+  so requiring both is what makes the prune safe against pid reuse in either
+  direction. Symlinks are neither followed nor removed, unrecognised names are
+  left alone (this sweep owns exactly the shape it can attribute to a pid), and
+  each pass is capped at `_LEGACY_PID_BINDING_PRUNE_BUDGET` (2000) so a
+  six-figure backlog drains over passes instead of monopolising one maintenance
+  task.
 - **Member execution routing**: the ordinary session/run owner record carries
   the immutable member/store snapshot. Strict MCP caller identity still uses
   the existing transport token and signed `session_pid` publication. No separate

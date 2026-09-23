@@ -1859,7 +1859,10 @@ class SessionConfig:
         metadata=_meta(
             "Archive Retention (days)",
             "Days to keep compacted/rotated session archives before auto-cleanup. "
-            "-1 disables cleanup (manage deletion manually).",
+            "-1 disables cleanup (manage deletion manually). The same window collects "
+            "a closed session's crew log, and with the crew log on that is where "
+            "Issue Radar keeps each repository's shared skip memory and its crews' "
+            "open work items.",
             nullable=True,
         ),
     )
@@ -2199,6 +2202,34 @@ class MemoryConfig:
             "Values below 1 are treated as 1 so retention cannot empty the directory.",
         ),
     )
+    persistence_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Persistence Enabled",
+            "Global switch for persistent memory. Off: no automatic memory "
+            "writes (lessons, consolidation extraction, task-runner lessons) "
+            "and no stored memory/lessons injected into new sessions; "
+            "within-conversation context is unaffected. Explicit dashboard "
+            "edits and deletions stay available. An installed app's own "
+            "ingestion sweep is out of scope and still writes app-scoped rows.",
+        ),
+    )
+    inject_memory: bool = field(
+        default=True,
+        metadata=_meta(
+            "Inject Memory Context",
+            "Inject the stored memory block (preferences, the memory activity "
+            "index and recent-session snippets) into new-session context. "
+            "On-demand memory_recall is unaffected.",
+        ),
+    )
+    inject_lessons: bool = field(
+        default=True,
+        metadata=_meta(
+            "Inject Lessons Context",
+            "Inject the learned-corrections and user-profile blocks into " "new-session context.",
+        ),
+    )
     migrated: bool = field(
         default=False,
         metadata=_meta("Migrated", "Whether memory has been migrated to vector store."),
@@ -2532,6 +2563,18 @@ class SlackConfig:
             "Show Thinking",
             "Post the model's thinking/reasoning as a thread reply in Slack. "
             "Disable to keep responses concise.",
+            tags=["slack"],
+        ),
+    )
+    dm_single_session: bool = field(
+        default=False,
+        metadata=_meta(
+            "DM Single Session",
+            "Treat each 1:1 DM as one continuous conversation instead of starting "
+            "a new session per top-level message. Replies post at channel root "
+            "rather than in a thread. Threaded replies, group channels and group "
+            "DMs are unaffected. Off by default: turning it on routes the next DM "
+            "to a different session than the previous one.",
             tags=["slack"],
         ),
     )
@@ -5762,12 +5805,13 @@ DECISION_PROVIDER_MODEL_DEFAULT = "jev-latest"
 # a message count, because what it bounds is the size of the request that leaves
 # the machine -- a count bounds neither.
 #
-# The default is 0, and that is the whole point: consent is recorded against what
-# the owner reviewed, and the text they reviewed says the message excerpt and the
-# candidate descriptions leave the machine. Shipping prior turns under that
-# standing grant would widen egress with no new choice, so an owner who wants the
-# conversation sent raises this themselves.
-DECISION_HISTORY_BUDGET_DEFAULT = 0
+# The default covers the last two or three turns, which is what a request like "do
+# the B comparison drawer" needs for the oracle to know what "B" names. It widens
+# nothing on its own: the gate sends ``min(this, the consent keystone's ceiling)``,
+# and that ceiling is 0 until the owner reviews a prior-turn number, so an install
+# whose consent names only the message excerpt and the candidate descriptions
+# carries the current message alone.
+DECISION_HISTORY_BUDGET_DEFAULT = 2000
 
 # The tiers ``model.route`` may answer with, and the model each maps to by default.
 # The keys are the point's CLOSED answer domain
@@ -5811,6 +5855,86 @@ def coerce_model_route(raw: object) -> dict[str, str]:
     """
     section = raw if isinstance(raw, dict) else {}
     return {tier: normalize_agent_model(section.get(tier)) for tier in DECISION_MODEL_ROUTE_TIERS}
+
+
+# The providers ``decisions.nudge_wake.provider`` may name. ``auto`` resolves at
+# decision time -- Jev when the keystone consents to it, the LLM lane otherwise --
+# so a machine that later gains or loses a Jev key needs no config edit.
+JUDGE_PROVIDER_AUTO = "auto"
+JUDGE_PROVIDER_JEV = "jev"
+JUDGE_PROVIDER_LLM = "llm"
+JUDGE_PROVIDERS = (JUDGE_PROVIDER_AUTO, JUDGE_PROVIDER_JEV, JUDGE_PROVIDER_LLM)
+
+
+@dataclass
+class NudgeWakeConfig:
+    """Per-point settings for the wake judge (``decisions`` point ``nudge.wake``).
+
+    Deliberately carries NO ``enabled``. There is no feature toggle, because the two
+    lanes are authorized by different things and neither of them is a toggle:
+
+    * The Jev lane needs the Decisions keystone in full -- the main switch AND this
+      point's own ``nudge_evidence`` scope, because that scope names a category of
+      egress to the Jev endpoint. Config cannot grant it and this section cannot
+      widen it.
+    * The ``llm`` lane needs no consent row, so ``provider = llm`` plus a ``judge``
+      spec on the loop is what runs it. What makes that safe is not that config is
+      trusted: the lane adds no destination and no data class. It sends to the model
+      provider the owner's sessions already send to every turn, carrying a scrubbed,
+      bounded subset of the owner's own children's transcripts, which that provider
+      already received when those sessions ran. The judge only chooses QUIET against
+      firing and is fail-open, so the worst case is one delayed wake, bounded by the
+      quiet-streak floor.
+
+    Hot-applied: the gate reads the live snapshot per call.
+    """
+
+    provider: str = field(
+        default=JUDGE_PROVIDER_AUTO,
+        metadata=_meta(
+            "Judge provider",
+            "Which judge answers at nudge.wake: 'jev' (the System One model this "
+            "card's consent switch covers), 'llm' (a small text-only model on the "
+            "provider this machine already uses, no extra key needed), or 'auto' "
+            "-- Jev when consent stands for it, otherwise the small model. "
+            "Anything else reads as 'auto'. Choosing 'jev' without that consent "
+            "sends nothing and every tick fires as it does today.",
+        ),
+    )
+    llm_model: str = field(
+        default="",
+        metadata=_meta(
+            "Judge model (LLM lane)",
+            "The model id the 'llm' lane runs on, spelled as your provider "
+            "advertises it. EMPTY INHERITS: the judge keeps the model its "
+            "background agent already resolves, which is the default. A value that "
+            "is not a short model id is ignored rather than sent.",
+        ),
+    )
+
+    @classmethod
+    def from_raw(cls, section: object) -> "NudgeWakeConfig":
+        """Normalize rather than reject, the posture the whole section takes.
+
+        Every unreadable value resolves to the shipped default. Neither key can reach
+        a destination the session does not already send to, so a hand-edit that fails
+        to parse costs a preference, not a permission.
+        """
+        if not isinstance(section, dict):
+            return cls()
+        raw_provider = section.get("provider")
+        provider = raw_provider.strip().lower() if isinstance(raw_provider, str) else ""
+        raw_model = section.get("llm_model")
+        return cls(
+            # An unknown name reads as ``auto`` rather than as an error: a typo must
+            # not become a third lane and must not stop the gateway booting.
+            provider=provider if provider in JUDGE_PROVIDERS else JUDGE_PROVIDER_AUTO,
+            # Kept verbatim (stripped) and validated where it is USED, against
+            # ``decisions.types.MODEL_ID_RE``: storing "" for an id this build
+            # cannot use would make the saved config disagree with what the operator
+            # wrote, and the bound that matters is at the call that names a model.
+            llm_model=raw_model.strip() if isinstance(raw_model, str) else "",
+        )
 
 
 @dataclass
@@ -5902,11 +6026,11 @@ class DecisionsConfig:
             "How many characters of PRIOR conversation one decision may carry, on "
             "top of the current message. Earlier user and assistant turns are added "
             "newest-first until this many characters are spent and the last one is "
-            "clipped to fit; tool output is never sent. The default is 0 -- no prior "
-            "turns -- because consent is recorded against the text the owner "
-            "reviewed, which names the message excerpt and the candidate "
-            "descriptions; raising this widens what leaves the machine, so it is a "
-            "choice rather than an upgrade. A negative value reads as 0.",
+            "clipped to fit; tool output is never sent. The default is 2000, about "
+            "the last two or three turns, and the consent keystone caps it: the gate "
+            "sends the smaller of the two, so an install whose owner reviewed no "
+            "prior-turn ceiling sends no prior turns at all. A negative value reads "
+            "as 0.",
         ),
     )
     model_route: dict[str, str] = field(
@@ -5932,6 +6056,17 @@ class DecisionsConfig:
     provider: DecisionProviderConfig = field(
         default_factory=DecisionProviderConfig,
         metadata=_meta("Provider", "Where decisions are sent and what they may cost."),
+    )
+    nudge_wake: NudgeWakeConfig = field(
+        default_factory=NudgeWakeConfig,
+        metadata=_meta(
+            "Wake judge",
+            "Per-point settings for nudge.wake: which judge answers, and the model "
+            "id for the small-model lane. The Jev lane still needs this point's "
+            "consent scope on the Decisions card; the small-model lane needs no "
+            "consent row, because it sends to the model provider your sessions "
+            "already use, so picking it here is what runs it.",
+        ),
     )
 
     @classmethod
@@ -5999,10 +6134,11 @@ class DecisionsConfig:
                 DECISION_BUCKET_MIN,
                 DECISION_BUCKET_MAX,
             ),
-            # Unreadable reads as the DEFAULT, which for this key is 0 -- the same
-            # direction a malformed bucket takes, because both decide how much
-            # conversation leaves the machine and neither may fail open. Floored at
-            # 0 so a negative number cannot read as unbounded.
+            # Unreadable reads as the DEFAULT, the same direction a malformed
+            # bucket takes. That cannot fail open for this key: the gate holds the
+            # configured number against the consent keystone's ceiling, so an
+            # unreadable value still sends at most what the owner reviewed. Floored
+            # at 0 so a negative number cannot read as unbounded.
             history_budget_chars=_safe_int(
                 section.get("history_budget_chars", DECISION_HISTORY_BUDGET_DEFAULT),
                 DECISION_HISTORY_BUDGET_DEFAULT,
@@ -6014,6 +6150,7 @@ class DecisionsConfig:
             # against the provider's advertised list at routing time.
             model_route=coerce_model_route(section.get("model_route")),
             provider=provider,
+            nudge_wake=NudgeWakeConfig.from_raw(section.get("nudge_wake")),
         )
 
 
@@ -7774,6 +7911,25 @@ class WakaTimeConfig:
             "Override the WakaTime API base URL for a self-hosted, "
             "API-compatible backend (Wakapi, Hackatime). Empty uses the public "
             "WakaTime API at https://wakatime.com/api/v1.",
+            tags=["wakatime"],
+        ),
+    )
+    send_heartbeats: bool = field(
+        default=False,
+        metadata=_meta(
+            "Send coding-activity heartbeats",
+            "Send a heartbeat to WakaTime after each agent turn that edited "
+            "files or ran a command, so your Kiro Crew coding time shows up in "
+            "WakaTime alongside your editor. Off by default: sending activity "
+            "outward is a separate opt-in from reading your own stats. Requires "
+            "the WakaTime integration to be enabled. Covers dashboard chat and "
+            "dashboard-linked Slack threads; the other messaging channels "
+            "(Telegram, Discord, Teams, WhatsApp and the rest), the task "
+            "runner, subagents, installed apps, and the standalone kirocrew "
+            "chat CLI each run their own turn loop and do not emit heartbeats "
+            "yet. Incognito and temporary sessions never send one: they keep "
+            "no record of the chat, and a heartbeat is an external record of "
+            "it.",
             tags=["wakatime"],
         ),
     )

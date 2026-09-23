@@ -76,6 +76,14 @@ from kiro_crew.crew_log.schema import KIND_SESSION
 # functions that need it, so nothing here pulls the storage package onto the
 # gateway's boot path.
 from kiro_crew.session_ledger import EVENT_KINDS as _LEDGER_EVENT_KINDS
+from kiro_crew.work_vocab import (
+    WORK_ACTIONS,
+    WORK_ACTORS,
+    WORK_EVENT_KINDS,
+    WORK_ITEM_STATES,
+    WORK_VERDICTS,
+    WORK_WORKER_STATUSES,
+)
 
 #: JSON types a declared field may hold. ``int`` and ``float`` are separate
 #: because the wire format's numbers are separate to a reader: a count is not a
@@ -178,6 +186,128 @@ ACTOR_VALUES: tuple[str, ...] = (
 #: The ledger's event kinds, in a stable order for the reference tables. Derived
 #: from the writer's own set so the two cannot drift.
 _EVENT_KIND_VALUES: tuple[str, ...] = tuple(sorted(_LEDGER_EVENT_KINDS))
+#: The Issue Radar crew ledger's entry type, and the closed vocabularies its
+#: fields clamp to. DECLARED HERE, in the registry, and imported by the app that
+#: writes them: the crew log is core and the app depends on core, so the direction
+#: an app-owned copy would need (core importing an app module to learn what
+#: ``phase`` may hold) is the wrong one. The app re-exports these under its own
+#: names so its callers and the fold in ``projection`` read one set of values.
+RADAR_ENTRY_TYPE = "radar/recorded"
+
+#: Work-item phases. Two classifications hang off this enum and do not coincide:
+#: the TTL-active phases age toward the claim TTL, and the editing phases are the
+#: ones a crew may hold at most ONE item in. Neither can be collapsed into a bool
+#: on the record, which is why both sets are named beside the enum.
+RADAR_PHASES: tuple[str, ...] = (
+    "selected",
+    "claimed",
+    "investigating",
+    "implementing",
+    "awaiting-ci",
+    "addressing-review",
+    "awaiting-merge",
+    "awaiting-reply",
+    "resolved",
+    "skipped",
+    "yielded",
+    "handed-back",
+    "preempted",
+)
+RADAR_TERMINAL_PHASES: frozenset[str] = frozenset(
+    {"resolved", "skipped", "yielded", "handed-back", "preempted"}
+)
+RADAR_TTL_ACTIVE_PHASES: frozenset[str] = frozenset({"claimed", "investigating", "implementing"})
+RADAR_EDITING_PHASES: frozenset[str] = frozenset({"implementing", "addressing-review"})
+
+#: Progress-line kinds. ``sweep`` is the one kind that belongs to no issue: it
+#: records that the crew looked at the queue and took nothing, so it is the only
+#: kind an entry without ``number`` may carry, and it never carries one.
+RADAR_EVENT_KINDS: tuple[str, ...] = (
+    "claim",
+    "investigate",
+    "reply",
+    "implement",
+    "ci",
+    "review",
+    "conflict",
+    "merge",
+    "handback",
+    "skip",
+    "yield",
+    "sweep",
+)
+RADAR_CREW_LEVEL_EVENT_KIND = "sweep"
+
+#: Why an issue was passed over. Closed so a crew can calibrate against the
+#: recent passes and a human can see whether they cluster; an unrecognised value
+#: is coerced to ``other`` by the writer before the entry is built.
+RADAR_SKIP_SCOPES: tuple[str, ...] = (
+    "architecture",
+    "new-feature",
+    "needs-design",
+    "needs-decision",
+    "needs-investigation",
+    "duplicate",
+    "already-fixed",
+    "not-reproducible",
+    "wrong-root-cause",
+    "breaking-change",
+    "gate-config",
+    "other",
+)
+RADAR_DEFAULT_SKIP_SCOPE = "other"
+
+#: Work-item fields an update may CLEAR by name. An explicit ``null`` in a record
+#: call means "empty this field", and a typed field cannot carry a null, so the
+#: writer lists the cleared names here instead; the fold empties each one.
+RADAR_CLEARABLE_FIELDS: tuple[str, ...] = (
+    "decision",
+    "why",
+    "next",
+    "worktree",
+    "branch",
+    "base_sha",
+    "pr_number",
+    "claim_comment_id",
+    "ci_state",
+    "labels_applied",
+    "outcome",
+)
+
+#: The members a CI reading carries. The fold keeps these and NO other key, so a
+#: reading merged into an item key by key cannot grow the item by key; the route
+#: assembles exactly these from the record tool's flat ``ci_*`` arguments.
+RADAR_CI_KEYS: tuple[str, ...] = ("state", "passed", "total", "round", "inherited_reds")
+
+#: Each CI member's type and ceiling -- the record tool's own bounds on its ``ci_*``
+#: arguments (``validation.py``), restated here so the fold re-applies them to the
+#: bytes it reads and the carry applies them to a pre-projection file: a string
+#: verdict clipped to its length, a counter kept only as a non-negative int within
+#: the tool's range. A test pins this table against the tool's field specs.
+RADAR_CI_BOUNDS: dict[str, tuple[type, int]] = {
+    "state": (str, 32),
+    "passed": (int, 100_000),
+    "total": (int, 100_000),
+    "round": (int, 1_000),
+    "inherited_reds": (int, 100_000),
+}
+
+#: The most labels an item retains -- the record tool's own ``max_items`` on
+#: ``labels_applied``, re-applied by the fold to the bytes it reads.
+RADAR_LABELS_LIMIT = 20
+
+#: Each retained numeric field's inclusive range -- again the record tool's own
+#: ``min_val``/``max_val``, restated so the fold bounds the MAGNITUDE of a number it
+#: reads off a file, not only its type. Without this a single crafted or damaged line
+#: carrying a thousand-digit ``number`` is retained verbatim, and an item or skip row
+#: keyed on ``str(number)`` then carries those digits into every checkpoint and
+#: response for as long as the row survives. A test pins this table against the tool's
+#: field specs.
+RADAR_NUMBER_BOUNDS: dict[str, tuple[int, int]] = {
+    "number": (1, 1_000_000_000),
+    "pr_number": (1, 1_000_000_000),
+    "claim_comment_id": (1, 10**18),
+}
 
 #: The members of a session's recorded class, shared by the opening entry's
 #: ``class`` object and by ``session/class``. One tuple rather than two identical
@@ -242,6 +372,9 @@ _SESSION_CLASS_FIELDS: tuple[Field, ...] = (
 OBJECT_PRODUCER_PROBE = "probe"
 OBJECT_PRODUCERS: tuple[str, ...] = (OBJECT_PRODUCER_PROBE,)
 
+#: The conductor work board's vocabularies live in :mod:`kiro_crew.work_vocab`, a
+#: pure-data leaf outside this package, so the type declared below, the store and
+#: the tool schemas clamp to ONE set without the boot path loading this module.
 _SESSION_TYPES: tuple[EntryType, ...] = (
     # -- session, turn ------------------------------------------------------ #
     EntryType(
@@ -1116,6 +1249,335 @@ _SESSION_TYPES: tuple[EntryType, ...] = (
             "record carrying its producer is what a reader can trust about an object "
             "outside the session; the agent's own report about that object is a "
             "message/sent entry and is evidence of nothing but the report."
+        ),
+    ),
+    # -- radar (Issue Radar crew ledger) ------------------------------------ #
+    EntryType(
+        RADAR_ENTRY_TYPE,
+        "One Issue Radar crew-ledger update: the work-item fields it set, and the event explaining them.",
+        (
+            Field("crew_id", JSON_STRING, required=True, note="The crew this update belongs to."),
+            Field("owner", JSON_STRING, required=True, note="Repository owner the crew works in."),
+            Field("repo", JSON_STRING, required=True, note="Repository name the crew works in."),
+            Field(
+                "number",
+                JSON_INT,
+                note=(
+                    "The issue this update is about. ABSENT on a crew-level step (a queue "
+                    "sweep that took nothing), which is the only kind of entry that patches "
+                    "no work item."
+                ),
+            ),
+            Field(
+                "phase",
+                JSON_STRING,
+                enum=RADAR_PHASES,
+                enum_closed=True,
+                note=(
+                    "The item's new phase. Never written without event and event_kind, which "
+                    "is what makes the phase-requires-a-reason rule a property of ONE entry."
+                ),
+            ),
+            Field("outcome", JSON_STRING, note="Terminal outcome; an empty string clears it."),
+            Field("decision", JSON_STRING, note="What the crew decided to do."),
+            Field("why", JSON_STRING, note="On what grounds."),
+            Field("next", JSON_STRING, note="The resumable intent -- the concrete next step."),
+            Field(
+                "tried",
+                JSON_OBJECT,
+                fields=(
+                    Field("approach", JSON_STRING, required=True, note="What was tried."),
+                    Field("rejected_because", JSON_STRING, note="Why it was rejected."),
+                ),
+                note="One rejected approach, appended to the item's list.",
+            ),
+            Field("worktree", JSON_STRING, note="Local only; never echoed into a comment."),
+            Field("branch", JSON_STRING, note="Local only."),
+            Field("base_sha", JSON_STRING, note="Local only."),
+            Field("pr_number", JSON_INT, note="The pull request this item opened."),
+            Field(
+                "ci_state",
+                JSON_OBJECT,
+                note=(
+                    "CI reading merged into the item's ci_state map, key by key. Members "
+                    "are state, passed, total, round, inherited_reds; the fold keeps no "
+                    "other key."
+                ),
+            ),
+            Field("claim_comment_id", JSON_INT, note="Which forge comment carries the claim."),
+            Field(
+                "labels_applied",
+                JSON_ARRAY,
+                item_type=JSON_STRING,
+                note="Labels this crew put on the issue, replaced whole.",
+            ),
+            Field(
+                "clear",
+                JSON_ARRAY,
+                item_type=JSON_STRING,
+                enum=RADAR_CLEARABLE_FIELDS,
+                note=(
+                    "Work-item fields this update EMPTIES, by name. The way an explicit "
+                    "null in a record call is carried: a typed field cannot hold one, so "
+                    "the writer names the cleared fields here and the fold empties them "
+                    "before applying the fields the same update sets."
+                ),
+            ),
+            Field(
+                "skip",
+                JSON_OBJECT,
+                fields=(
+                    Field(
+                        "reason", JSON_STRING, required=True, note="Why the issue was passed over."
+                    ),
+                    Field(
+                        "scope",
+                        JSON_STRING,
+                        required=True,
+                        enum=RADAR_SKIP_SCOPES,
+                        enum_closed=True,
+                        note="Closed vocabulary; the writer coerces an unknown scope to other.",
+                    ),
+                    Field(
+                        "crew_id",
+                        JSON_STRING,
+                        note=(
+                            "The crew that decided the pass, when it is not the entry's own -- "
+                            "only a carried entry sets it."
+                        ),
+                    ),
+                    Field(
+                        "decided_at",
+                        JSON_STRING,
+                        note="When the pass was decided, when not this entry's time -- carry only.",
+                    ),
+                    Field(
+                        "deferred",
+                        JSON_BOOL,
+                        note=(
+                            "True when another crew's decision on this number already stood "
+                            "in the shared index as this pass was recorded. A deferred pass "
+                            "never stands over the decision it saw, whatever the clocks say: "
+                            "the writer's own observation is the first-writer token, not a "
+                            "timestamp."
+                        ),
+                    ),
+                ),
+                note=(
+                    "Present when this update records a PASS on the issue. The repository's "
+                    "shared skip index is a fold of these across every crew of the repository."
+                ),
+            ),
+            Field(
+                "carried",
+                JSON_BOOL,
+                note=(
+                    "True on an entry that carries a pre-projection on-disk record forward, "
+                    "once, so a crew upgraded mid-work keeps its items and the repository "
+                    "keeps its passes."
+                ),
+            ),
+            Field(
+                "claimed_at",
+                JSON_STRING,
+                note="The carried record's own stamp; the fold stamps every other entry itself.",
+            ),
+            Field("last_progress_at", JSON_STRING, note="Carry only, as claimed_at."),
+            Field("finished_at", JSON_STRING, note="Carry only, as claimed_at."),
+            Field("event", JSON_STRING, required=True, note="The public progress line."),
+            Field(
+                "event_kind",
+                JSON_STRING,
+                required=True,
+                enum=RADAR_EVENT_KINDS,
+                enum_closed=True,
+                note=(
+                    "Which kind of step this records. sweep is the one crew-level kind and "
+                    "the only one an entry without number may carry."
+                ),
+            ),
+        ),
+        note=(
+            "One entry per issue_radar_crew_record call, carrying only the fields that call "
+            "set -- an omitted field means 'unchanged'. A phase change carries its event in "
+            "the SAME entry, and a pass carries its skip row in the same entry as the phase "
+            "that records it, so no reader can observe a phase that moved without its reason "
+            "or an issue skipped without its index entry. The crew ledger DEPENDS on this log: "
+            "a crew whose session has no crew log cannot record, and the tool refuses rather "
+            "than keeping a document of its own."
+        ),
+    ),
+    # -- work --------------------------------------------------------------- #
+    EntryType(
+        "work/recorded",
+        "One work-board mutation: who acted, on which item, and the fields it set.",
+        (
+            Field(
+                "slot",
+                JSON_STRING,
+                required=True,
+                note=(
+                    "The board's key -- the conductor slot this mutation belongs to. A "
+                    "worker's report names the conductor's slot, not its own, so every "
+                    "entry of one board folds under one key whichever party wrote it."
+                ),
+            ),
+            Field(
+                "actor",
+                JSON_STRING,
+                required=True,
+                enum=WORK_ACTORS,
+                enum_closed=True,
+                note="Which party wrote this entry; the fields the two may set are disjoint.",
+            ),
+            Field(
+                "by",
+                JSON_STRING,
+                required=True,
+                note=(
+                    "The acting session's slot key. Equals slot for a conductor entry and "
+                    "the bound worker's key for a report, so a reader of one entry can "
+                    "say who wrote it without opening the unit's header."
+                ),
+            ),
+            Field(
+                "action",
+                JSON_STRING,
+                required=True,
+                enum=WORK_ACTIONS,
+                enum_closed=True,
+                note=(
+                    "The one mutation this entry records. The fields below are the "
+                    "ones that action set; an omitted field means 'unchanged'."
+                ),
+            ),
+            Field(
+                "item_id",
+                JSON_STRING,
+                note="The item acted on. Absent only for goal, the board-level header write.",
+            ),
+            Field("goal", JSON_STRING, note="The board's objective, when goal set one."),
+            Field("round", JSON_INT, note="The board's or the item's round counter, when set."),
+            Field(
+                "generation",
+                JSON_STRING,
+                note=(
+                    "An opaque id minted when the conductor record was created. A slot "
+                    "reused after its board was purged mints a new one; the fold keeps "
+                    "only the latest board, transitioning in log order."
+                ),
+            ),
+            Field(
+                "depth",
+                JSON_INT,
+                note="The board's nesting depth, carried by the first entry of a board.",
+            ),
+            Field(
+                "parent_item",
+                JSON_STRING,
+                note="The parent board's item this board works, carried with depth.",
+            ),
+            Field("title", JSON_STRING, note="The item's title, set by create."),
+            Field(
+                "acceptance",
+                JSON_OBJECT,
+                note=(
+                    "The acceptance criteria object, set by create or accept. Its members "
+                    "are the caller's and are checked for shape by the writer."
+                ),
+            ),
+            Field(
+                "state",
+                JSON_STRING,
+                enum=WORK_ITEM_STATES,
+                enum_closed=True,
+                note="The item's new state, set by close.",
+            ),
+            Field(
+                "verdict",
+                JSON_STRING,
+                enum=WORK_VERDICTS,
+                enum_closed=True,
+                note="The acceptance verdict, set by verdict.",
+            ),
+            Field("decision", JSON_STRING, note="The conductor's decision text, set by decide."),
+            Field(
+                "worker_session_key",
+                JSON_STRING,
+                note="The worker slot bound to the item, set by bind.",
+            ),
+            Field("fails", JSON_INT, note="The item's failed-verdict count, when it moved."),
+            Field(
+                "status",
+                JSON_STRING,
+                enum=WORK_WORKER_STATUSES,
+                enum_closed=True,
+                note="The worker's status, set by report.",
+            ),
+            Field("summary", JSON_STRING, note="The worker's summary, set by report."),
+            Field(
+                "artifacts",
+                JSON_OBJECT,
+                note=(
+                    "String-to-string pointers replacing the item's map, set by report. "
+                    "The members are the worker's own keys and are checked for shape."
+                ),
+            ),
+            Field("pr", JSON_INT, note="The pull request number, set by report."),
+            Field(
+                "event_id",
+                JSON_STRING,
+                note="The store's content-addressed id of the event this write appended.",
+            ),
+            Field("event_ts", JSON_STRING, note="The store's stamp on that event."),
+            Field("created_at", JSON_STRING, note="The item's committed creation stamp."),
+            Field("last_report_at", JSON_STRING, note="The item's committed last-report stamp."),
+            Field("closed_at", JSON_STRING, note="The item's committed close stamp."),
+            Field(
+                "board_round",
+                JSON_INT,
+                note="The board's committed round, carried by a baseline entry.",
+            ),
+            Field(
+                "board_created_at",
+                JSON_STRING,
+                note="The board's committed creation stamp, carried by a baseline entry.",
+            ),
+            Field(
+                "goal_version",
+                JSON_INT,
+                note="The header's goal-write count after this goal write, set by goal.",
+            ),
+            Field(
+                "baseline",
+                JSON_BOOL,
+                note=(
+                    "True when the entry carries the WHOLE committed item, not a delta: "
+                    "written for an item the record has never held whole (one from before "
+                    "the projection), so a lost file rebuilds from it."
+                ),
+            ),
+            Field(
+                "event",
+                JSON_STRING,
+                note="The one-line item event this mutation appends to the item's tail.",
+            ),
+            Field(
+                "event_kind",
+                JSON_STRING,
+                enum=WORK_EVENT_KINDS,
+                enum_closed=True,
+                note="Which kind of item event this is; absent only for goal.",
+            ),
+        ),
+        note=(
+            "One entry per work-ledger write, appended to the ACTING session's log and "
+            "keyed by the conductor's slot. A conductor action and a worker report are "
+            "the two writers, each sets only its own fields, and the work fold rebuilds "
+            "the board from these entries across the conductor's and its bound workers' "
+            "units, so the ledger's files are a cache of the crew log rather than a "
+            "record beside it. The work ledger therefore DEPENDS on this log: with the "
+            "emitter off the tools refuse rather than keeping a document of their own."
         ),
     ),
 )

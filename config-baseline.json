@@ -1536,7 +1536,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Archive Retention (days)",
-      "help": "Days to keep compacted/rotated session archives before auto-cleanup. -1 disables cleanup (manage deletion manually).",
+      "help": "Days to keep compacted/rotated session archives before auto-cleanup. -1 disables cleanup (manage deletion manually). The same window collects a closed session's crew log, and with the crew log on that is where Issue Radar keeps each repository's shared skip memory and its crews' open work items.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 30,
@@ -1846,6 +1846,9 @@
         "history_max_days": 365,
         "backup_enabled": true,
         "backup_keep": 7,
+        "persistence_enabled": true,
+        "inject_memory": true,
+        "inject_lessons": true,
         "migrated": false
       }
     },
@@ -2203,6 +2206,48 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 7
+    },
+    {
+      "path": "memory.persistence_enabled",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Persistence Enabled",
+      "help": "Global switch for persistent memory. Off: no automatic memory writes (lessons, consolidation extraction, task-runner lessons) and no stored memory/lessons injected into new sessions; within-conversation context is unaffected. Explicit dashboard edits and deletions stay available. An installed app's own ingestion sweep is out of scope and still writes app-scoped rows.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": true
+    },
+    {
+      "path": "memory.inject_memory",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Inject Memory Context",
+      "help": "Inject the stored memory block (preferences, the memory activity index and recent-session snippets) into new-session context. On-demand memory_recall is unaffected.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": true
+    },
+    {
+      "path": "memory.inject_lessons",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Inject Lessons Context",
+      "help": "Inject the learned-corrections and user-profile blocks into new-session context.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": true
     },
     {
       "path": "memory.migrated",
@@ -4069,7 +4114,7 @@
       "enumValues": null,
       "defaultValue": {
         "bucket": 100,
-        "history_budget_chars": 0,
+        "history_budget_chars": 2000,
         "model_route": {
           "simple": "",
           "medium": "",
@@ -4080,6 +4125,10 @@
           "api_key": "secret://TYPESAFE_API_KEY",
           "model": "jev-latest",
           "timeout_ms": 1000
+        },
+        "nudge_wake": {
+          "provider": "auto",
+          "llm_model": ""
         }
       }
     },
@@ -4106,10 +4155,10 @@
       "sensitive": false,
       "tags": [],
       "label": "History budget (chars)",
-      "help": "How many characters of PRIOR conversation one decision may carry, on top of the current message. Earlier user and assistant turns are added newest-first until this many characters are spent and the last one is clipped to fit; tool output is never sent. The default is 0 -- no prior turns -- because consent is recorded against the text the owner reviewed, which names the message excerpt and the candidate descriptions; raising this widens what leaves the machine, so it is a choice rather than an upgrade. A negative value reads as 0.",
+      "help": "How many characters of PRIOR conversation one decision may carry, on top of the current message. Earlier user and assistant turns are added newest-first until this many characters are spent and the last one is clipped to fit; tool output is never sent. The default is 2000, about the last two or three turns, and the consent keystone caps it: the gate sends the smaller of the two, so an install whose owner reviewed no prior-turn ceiling sends no prior turns at all. A negative value reads as 0.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 0
+      "defaultValue": 2000
     },
     {
       "path": "decisions.model_route",
@@ -4217,6 +4266,51 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 1000
+    },
+    {
+      "path": "decisions.nudge_wake",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Wake judge",
+      "help": "Per-point settings for nudge.wake: which judge answers, and the model id for the small-model lane. The Jev lane still needs this point's consent scope on the Decisions card; the small-model lane needs no consent row, because it sends to the model provider your sessions already use, so picking it here is what runs it.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {
+        "provider": "auto",
+        "llm_model": ""
+      }
+    },
+    {
+      "path": "decisions.nudge_wake.provider",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Judge provider",
+      "help": "Which judge answers at nudge.wake: 'jev' (the System One model this card's consent switch covers), 'llm' (a small text-only model on the provider this machine already uses, no extra key needed), or 'auto' -- Jev when consent stands for it, otherwise the small model. Anything else reads as 'auto'. Choosing 'jev' without that consent sends nothing and every tick fires as it does today.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": "auto"
+    },
+    {
+      "path": "decisions.nudge_wake.llm_model",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Judge model (LLM lane)",
+      "help": "The model id the 'llm' lane runs on, spelled as your provider advertises it. EMPTY INHERITS: the judge keeps the model its background agent already resolves, which is the default. A value that is not a short model id is ignored rather than sent.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
     },
     {
       "path": "watchdog",
@@ -4508,6 +4602,7 @@
         "reactions": {},
         "reactions_enabled": true,
         "show_thinking": true,
+        "dm_single_session": false,
         "home_tab_sessions_per_kind": 5,
         "use_tunnel_url": false,
         "session_folder": ""
@@ -4752,6 +4847,22 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": true
+    },
+    {
+      "path": "slack.dm_single_session",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "slack"
+      ],
+      "label": "DM Single Session",
+      "help": "Treat each 1:1 DM as one continuous conversation instead of starting a new session per top-level message. Replies post at channel root rather than in a thread. Threaded replies, group channels and group DMs are unaffected. Off by default: turning it on routes the next DM to a different session than the previous one.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
     },
     {
       "path": "slack.home_tab_sessions_per_kind",
@@ -6374,7 +6485,8 @@
       "enumValues": null,
       "defaultValue": {
         "enabled": false,
-        "api_base_url": ""
+        "api_base_url": "",
+        "send_heartbeats": false
       }
     },
     {
@@ -6408,6 +6520,22 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""
+    },
+    {
+      "path": "wakatime.send_heartbeats",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "wakatime"
+      ],
+      "label": "Send coding-activity heartbeats",
+      "help": "Send a heartbeat to WakaTime after each agent turn that edited files or ran a command, so your Kiro Crew coding time shows up in WakaTime alongside your editor. Off by default: sending activity outward is a separate opt-in from reading your own stats. Requires the WakaTime integration to be enabled. Covers dashboard chat and dashboard-linked Slack threads; the other messaging channels (Telegram, Discord, Teams, WhatsApp and the rest), the task runner, subagents, installed apps, and the standalone kirocrew chat CLI each run their own turn loop and do not emit heartbeats yet. Incognito and temporary sessions never send one: they keep no record of the chat, and a heartbeat is an external record of it.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
     },
     {
       "path": "teams",

@@ -248,6 +248,11 @@ export interface ConnectionMintState {
   state: 'idle' | 'minting' | 'waiting' | 'granted' | 'failed' | 'expired'
   oauth_url?: string
   reason?: string
+  /** Copy-ready "host/path" of the authorization URL the credential gate
+   *  refused. Present only beside reason === 'mint_url_rejected', and only when
+   *  the backend could reduce the URL to a string the oauth_endpoints.json
+   *  loader would accept (query, fragment, port and userinfo are never sent). */
+  rejected_endpoint?: string
   /** Opaque id of the backend row, unique across gateway restarts as well as
    *  within one process. Reported so a row can be told apart from its
    *  successor for the same provider. */
@@ -3824,6 +3829,30 @@ export const api = {
     fetch(
       '/api/members/' + encodeURIComponent(slug) + '/panel?member=' + encodeURIComponent(member),
     ).then(j) as Promise<{ panel: CrewPanelMeta | null; html: string | null }>,
+  // The crewmate's self-maintained briefing markdown. Read-only from the UI
+  // (no editor: the file is agent-written and edited where the crewmate keeps
+  // it). `member` is the exact crew name (slugs are lossy).
+  memberBriefing: (slug: string, member: string) =>
+    fetch(
+      '/api/members/' + encodeURIComponent(slug) + '/briefing?member=' + encodeURIComponent(member),
+    ).then(j) as Promise<{
+      slug: string
+      member: string
+      /** Whether the platform can read the file safely (false on Windows). */
+      supported: boolean
+      /** Markdown content, or empty string when the crewmate has not written notes yet. */
+      text: string
+      /** Last-modified timestamp, or null when no notes file exists yet. */
+      updated_ts: number | null
+      /** The text above was redacted on the way out (a secret-like string or an
+       *  exfiltration URL replaced by its placeholder); the panel says so above
+       *  the notes. */
+      redacted: boolean
+      /** The file ran past the briefing cap, so the text above ends in the
+       *  truncation marker instead of the tail; the panel says so above the
+       *  notes. */
+      truncated: boolean
+    }>,
   updateKirocrewAgent: (name: string, body: object) =>
     put('/api/agents/' + encodeURIComponent(name), body).then(j),
   deleteKirocrewAgent: (name: string) =>
@@ -4658,8 +4687,11 @@ export const api = {
   // Sessions (history)
   // `excludeOpen` drops sessions already open as a tab — for the sidebar's
   // Older-sessions pane, which is the complement of the tab list above it.
-  // Off by default: every other caller wants the full inventory.
-  sessions: (limit = 30, offset = 0, preview = false, excludeOpen = false) => fetch('/api/sessions?limit=' + limit + '&offset=' + offset + (preview ? '&preview=1' : '') + (excludeOpen ? '&exclude_open=1' : '')).then(j),
+  // `userOnly` drops machine namespaces (`subagent_`, `wf_`, …), whose transcripts
+  // have no title and so render their own storage key as one. NOT `taskrunner_`: that
+  // namespace also holds real conversations, so the server keeps it listed.
+  // Both off by default: every other caller wants the full inventory.
+  sessions: (limit = 30, offset = 0, preview = false, excludeOpen = false, userOnly = false) => fetch('/api/sessions?limit=' + limit + '&offset=' + offset + (preview ? '&preview=1' : '') + (excludeOpen ? '&exclude_open=1' : '') + (userOnly ? '&user_only=1' : '')).then(j),
   sessionsSearch: (q: string, limit = 50) => fetch('/api/sessions/search?q=' + encodeURIComponent(q) + '&limit=' + limit).then(j),
   // Federated session search across the local gateway + every CONNECTED remote
   // instance (backend rank-interleaves; remote rows carry instance_id/_name).
@@ -4888,15 +4920,18 @@ export const api = {
     if (q) p.set('q', q)
     return fetch(`/api/path-complete?${p}`, signal ? { signal } : undefined).then(j) as Promise<{ results: Array<{ path: string; name: string; size: number; mtime: number; kind?: 'file' | 'dir' }>; root: string; outside?: boolean }>
   },
-  /** Upload files via browser File API (cross-platform) */
-  uploadFiles: async (files: File[]) => {
+  /** Upload files via browser File API (cross-platform).
+   *  `signal` lets the composer abort an upload still in flight: the
+   *  request dies client-side and the server unlinks its partials through
+   *  the disconnect path the upload handler already has. */
+  uploadFiles: async (files: File[], signal?: AbortSignal) => {
     // Downscale oversized images client-side so they fit the model's image
     // limits before they ever reach the server (see resizeImage.ts).
     const prepared = await Promise.all(files.map(f => resizeImageForModel(f)))
     const resized = prepared.map(p => p.info).filter((i): i is ResizeInfo => i !== null)
     const fd = new FormData()
     prepared.forEach(p => fd.append('file', p.file))
-    const res = await fetch('/api/upload/file', { method: 'POST', body: fd })
+    const res = await fetch('/api/upload/file', { method: 'POST', body: fd, ...(signal ? { signal } : {}) })
     checkSessionExpired(res)
     let body: { paths?: unknown; error?: string }
     try { body = await res.json() } catch { body = {} }
