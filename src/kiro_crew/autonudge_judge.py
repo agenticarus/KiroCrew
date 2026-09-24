@@ -91,9 +91,13 @@ def parse_targets(spec: Mapping[str, Any] | None, message: str = "") -> list[str
     strings come from the owner's tool call.
     """
     raw: list[str] = []
+    narrowed = False
     if isinstance(spec, Mapping):
         listed = spec.get("targets")
         if isinstance(listed, (list, tuple)):
+            # The owner NARROWED the watch by naming a list, and that stands even if
+            # nothing in it survives the filter below.
+            narrowed = True
             raw = [str(item) for item in listed if isinstance(item, str)]
     out: list[str] = []
     for item in raw:
@@ -104,9 +108,15 @@ def parse_targets(spec: Mapping[str, Any] | None, message: str = "") -> list[str
             out.append(value)
         if len(out) >= MAX_TARGETS:
             break
-    if out:
+    if out or narrowed:
+        # ``narrowed`` alone is enough. An owner who named targets and had every one
+        # dropped -- a typo, a shape this build does not read -- must not be handed the
+        # message's subjects instead: that is a WIDER watch than the one they asked for,
+        # reading evidence from a session they never named. Answering no targets costs a
+        # turn every interval, because a spec naming none fires rather than suppressing,
+        # and spending a turn is the right direction to be wrong in.
         return out
-    # Nothing explicit, so read the instruction the way the design says: the targets
+    # No list at all, so read the instruction the way the design says: the targets
     # default to what the MESSAGE names. Both shapes, not just pull requests -- a
     # conductor's instruction names the sessions it patrols, and requiring those to be
     # repeated in ``targets`` would mean a brief that looks armed and watches nothing.
@@ -266,6 +276,64 @@ def _pr_identity(value: str) -> tuple[str, str, str] | None:
     return (inferred.kind, inferred.subject, inferred.host_key)
 
 
+#: Keys a reader ADDS to the observation it hands over, which are not facts about
+#: the subject. :func:`pr_observation_has_facts` discounts them, so an empty
+#: canonical stays empty after the reader stamps its age onto the copy.
+_PR_OBSERVATION_SIBLINGS = frozenset({"observed_at"})
+
+
+def pr_observation_has_facts(observation: Mapping[str, Any] | None) -> bool:
+    """Whether *observation* is a reading of a pull request at all.
+
+    An empty canonical is the shape a monitor record carries before any provider
+    writes one -- and the shape every GATED loop carries for the life of the watch,
+    because the canonical field has one writer, the structured controller's
+    provider, while a gated loop observes through the raise-based kernel whose
+    verdict carries an outcome and prose and no facts.
+
+    That has to read as NOT READ rather than as a subject with nothing to report.
+    The two are indistinguishable downstream: :func:`render_pr_summary` returns
+    ``""`` for both, :func:`pr_evidence` then yields no rows for both, and a tick
+    holding no evidence and no dropped target is the one shape the point reads as
+    every target having been read and found calm -- so an owner's criterion about
+    their pull request would suppress every tick up to the streak floor. Answering
+    ``False`` here makes it a dropped target instead, which fires.
+    """
+    if not isinstance(observation, Mapping):
+        return False
+    return any(str(key) not in _PR_OBSERVATION_SIBLINGS for key in observation)
+
+
+def pr_target_is_unread(
+    observation: Mapping[str, Any] | None,
+    *,
+    probe_covers_subject: bool,
+) -> bool:
+    """Whether this tick read the pull request at all, which is what a DROP means.
+
+    A drop says "this target might have mattered and nobody looked", and the tick
+    fires on it. So the question is not whether the judge got facts -- it is whether
+    anything read the subject.
+
+    *probe_covers_subject* is true when the typed probe observed this very subject on
+    this tick, which the gated path always has by the time the judge is asked: the
+    judge is consulted there only after the probe's own verdict came back quiet. A
+    factless observation of that subject is then not an unread target. It was read,
+    by the reader whose reading the judge was called to supplement, and counting it as
+    unread fires a turn the probe had already settled -- every interval, for the life
+    of the watch, which inverts what the screen is for.
+
+    With no probe behind it -- a loop carrying no monitor, a spent watch, a brief
+    naming some other pull request, or a build whose collector cannot reach one -- a
+    factless observation is exactly an unread target, and firing is right.
+    """
+    if not isinstance(observation, Mapping):
+        return True
+    if pr_observation_has_facts(observation):
+        return False
+    return not probe_covers_subject
+
+
 def pr_observation_is_about(
     target: str,
     *,
@@ -282,13 +350,25 @@ def pr_observation_is_about(
     subject's state. A judge could rule quiet on facts about a different pull
     request, which is the one way this path can suppress a turn that was owed.
 
-    Two ways to agree, because the two sides are spelled by different writers. An
-    identical string is unambiguous. Otherwise both are put through the same
-    inference :func:`parse_targets` already admits a target by, and their subject
-    identities must match -- host included, since one slug on two servers is two
-    pull requests. The observation's own ``target`` and ``kind`` labels are checked
-    too when it carries them: those are what the reading says about itself, and a
-    reading disagreeing with the record it came from is not a case to guess at.
+    Three ways to agree, because the two sides are spelled by different writers and
+    a monitor is stored in one of two shapes. An identical string is unambiguous.
+    Otherwise *target* is put through the same inference :func:`parse_targets`
+    already admits it by, and either the watched side infers to the same identity --
+    host included, since one slug on two servers is two pull requests -- or the
+    inferred ``kind`` and ``subject`` equal the pair the monitor is bound to.
+
+    That third way is what a GATED loop needs. ``monitor_watch`` stores the caller's
+    own canonical URL, so the first two ways cover it; ``infer_monitor`` stores the
+    CANONICAL subject (``owner/name#123``) with the inferred kind, and that shorthand
+    carries no host by design, so inference declines it. Putting the watched side
+    through inference therefore answered ``None`` for every message-armed watch and
+    dropped its target on every tick. Comparing the stored pair directly needs no
+    host of its own: the inference pins exactly one host and refuses any other, so
+    for a subject it admits at all, kind and subject ARE the whole identity.
+
+    The observation's own ``target`` and ``kind`` labels are checked too when it
+    carries them: those are what the reading says about itself, and a reading
+    disagreeing with the record it came from is not a case to guess at.
 
     ``False`` on every doubtful case, which drops the target: the collector counts a
     drop, and a tick with no evidence answers FALLBACK, which fires.
@@ -312,7 +392,11 @@ def pr_observation_is_about(
     if requested == watched:
         return True
     identity = _pr_identity(requested)
-    return identity is not None and identity == _pr_identity(watched)
+    if identity is None:
+        return False
+    if identity == _pr_identity(watched):
+        return True
+    return (identity[0], identity[1]) == (kind, watched)
 
 
 def pr_evidence(
@@ -382,8 +466,16 @@ async def collect_evidence(
     """
     clock = point.now() if now_ts is None else now_ts
     evidence: list[dict[str, Any]] = []
-    dropped = 0
-    for target in list(targets)[:MAX_TARGETS]:
+    wanted = list(targets)
+    # Targets past the cap are NOT read, so they start the drop count rather than
+    # vanishing from it. The cap bounds how many authorizations and reads one tick
+    # performs, which is its job; what it must not do is make an incomplete reading
+    # look like a complete one. With this at zero, a message naming one target more
+    # than the cap allows would let a confident QUIET about the ones that fit suppress
+    # a turn the unread one might have needed -- the same fault as a target the
+    # collector could not read, arriving through a bound instead of a failure.
+    dropped = max(0, len(wanted) - MAX_TARGETS)
+    for target in wanted[:MAX_TARGETS]:
         try:
             if is_session_target(target):
                 if read_session is None:
@@ -399,13 +491,15 @@ async def collect_evidence(
                     continue
                 observation = await read_pr(target)
                 if observation is None:
-                    # The reader answers ``None`` for a loop carrying no monitor --
-                    # which is every loop armed through ``POST /api/autonudge`` -- for
-                    # a brief naming a pull request this loop does not watch, and
-                    # before the monitor's first observation. The subject was not read
-                    # in any of those, so this is a DROPPED target: without the count
-                    # the tick would hold no evidence and no drop, which is the one
-                    # shape the point reads as "every target was calm".
+                    # The reader answers ``None`` for every target nothing read this
+                    # tick: a loop carrying no monitor -- which is every loop armed
+                    # through ``POST /api/autonudge`` -- a brief naming a pull request
+                    # this loop does not watch, a spent watch, and a factless
+                    # observation with no typed probe behind it. It decides that,
+                    # because the monitor and the probe's schedule are in its reach and
+                    # not in this function's. Without the count the tick would hold no
+                    # evidence and no drop, which is the one shape the point reads as
+                    # "every target was calm".
                     dropped += 1
                     continue
                 evidence.extend(pr_evidence(observation, target, now_ts=clock))
@@ -457,6 +551,38 @@ def criteria_of(spec: Mapping[str, Any] | None) -> tuple[str, str]:
         wake[: point.MAX_CRITERION_CHARS] if isinstance(wake, str) else "",
         quiet[: point.MAX_CRITERION_CHARS] if isinstance(quiet, str) else "",
     )
+
+
+#: The brief a gated loop is screened under when its owner named none. Generic on
+#: purpose: it asks the one question every patrol loop shares -- does the subject need
+#: its owner this tick -- rather than anything about a particular subject, which is
+#: what the owner's own criterion is for.
+#:
+#: "the loop message's own exit condition" is readable because the instruction is
+#: passed to the judge as the tick's context, so a loop that says "stop when the PR is
+#: merged" has its exit condition in front of the judge without restating it here.
+DEFAULT_WAKE_WHEN = (
+    "the subject needs its owner: a blocker, a question or ruling addressed to it, "
+    "a terminal state, or the loop message's own exit condition"
+)
+DEFAULT_QUIET_WHEN = "nothing new for the owner since the last tick"
+
+#: Which brief a tick ran under, for the transcript notice. A reader has to be able to
+#: tell a verdict reached under their own criterion from one reached under the shipped
+#: default, because only the first is evidence that their criterion works.
+BRIEF_DEFAULT = "default"
+BRIEF_CUSTOM = "custom"
+
+
+def default_spec() -> dict[str, Any]:
+    """The default brief, fresh each call so a caller cannot mutate the shipped one.
+
+    No ``targets``: :func:`parse_targets` reads the loop's own instruction when a brief
+    names none, so the default inherits whatever subject the loop already names. A loop
+    whose message names no readable subject has nothing to observe, and its tick fires
+    as it does today rather than being screened against an empty reading.
+    """
+    return {"wake_when": DEFAULT_WAKE_WHEN, "quiet_when": DEFAULT_QUIET_WHEN}
 
 
 def verdict_record(verdict: Any, evidence_items: int) -> dict[str, Any]:

@@ -128,9 +128,6 @@ function legacyWire(loop: LegacyGoalLoop): AutoNudgeLoop {
     next_due_ts: loop.nextDueAt ?? 0,
     ...(loop.stopSentinelPath !== undefined ? { stop_sentinel_path: loop.stopSentinelPath } : {}),
     ...(loop.judge !== undefined ? { judge: loop.judge } : {}),
-    ...(loop.judge_quiet_streak !== undefined
-      ? { judge_quiet_streak: loop.judge_quiet_streak }
-      : {}),
     ...(loop.judge_last_verdict !== undefined
       ? { judge_last_verdict: loop.judge_last_verdict }
       : {}),

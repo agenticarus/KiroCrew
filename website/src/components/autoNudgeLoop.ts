@@ -41,10 +41,6 @@ export interface AutoNudgeLoop {
    *  popover shows them back rather than making the owner reopen the tool call to
    *  remember what a loop is screening on. */
   judge?: { wake_when?: string; quiet_when?: string; targets?: string[] }
-  /** QUIET verdicts in a row. A judge keeping a loop quiet is bounded -- at the
-   *  floor a tick fires regardless -- so this reading says how close the loop is
-   *  to firing anyway, not how well the judge is doing. */
-  judge_quiet_streak?: number
   /** The last verdict, deliberately text-free: an outcome, how many evidence
    *  items it was based on, and when. It carries NO transcript text and no
    *  per-answer probability; those live in the decisions log, which is where the
@@ -163,9 +159,13 @@ export interface JudgeVerdict {
 /**
  * Read one loop's judge state.
  *
- * A brief with neither sentence reads as `none`: `{}` is what the arm path stores
- * for a loop whose judge was cleared, so treating an empty object as armed would
- * report a judge on a plain timer.
+ * A brief with neither sentence reads as `none`, and that is what a loop stores when
+ * its owner named no criteria of their own. Such a loop may still be SCREENED, under
+ * the default brief the gateway supplies per tick, which is never written back to the
+ * record — so this reading is "does the owner have a criterion here", not "is a judge
+ * running". The row is the owner's own sentence or nothing; the per-tick transcript
+ * notice is where a verdict reached under the default is reported, and it names which
+ * brief it used.
  */
 export function judgeReading(loop: AutoNudgeLoop | null | undefined): JudgeReading {
   const wakeWhen = (loop?.judge?.wake_when ?? '').trim()

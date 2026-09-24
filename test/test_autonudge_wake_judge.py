@@ -23,11 +23,13 @@ from kiro_crew.autonudge import (
     AutoNudgeService,
     MonitorState,
     NudgeLoop,
+    _bounded_judge_spec,
+    infer_monitor,
 )
 from kiro_crew.decisions.points import nudge_wake as point
 from kiro_crew.decisions.types import Answer
-from kiro_crew.irq import Outcome
-from kiro_crew.validation import ValidationError, validate_judge_spec
+from kiro_crew.irq import Outcome, Verdict
+from kiro_crew.validation import JUDGE_OFF_KEY, ValidationError, validate_judge_spec
 
 
 def answers(
@@ -307,8 +309,47 @@ class TestEmptyDelta:
         assert verdict.outcome is Outcome.QUIET
         assert "no new evidence" in verdict.body
 
+    def test_targets_past_the_cap_count_as_dropped(self) -> None:
+        """A bound that silently shrinks the reading must not make it look complete.
+
+        The cap limits how many authorizations and reads one tick performs, which is
+        its job. What it must not do is leave ``dropped`` at zero, because a confident
+        quiet about the targets that FIT would then suppress a turn the omitted one
+        might have needed -- the same fault as an unreadable target, arriving through a
+        bound instead of a failure.
+        """
+        over = [f"chat-{n}-{n}" for n in range(judge.MAX_TARGETS + 2)]
+
+        async def read_session(target: str, since: int) -> tuple[list[dict], int]:
+            return [], since
+
+        _, dropped = asyncio.run(
+            judge.collect_evidence(over, cursors={}, read_session=read_session, read_pr=None)
+        )
+        assert dropped >= 2, "both targets past the cap are counted"
+
     def test_a_dropped_target_is_fallback_not_quiet(self) -> None:
         verdict = asyncio.run(point.judge_tick("watch", evidence=[], dropped=1))
+        assert verdict.outcome is Outcome.FALLBACK
+        assert "could not read every target" in verdict.body
+
+    def test_a_dropped_target_fires_even_when_another_target_yielded_rows(self) -> None:
+        """One unread target is enough, whatever the readable ones produced.
+
+        The blind-tick check has to sit ABOVE the empty-delta branch: a tick with one
+        refused target and one talkative one has a NONEMPTY delta, so a branch reached
+        only on an empty one never sees the drop, and a confident quiet about the
+        target that WAS read would suppress the turn the unread one might have needed.
+        """
+        rows = [
+            {
+                "source": "session:chat-2-2",
+                "kind": point.KIND_TRANSCRIPT_TAIL,
+                "age_s": 1.0,
+                "text": "WORKING",
+            }
+        ]
+        verdict = asyncio.run(point.judge_tick("watch", evidence=rows, dropped=1))
         assert verdict.outcome is Outcome.FALLBACK
         assert "could not read every target" in verdict.body
 
@@ -645,6 +686,56 @@ class TestCollectors:
         )
         assert dropped == 0 and len(items) == 1
 
+    def test_a_probe_covered_subject_contributes_nothing_and_drops_nothing(self) -> None:
+        """A factless reading the reader passes through must not fire the tick.
+
+        The reader hands one over for the subject the typed probe just read and found
+        quiet, which is the only reason the judge is asked on that path. Counted as a
+        drop it would fire a turn the probe had already settled, every interval, for
+        the life of the watch -- the inverse of what the screen is for.
+        """
+
+        async def blank(target: str) -> dict:
+            return {}
+
+        items, dropped = asyncio.run(
+            judge.collect_evidence(
+                ["https://github.com/o/r/pull/7"],
+                read_pr=blank,
+            )
+        )
+        assert items == [] and dropped == 0
+
+    def test_a_reading_is_unread_only_when_no_probe_covers_the_subject(self) -> None:
+        """The rule the reader applies, both directions.
+
+        A drop means "nobody looked", not "the judge got no facts". So the same
+        factless observation is unread with no probe behind it and READ when the tick's
+        own typed probe observed that subject.
+        """
+        assert judge.pr_target_is_unread({}, probe_covers_subject=False)
+        assert not judge.pr_target_is_unread({}, probe_covers_subject=True)
+        assert judge.pr_target_is_unread(
+            {"observed_at": 1.0},
+            probe_covers_subject=False,
+        )
+        assert not judge.pr_target_is_unread(
+            {"observed_at": 1.0},
+            probe_covers_subject=True,
+        )
+        # Facts settle it whichever reader produced them, and a non-mapping is never
+        # a reading.
+        assert not judge.pr_target_is_unread({"state": "open"}, probe_covers_subject=False)
+        assert judge.pr_target_is_unread(None, probe_covers_subject=True)
+
+    def test_one_canonical_fact_is_enough_to_count_as_read(self) -> None:
+        """The fact test's own boundary, discounting the age the reader stamps on."""
+        assert judge.pr_observation_has_facts({"state": "open"})
+        assert judge.pr_observation_has_facts({"observed_at": 1.0, "state": "open"})
+        assert not judge.pr_observation_has_facts({})
+        assert not judge.pr_observation_has_facts({"observed_at": 1.0})
+        assert not judge.pr_observation_has_facts(None)
+
     def test_targets_from_the_spec_are_deduped_and_screened(self) -> None:
         targets = judge.parse_targets(
             {"targets": ["chat-2-2", "chat-2-2", "not a target at all"]}, ""
@@ -689,6 +780,438 @@ class TestSchema:
         with pytest.raises(ValidationError):
             validate_judge_spec(bad)
 
+    def test_false_normalises_to_the_opt_out_marker(self) -> None:
+        assert validate_judge_spec(False) == {JUDGE_OFF_KEY: True}
+
+    def test_true_is_refused_rather_than_read_as_the_default(self) -> None:
+        # The default already applies to every gated loop that names no brief, so
+        # accepting `true` would give one meaning two spellings -- and an owner who
+        # typed it more likely meant the opt-out.
+        with pytest.raises(ValidationError):
+            validate_judge_spec(True)
+
+    def test_an_owner_cannot_spell_the_marker_by_hand(self) -> None:
+        # The reserved key is deliberately absent from JUDGE_SPEC_KEYS: `judge: false`
+        # is the only surface for the opt-out, and the dict form is an unknown key.
+        with pytest.raises(ValidationError):
+            validate_judge_spec({JUDGE_OFF_KEY: True})
+
+    def test_an_empty_object_is_not_the_opt_out(self) -> None:
+        # It drops the owner's own criteria; a gated loop then runs under the default.
+        assert validate_judge_spec({}) == {}
+
+
+class TestTheStoredOptOutSurvivesAReload:
+    """The loader keeps the one key the arming validator refuses from a caller."""
+
+    def test_the_marker_round_trips(self) -> None:
+        assert _bounded_judge_spec({JUDGE_OFF_KEY: True}) == {JUDGE_OFF_KEY: True}
+
+    def test_the_marker_is_returned_alone(self) -> None:
+        # An opted-out loop has no criteria to carry, so pairing the marker with a
+        # brief would describe a state no arming call can produce.
+        stored = _bounded_judge_spec({JUDGE_OFF_KEY: True, "wake_when": "ignored"})
+        assert stored == {JUDGE_OFF_KEY: True}
+
+    def test_a_false_marker_is_not_an_opt_out(self) -> None:
+        assert _bounded_judge_spec({JUDGE_OFF_KEY: False, "wake_when": "x"}) == {"wake_when": "x"}
+
+
+class TestTheStructuredPathRefusesABrief:
+    """A structured monitor is probe-first and holds no brief, so it must REFUSE one.
+
+    The schema offers ``judge`` on every ``monitor_update``, so arming a structured
+    monitor and then sending a brief is two ordinary steps. Dropping it and returning
+    success tells an owner their criterion is armed while every tick keeps firing on
+    the typed probe alone, which the acknowledgement gives them no way to discover.
+    """
+
+    @staticmethod
+    def _refusal_set() -> set[str]:
+        from kiro_crew.dashboard import session_directive_apply
+
+        source = inspect.getsource(session_directive_apply)
+        line = next(ln for ln in source.splitlines() if "legacy_only = sorted(" in ln)
+        return {
+            token.strip().strip('"')
+            for token in line[line.index("{") + 1 : line.rindex("}")].split(",")
+        }
+
+    def test_judge_is_refused_not_dropped(self) -> None:
+        assert "judge" in self._refusal_set()
+
+    def test_the_precedent_field_is_still_there(self) -> None:
+        # ``banner`` is the field this refusal was built for, and the same silent-no-op
+        # argument covers both. Asserted so a future edit cannot trade one for the other.
+        assert "banner" in self._refusal_set()
+
+
+class TestAnOwedWakeSurvives:
+    """A judge verdict that says fire must not be lost if the fire never happens.
+
+    The judge advances DURABLE read cursors before deciding, so a process that stops
+    between the verdict and the fire leaves the next tick reading nothing new: it would
+    answer quiet and suppress the very turn that is owed. The marker lives on the loop
+    rather than on ``MonitorState`` because a judge-only loop has no monitor record, so
+    every mechanism guarded by ``monitor is not None`` misses it.
+    """
+
+    @staticmethod
+    def _fired(outcome: Outcome) -> NudgeLoop:
+        svc = _service()
+
+        async def collect(loop: NudgeLoop) -> tuple[list[dict], int, dict]:
+            return (
+                [
+                    {
+                        "source": "session:chat-2-2",
+                        "kind": point.KIND_TRANSCRIPT_TAIL,
+                        "age_s": 1.0,
+                        "text": "WORKING",
+                    }
+                ],
+                0,
+                {},
+            )
+
+        async def persist(loop: NudgeLoop) -> bool:
+            return True
+
+        svc._collect_judge_evidence = collect
+        svc._persist_judge_state = persist  # type: ignore[method-assign]
+        svc._persist_soon = lambda: None  # type: ignore[method-assign]
+        loop = _loop({"wake_when": "RULING"})
+
+        async def tick(instruction: str, **kwargs: Any) -> Any:
+            return Verdict(outcome=outcome, body="x")
+
+        with (
+            patch("kiro_crew.decisions.is_enabled", lambda *a, **k: True),
+            patch("kiro_crew.decisions.judge_evidence_scope_granted", lambda **k: True),
+            patch("kiro_crew.decisions.points.nudge_wake.judge_tick", tick),
+        ):
+            asyncio.run(svc._judge_tick_is_quiet(loop))
+        return loop
+
+    def test_a_wake_marks_the_turn_as_owed(self) -> None:
+        assert self._fired(Outcome.WAKE).judge_wake_pending is True
+
+    def test_a_fallback_marks_it_too(self) -> None:
+        # A fallback spends a turn exactly as a wake does, so it owes one the same way.
+        assert self._fired(Outcome.FALLBACK).judge_wake_pending is True
+
+    def test_a_quiet_owes_nothing(self) -> None:
+        assert self._fired(Outcome.QUIET).judge_wake_pending is False
+
+    def test_an_owed_wake_fires_without_asking_the_judge_again(self) -> None:
+        # The decisive case: a second reading would find nothing new and answer quiet.
+        svc = _service()
+        asked: list[str] = []
+
+        async def collect(loop: NudgeLoop) -> tuple[list[dict], int, dict]:
+            asked.append("collected")
+            return [], 0, {}
+
+        svc._collect_judge_evidence = collect
+        loop = _loop({"wake_when": "RULING"})
+        loop.judge_wake_pending = True
+        got = asyncio.run(svc._judge_tick_is_quiet(loop))
+        assert got is False, "the owed turn is delivered"
+        assert asked == [], "and no evidence is re-read to second-guess it"
+        assert loop.judge_wake_pending is True, "it stays owed until the fire settles"
+
+    def test_the_loader_refuses_a_non_boolean_marker(self) -> None:
+        # The store is agent-writable, so a corrupt value must not make a loop fire
+        # forever without ever consulting its judge.
+        loop = NudgeLoop(id="l1", slot_key="chat-1-1", message="m")
+        assert loop.judge_wake_pending is False
+
+
+class TestAScreenedPullRequestTickLeavesTheProbesQuietAlone:
+    """A gated PR watch must not pay a turn for a tick its own probe re-armed free.
+
+    On the gated path the judge is asked only AFTER the typed probe returned quiet, so
+    the subject HAS been read. The canonical observation the PR collector wants has one
+    writer and it is on the structured path, so the reader finds none -- and the
+    question that decides this loop's cost is whether that counts as an unread target.
+    Counted unread it is a FALLBACK, which fires: a turn, a durable write and a notice
+    row every interval, for the life of the watch, against one turn per streak floor
+    without any judge at all. So the screen would invert its own purpose for the
+    commonest gated loop there is.
+    """
+
+    def test_a_probe_covered_tick_answers_quiet(self) -> None:
+        svc = _service()
+
+        async def collect(loop: NudgeLoop) -> tuple[list[dict], int, dict]:
+            # What the reader produces for the probe's own subject with no canonical
+            # facts behind it: nothing to judge, and nothing unread either.
+            return [], 0, {}
+
+        svc._collect_judge_evidence = collect
+        svc._persist_soon = lambda: None  # type: ignore[method-assign]
+        loop = _loop({"wake_when": "checks go red"})
+        loop.message = "https://github.com/o/r/pull/7"
+
+        with (
+            patch("kiro_crew.decisions.is_enabled", lambda *a, **k: True),
+            patch("kiro_crew.decisions.judge_evidence_scope_granted", lambda **k: True),
+        ):
+            got = asyncio.run(svc._judge_tick_is_quiet(loop))
+        assert got is True, "the probe already read this subject, so the tick stays free"
+
+    def test_an_unread_target_still_fires(self) -> None:
+        """The control, and the reason the drop exists at all."""
+        svc = _service()
+
+        async def collect(loop: NudgeLoop) -> tuple[list[dict], int, dict]:
+            return [], 1, {}
+
+        svc._collect_judge_evidence = collect
+        svc._persist_soon = lambda: None  # type: ignore[method-assign]
+        loop = _loop({"wake_when": "checks go red"})
+        loop.message = "https://github.com/o/r/pull/7"
+
+        with (
+            patch("kiro_crew.decisions.is_enabled", lambda *a, **k: True),
+            patch("kiro_crew.decisions.judge_evidence_scope_granted", lambda **k: True),
+        ):
+            got = asyncio.run(svc._judge_tick_is_quiet(loop))
+        assert got is False, "one target nobody read makes the reading incomplete"
+
+
+class TestARetargetDoesNotLeakOrLie:
+    """A message retarget changes WHAT is judged without touching the judge spec.
+
+    Targets are parsed out of ``loop.message``, so the spec can be byte-identical
+    across a retarget. Two separate faults followed from that, and each is pinned here.
+    """
+
+    def test_a_retarget_prunes_the_old_target_s_cursor(self) -> None:
+        # The collector only ever ADDS a key, so without pruning the old target's cursor
+        # was re-persisted forever and the load cap could later drop a LIVE one instead.
+        spec = {"wake_when": "RULING"}
+        loop = _loop(spec)
+        loop.message = "watch session:chat-9-9"
+        loop.judge_cursors = {"chat-9-9": 12, "chat-old-1": 7}
+        wanted = set(judge.parse_targets(spec, loop.message))
+        pruned = {t: c for t, c in loop.judge_cursors.items() if t in wanted}
+        assert "chat-old-1" not in pruned, "the departed target's cursor is gone"
+        assert pruned.get("chat-9-9") == 12, "and the live one is kept, not reset"
+
+    def test_the_fence_catches_a_retarget_that_leaves_the_spec_identical(self) -> None:
+        # Drives the real tick. The judge answers QUIET, but the message is retargeted
+        # DURING the await, so the verdict answers the previous target and must be
+        # discarded and the turn fired. The spec is byte-identical throughout, so only
+        # the message half of the fence can catch it.
+        svc = _service()
+        loop = _loop({"quiet_when": "the run is green"})
+        loop.message = "watch chat-1-1"
+
+        async def collect(lp: NudgeLoop) -> tuple[list[dict], int, dict]:
+            # The retarget lands while this tick is reading, which is the whole window.
+            lp.message = "watch chat-2-2"
+            return (
+                [
+                    {
+                        "source": "chat-1-1",
+                        "kind": point.KIND_TRANSCRIPT_TAIL,
+                        "age_s": 1.0,
+                        "text": "green",
+                    }
+                ],
+                0,
+                {},
+            )
+
+        async def persist(lp: NudgeLoop) -> bool:
+            return True
+
+        svc._collect_judge_evidence = collect
+        svc._persist_judge_state = persist  # type: ignore[method-assign]
+        svc._persist_soon = lambda: None  # type: ignore[method-assign]
+
+        async def tick(instruction: str, **kwargs: Any) -> Any:
+            return Verdict(outcome=Outcome.QUIET, body="quiet")
+
+        with (
+            patch("kiro_crew.decisions.is_enabled", lambda *a, **k: True),
+            patch("kiro_crew.decisions.judge_evidence_scope_granted", lambda **k: True),
+            patch("kiro_crew.decisions.points.nudge_wake.judge_tick", tick),
+        ):
+            answer = asyncio.run(svc._judge_tick_is_quiet(loop))
+
+        assert answer is False, "a verdict answering the old target cannot suppress the turn"
+        assert loop.judge_quiet_streak == 0, "and it earns no streak against the new target"
+
+    def test_the_two_targets_really_do_differ(self) -> None:
+        # Guards the test above from passing on a parse that ignores the message.
+        a = judge.parse_targets({"wake_when": "x"}, "watch session:chat-1-1")
+        b = judge.parse_targets({"wake_when": "x"}, "watch session:chat-2-2")
+        assert a != b and a and b
+
+
+class TestANarrowedWatchIsNeverWidened:
+    """Naming ``targets`` narrows the watch, and a dropped entry must not undo that.
+
+    Falling through to message inference hands the owner a WIDER watch than they asked
+    for and reads evidence from a session they never named.
+    """
+
+    def test_an_unusable_explicit_target_does_not_infer_from_the_message(self) -> None:
+        got = judge.parse_targets({"wake_when": "x", "targets": ["!!!bad!!!"]}, "watch chat-7-7")
+        assert got == [], "no target, rather than one the owner never named"
+
+    def test_an_explicitly_empty_list_watches_nothing(self) -> None:
+        assert judge.parse_targets({"wake_when": "x", "targets": []}, "watch chat-7-7") == []
+
+    def test_no_list_at_all_still_infers_from_the_message(self) -> None:
+        # The default the design asks for is unchanged: absent is not the same as empty.
+        assert judge.parse_targets({"wake_when": "x"}, "watch chat-7-7") == ["chat-7-7"]
+
+    def test_a_usable_explicit_target_wins_over_the_message(self) -> None:
+        got = judge.parse_targets({"wake_when": "x", "targets": ["chat-1-1"]}, "watch chat-7-7")
+        assert got == ["chat-1-1"]
+
+    def test_no_targets_fires_rather_than_suppressing(self) -> None:
+        # Why answering [] is safe: the tick spends a turn instead of going quiet.
+        svc = _service()
+        loop = _loop({"wake_when": "x", "targets": ["!!!bad!!!"]})
+        loop.message = "watch chat-7-7"
+
+        async def collect(lp: NudgeLoop) -> tuple[list[dict], int, dict]:
+            raise AssertionError("a loop with no usable target must not collect evidence")
+
+        svc._collect_judge_evidence = collect
+        with (
+            patch("kiro_crew.decisions.is_enabled", lambda *a, **k: True),
+            patch("kiro_crew.decisions.judge_evidence_scope_granted", lambda **k: True),
+        ):
+            assert asyncio.run(svc._judge_tick_is_quiet(loop)) is False
+
+    def test_the_quiet_floor_also_owes_its_turn(self) -> None:
+        # The floor branch FIRES, so it owes a turn exactly as a wake does. It was the
+        # one firing path the marker missed, and the loss there is silent: the reset it
+        # persists means the next tick finds nothing new and pushes the forced turn out
+        # another whole floor with nothing recording that one was due.
+        svc = _service()
+
+        async def collect(loop: NudgeLoop) -> tuple[list[dict], int, dict]:
+            return (
+                [
+                    {
+                        "source": "chat-2-2",
+                        "kind": point.KIND_TRANSCRIPT_TAIL,
+                        "age_s": 1.0,
+                        "text": "still green",
+                    }
+                ],
+                0,
+                {},
+            )
+
+        async def persist(loop: NudgeLoop) -> bool:
+            return True
+
+        svc._collect_judge_evidence = collect
+        svc._persist_judge_state = persist  # type: ignore[method-assign]
+        svc._persist_soon = lambda: None  # type: ignore[method-assign]
+        loop = _loop({"quiet_when": "the run is green"})
+        # One short of the floor, so this tick reaches it.
+        loop.judge_quiet_streak = svc._judge_quiet_streak_floor() - 1
+
+        async def tick(instruction: str, **kwargs: Any) -> Any:
+            return Verdict(outcome=Outcome.QUIET, body="quiet")
+
+        with (
+            patch("kiro_crew.decisions.is_enabled", lambda *a, **k: True),
+            patch("kiro_crew.decisions.judge_evidence_scope_granted", lambda **k: True),
+            patch("kiro_crew.decisions.points.nudge_wake.judge_tick", tick),
+        ):
+            answer = asyncio.run(svc._judge_tick_is_quiet(loop))
+
+        assert answer is False, "the floor fires"
+        assert loop.judge_quiet_streak == 0, "and the streak is spent"
+        assert loop.judge_wake_pending is True, "and the turn it owes survives a refusal"
+
+
+class TestCursorsMoveOnlyWithAVerdict:
+    """Read positions are a consequence of a verdict, so they land only with one.
+
+    The judge await is cancellable -- a user typing cancels exactly that task -- so a
+    tick can end after the reading and before any commit. Publishing the advanced
+    positions before that point consumes rows for a verdict that never happened: the
+    next tick reads nothing new, answers quiet, and the wake those rows had earned is
+    gone, silently, until the streak floor.
+    """
+
+    @staticmethod
+    def _svc(outcome: Outcome | None, raise_exc: BaseException | None = None):
+        svc = _service()
+        advanced = {"chat-2-2": 99}
+
+        async def collect(loop: NudgeLoop) -> tuple[list[dict], int, dict]:
+            return (
+                [
+                    {
+                        "source": "chat-2-2",
+                        "kind": point.KIND_TRANSCRIPT_TAIL,
+                        "age_s": 1.0,
+                        "text": "WORKING",
+                    }
+                ],
+                0,
+                dict(advanced),
+            )
+
+        async def persist(loop: NudgeLoop) -> bool:
+            return True
+
+        svc._collect_judge_evidence = collect
+        svc._persist_judge_state = persist  # type: ignore[method-assign]
+        svc._persist_soon = lambda: None  # type: ignore[method-assign]
+
+        async def tick(instruction: str, **kwargs: Any) -> Any:
+            if raise_exc is not None:
+                raise raise_exc
+            return Verdict(outcome=outcome or Outcome.QUIET, body="x")
+
+        return svc, tick, advanced
+
+    def test_a_cancelled_judge_leaves_the_stored_cursors_alone(self) -> None:
+        svc, tick, _ = self._svc(None, raise_exc=asyncio.CancelledError())
+        loop = _loop({"quiet_when": "the run is green"})
+        loop.judge_cursors = {"chat-2-2": 7}
+
+        with (
+            patch("kiro_crew.decisions.is_enabled", lambda *a, **k: True),
+            patch("kiro_crew.decisions.judge_evidence_scope_granted", lambda **k: True),
+            patch("kiro_crew.decisions.points.nudge_wake.judge_tick", tick),
+        ):
+            try:
+                asyncio.run(svc._judge_tick_is_quiet(loop))
+            except asyncio.CancelledError:
+                pass
+
+        assert loop.judge_cursors == {
+            "chat-2-2": 7
+        }, "the reading was never judged, so it was never consumed"
+
+    def test_a_committed_verdict_does_publish_them(self) -> None:
+        # The other half: without this the fix could simply never advance cursors.
+        svc, tick, advanced = self._svc(Outcome.QUIET)
+        loop = _loop({"quiet_when": "the run is green"})
+        loop.judge_cursors = {"chat-2-2": 7}
+
+        with (
+            patch("kiro_crew.decisions.is_enabled", lambda *a, **k: True),
+            patch("kiro_crew.decisions.judge_evidence_scope_granted", lambda **k: True),
+            patch("kiro_crew.decisions.points.nudge_wake.judge_tick", tick),
+        ):
+            asyncio.run(svc._judge_tick_is_quiet(loop))
+
+        assert loop.judge_cursors == advanced, "a judged reading is consumed"
+
 
 def _service() -> AutoNudgeService:
     """A service with no disk and no evidence reader wired, for tick tests."""
@@ -710,17 +1233,36 @@ def _service() -> AutoNudgeService:
     return svc
 
 
-def _loop(brief: dict | None = None) -> NudgeLoop:
+def _loop(brief: dict | None = None, *, gate: bool = True) -> NudgeLoop:
     loop = NudgeLoop(id="l1", slot_key="chat-1-1", message="watch chat-2-2")
     loop.judge = dict(brief or {})
+    # GATED, because that is the population the judge screens: monitor_start's own
+    # directive gates unless the caller passes `gate=false`, and an ungated loop is
+    # one whose duty is to act while its subject is quiet. A helper that left this
+    # False would be testing the bypass in every case that meant to test the judge.
+    loop.gate = gate
     return loop
 
 
 class TestTickLeavesEverythingAloneWhenItShould:
     """``None`` means the judge had no say, so the tick behaves exactly as today."""
 
-    def test_no_brief(self) -> None:
-        assert asyncio.run(_service()._judge_tick_is_quiet(_loop())) is None
+    def test_an_ungated_loop_is_never_screened(self) -> None:
+        # `gate=false` is a loop whose duty is to act WHILE its subject is quiet -- a
+        # heartbeat, a reviewer chase -- so suppressing a quiet tick would remove the
+        # work rather than the waste. It is the bypass, not an absent decision.
+        assert asyncio.run(_service()._judge_tick_is_quiet(_loop(gate=False))) is None
+
+    def test_an_ungated_loop_is_not_screened_even_with_a_brief(self) -> None:
+        loop = _loop({"wake_when": "x"}, gate=False)
+        assert asyncio.run(_service()._judge_tick_is_quiet(loop)) is None
+
+    def test_an_explicit_judge_false_bypasses_the_judge(self) -> None:
+        # The other bypass, and it means something different: this owner wants
+        # observation gating and no judge. Stored as the reserved marker that
+        # `judge: false` normalises to.
+        loop = _loop({JUDGE_OFF_KEY: True})
+        assert asyncio.run(_service()._judge_tick_is_quiet(loop)) is None
 
     def test_brief_but_no_evidence_reader(self) -> None:
         assert asyncio.run(_service()._judge_tick_is_quiet(_loop({"wake_when": "x"}))) is None
@@ -736,7 +1278,7 @@ class TestTickLeavesEverythingAloneWhenItShould:
         """
         svc = _service()
 
-        async def never(loop: NudgeLoop) -> tuple[list[dict], int]:
+        async def never(loop: NudgeLoop) -> tuple[list[dict], int, dict]:
             raise AssertionError("collected evidence while the seam refused")
 
         svc._collect_judge_evidence = never
@@ -777,15 +1319,19 @@ class TestTickVerdicts:
     def _armed(verdict_answers: dict[str, Answer] | None) -> tuple[AutoNudgeService, NudgeLoop]:
         svc = _service()
 
-        async def collect(loop: NudgeLoop) -> tuple[list[dict], int]:
-            return [
-                {
-                    "source": "session:chat-2-2",
-                    "kind": point.KIND_TRANSCRIPT_TAIL,
-                    "age_s": 1.0,
-                    "text": "WORKING: still building",
-                }
-            ], 0
+        async def collect(loop: NudgeLoop) -> tuple[list[dict], int, dict]:
+            return (
+                [
+                    {
+                        "source": "session:chat-2-2",
+                        "kind": point.KIND_TRANSCRIPT_TAIL,
+                        "age_s": 1.0,
+                        "text": "WORKING: still building",
+                    }
+                ],
+                0,
+                {},
+            )
 
         svc._collect_judge_evidence = collect
         svc._persist_soon = lambda: None  # type: ignore[method-assign]
@@ -818,16 +1364,20 @@ class TestTickVerdicts:
         svc, loop = self._armed(None)
         loop.judge_cursors = {"chat-2-2": 5}
 
-        async def replace_then_read(loop_: NudgeLoop) -> tuple[list[dict], int]:
+        async def replace_then_read(loop_: NudgeLoop) -> tuple[list[dict], int, dict]:
             loop_.judge = {"wake_when": "something else entirely"}
-            return [
-                {
-                    "source": "session:chat-2-2",
-                    "kind": point.KIND_TRANSCRIPT_TAIL,
-                    "age_s": 1.0,
-                    "text": "WORKING: still building",
-                }
-            ], 0
+            return (
+                [
+                    {
+                        "source": "session:chat-2-2",
+                        "kind": point.KIND_TRANSCRIPT_TAIL,
+                        "age_s": 1.0,
+                        "text": "WORKING: still building",
+                    }
+                ],
+                0,
+                {},
+            )
 
         svc._collect_judge_evidence = replace_then_read  # type: ignore[method-assign]
         assert self._run(svc, loop, answers()) is False, "a stale verdict fires"
@@ -844,8 +1394,8 @@ class TestTickVerdicts:
     def _reads(svc: AutoNudgeService, dropped: int) -> None:
         """Make the collector return an empty delta, with *dropped* targets unread."""
 
-        async def read(loop: NudgeLoop) -> tuple[list[dict], int]:
-            return [], dropped
+        async def read(loop: NudgeLoop) -> tuple[list[dict], int, dict]:
+            return [], dropped, {}
 
         svc._collect_judge_evidence = read  # type: ignore[method-assign]
 
@@ -959,11 +1509,242 @@ class TestTickVerdicts:
     def test_collector_failure_spends_a_turn(self) -> None:
         svc, loop = self._armed(None)
 
-        async def boom(loop_: NudgeLoop) -> tuple[list[dict], int]:
+        async def boom(loop_: NudgeLoop) -> tuple[list[dict], int, dict]:
             raise RuntimeError("slot read exploded")
 
         svc._collect_judge_evidence = boom
         assert self._run(svc, loop, answers()) is False
+
+
+class TestTheDefaultBrief:
+    """A gated loop is screened whether or not its owner wrote a brief."""
+
+    @staticmethod
+    def _sees_criteria() -> tuple[AutoNudgeService, list[tuple[str, str]], list[str]]:
+        """A service that records the criteria the judge was asked under."""
+        svc = _service()
+        asked: list[tuple[str, str]] = []
+        sink: list[str] = []
+
+        async def collect(loop: NudgeLoop) -> tuple[list[dict], int, dict]:
+            return (
+                [
+                    {
+                        "source": "session:chat-2-2",
+                        "kind": point.KIND_TRANSCRIPT_TAIL,
+                        "age_s": 1.0,
+                        "text": "WORKING",
+                    }
+                ],
+                0,
+                {},
+            )
+
+        async def emit(loop: NudgeLoop, line: str) -> None:
+            sink.append(line)
+
+        svc._collect_judge_evidence = collect
+        svc._emit_judge_notice = emit
+        svc._persist_soon = lambda: None  # type: ignore[method-assign]
+        return svc, asked, sink
+
+    def _run(self, svc: AutoNudgeService, loop: NudgeLoop, asked: list) -> Any:
+        async def tick(instruction: str, **kwargs: Any) -> Any:
+            asked.append((kwargs.get("wake_when", ""), kwargs.get("quiet_when", "")))
+            return Verdict(outcome=Outcome.QUIET, body="no new evidence")
+
+        with (
+            patch("kiro_crew.decisions.is_enabled", lambda *a, **k: True),
+            # GRANTED, because the default brief's own precondition is this point's
+            # egress scope -- these cases are a machine whose owner opted in.
+            patch("kiro_crew.decisions.judge_evidence_scope_granted", lambda **k: True),
+            patch("kiro_crew.decisions.points.nudge_wake.judge_tick", tick),
+        ):
+            return asyncio.run(svc._judge_tick_is_quiet(loop))
+
+    def test_a_gated_loop_with_no_brief_is_judged_under_the_default(self) -> None:
+        svc, asked, _ = self._sees_criteria()
+        self._run(svc, _loop(), asked)
+        assert asked == [(judge.DEFAULT_WAKE_WHEN, judge.DEFAULT_QUIET_WHEN)]
+
+    def test_the_owners_own_sentences_replace_the_default(self) -> None:
+        svc, asked, _ = self._sees_criteria()
+        self._run(svc, _loop({"wake_when": "a line starts with RULING"}), asked)
+        assert asked == [("a line starts with RULING", "")], "no default is mixed in"
+
+    def test_a_brief_naming_only_targets_still_gets_the_defaults_sentences(self) -> None:
+        # `targets` says WHICH subjects to watch and nothing about when to wake, so a
+        # brief carrying only targets needs the default's criteria and keeps its own
+        # list. Keyed on the criteria rather than on the brief being empty for exactly
+        # this case.
+        svc, asked, _ = self._sees_criteria()
+        loop = _loop({"targets": ["chat-2-2"]})
+        self._run(svc, loop, asked)
+        assert asked == [(judge.DEFAULT_WAKE_WHEN, judge.DEFAULT_QUIET_WHEN)]
+
+    def test_the_default_is_not_written_back_onto_the_loop(self) -> None:
+        # The loop keeps storing no brief, so granting the owner a criterion later is
+        # still an empty-to-set change rather than an edit of shipped text, and the
+        # mid-tick replacement guard compares against what was stored.
+        svc, asked, _ = self._sees_criteria()
+        loop = _loop()
+        self._run(svc, loop, asked)
+        assert loop.judge == {}
+
+    def test_the_default_needs_this_points_own_egress_scope(self) -> None:
+        # The ruling's own precondition is the SCOPE, and `is_enabled` is a broader
+        # question: the LLM lane satisfies it on the provider key alone. The gate
+        # documents a loop's own brief as half of that lane's authorization, so a loop
+        # whose owner armed nothing must not be screened on that authority by itself.
+        svc, asked, _ = self._sees_criteria()
+
+        async def tick(instruction: str, **kwargs: Any) -> Any:
+            asked.append((kwargs.get("wake_when", ""), kwargs.get("quiet_when", "")))
+            return Verdict(outcome=Outcome.QUIET, body="no new evidence")
+
+        with (
+            patch("kiro_crew.decisions.is_enabled", lambda *a, **k: True),
+            patch("kiro_crew.decisions.judge_evidence_scope_granted", lambda **k: False),
+            patch("kiro_crew.decisions.points.nudge_wake.judge_tick", tick),
+        ):
+            got = asyncio.run(svc._judge_tick_is_quiet(_loop()))
+        assert got is None, "scope off leaves the tick exactly as today"
+        assert asked == [], "nothing was read, so nothing was sent"
+
+    def test_an_explicit_brief_still_runs_without_that_scope(self) -> None:
+        # Unchanged from before the default existed: an owner who armed a criterion
+        # supplied the affirmative act the LLM lane's authorization rests on.
+        svc, asked, _ = self._sees_criteria()
+
+        async def tick(instruction: str, **kwargs: Any) -> Any:
+            asked.append((kwargs.get("wake_when", ""), kwargs.get("quiet_when", "")))
+            return Verdict(outcome=Outcome.QUIET, body="no new evidence")
+
+        with (
+            patch("kiro_crew.decisions.is_enabled", lambda *a, **k: True),
+            patch("kiro_crew.decisions.judge_evidence_scope_granted", lambda **k: False),
+            patch("kiro_crew.decisions.points.nudge_wake.judge_tick", tick),
+        ):
+            got = asyncio.run(svc._judge_tick_is_quiet(_loop({"wake_when": "RULING"})))
+        assert got is True
+        assert asked == [("RULING", "")]
+
+    def test_the_notice_names_the_default_brief(self) -> None:
+        svc, asked, sink = self._sees_criteria()
+        self._run(svc, _loop(), asked)
+        assert "default brief" in sink[0]
+        assert "custom" not in sink[0]
+
+    def test_the_notice_names_a_custom_brief(self) -> None:
+        svc, asked, sink = self._sees_criteria()
+        self._run(svc, _loop({"wake_when": "RULING"}), asked)
+        assert "custom brief" in sink[0]
+        assert "default" not in sink[0]
+
+
+class TestPersistBeforePublish:
+    """The notice describes committed state, so the write goes first on every path."""
+
+    @staticmethod
+    def _ordered(outcome: Outcome, *, persist_ok: bool = True):
+        """Run one tick and return the ordered ('persist'|'notice') trail."""
+        svc = _service()
+        trail: list[str] = []
+
+        async def collect(loop: NudgeLoop) -> tuple[list[dict], int, dict]:
+            return (
+                [
+                    {
+                        "source": "session:chat-2-2",
+                        "kind": point.KIND_TRANSCRIPT_TAIL,
+                        "age_s": 1.0,
+                        "text": "WORKING",
+                    }
+                ],
+                0,
+                {},
+            )
+
+        async def emit(loop: NudgeLoop, line: str) -> None:
+            trail.append("notice")
+
+        async def persist(loop: NudgeLoop) -> bool:
+            trail.append("persist")
+            return persist_ok
+
+        svc._collect_judge_evidence = collect
+        svc._emit_judge_notice = emit
+        svc._persist_judge_state = persist  # type: ignore[method-assign]
+        svc._persist_soon = lambda: None  # type: ignore[method-assign]
+
+        async def tick(instruction: str, **kwargs: Any) -> Any:
+            return Verdict(outcome=outcome, body="x")
+
+        with (
+            patch("kiro_crew.decisions.is_enabled", lambda *a, **k: True),
+            patch("kiro_crew.decisions.judge_evidence_scope_granted", lambda **k: True),
+            patch("kiro_crew.decisions.points.nudge_wake.judge_tick", tick),
+        ):
+            got = asyncio.run(svc._judge_tick_is_quiet(_loop({"wake_when": "RULING"})))
+        return got, trail
+
+    def test_a_quiet_writes_before_it_notifies(self) -> None:
+        got, trail = self._ordered(Outcome.QUIET)
+        assert got is True
+        assert trail == ["persist", "notice"]
+
+    def test_a_wake_writes_before_it_notifies(self) -> None:
+        got, trail = self._ordered(Outcome.WAKE)
+        assert got is False
+        assert trail == ["persist", "notice"]
+
+    def test_a_failed_write_still_notifies_and_fires(self) -> None:
+        # The notice must not be lost on the path that fires BECAUSE the write failed:
+        # that tick spends a turn and the reader still needs to know why.
+        got, trail = self._ordered(Outcome.QUIET, persist_ok=False)
+        assert got is False
+        assert trail == ["persist", "notice"]
+
+    def test_a_brief_replaced_before_the_commit_is_discarded(self) -> None:
+        svc = _service()
+        loop = _loop({"wake_when": "RULING"})
+        emitted: list[str] = []
+
+        async def collect(inner: NudgeLoop) -> tuple[list[dict], int, dict]:
+            return (
+                [
+                    {
+                        "source": "session:chat-2-2",
+                        "kind": point.KIND_TRANSCRIPT_TAIL,
+                        "age_s": 1.0,
+                        "text": "WORKING",
+                    }
+                ],
+                0,
+                {},
+            )
+
+        async def emit(inner: NudgeLoop, line: str) -> None:
+            emitted.append(line)
+
+        svc._collect_judge_evidence = collect
+        svc._emit_judge_notice = emit
+        svc._persist_soon = lambda: None  # type: ignore[method-assign]
+
+        async def tick(instruction: str, **kwargs: Any) -> Any:
+            # The owner revises the brief while the judge is deciding.
+            loop.judge = {"wake_when": "something else entirely"}
+            return Verdict(outcome=Outcome.QUIET, body="x")
+
+        with (
+            patch("kiro_crew.decisions.is_enabled", lambda *a, **k: True),
+            patch("kiro_crew.decisions.judge_evidence_scope_granted", lambda **k: True),
+            patch("kiro_crew.decisions.points.nudge_wake.judge_tick", tick),
+        ):
+            got = asyncio.run(svc._judge_tick_is_quiet(loop))
+        assert got is False, "a verdict about a withdrawn question fires rather than suppressing"
+        assert loop.judge_quiet_streak == 0, "no streak is earned for the replacement brief"
+        assert emitted == [], "and no notice claims a verdict that was discarded"
 
 
 class TestTranscriptNotice:
@@ -974,15 +1755,19 @@ class TestTranscriptNotice:
         svc = _service()
         sink: list[str] = []
 
-        async def collect(loop: NudgeLoop) -> tuple[list[dict], int]:
-            return [
-                {
-                    "source": "session:chat-2-2",
-                    "kind": point.KIND_TRANSCRIPT_TAIL,
-                    "age_s": 1.0,
-                    "text": "WORKING: still building",
-                }
-            ], 0
+        async def collect(loop: NudgeLoop) -> tuple[list[dict], int, dict]:
+            return (
+                [
+                    {
+                        "source": "session:chat-2-2",
+                        "kind": point.KIND_TRANSCRIPT_TAIL,
+                        "age_s": 1.0,
+                        "text": "WORKING: still building",
+                    }
+                ],
+                0,
+                {},
+            )
 
         async def emit(loop: NudgeLoop, line: str) -> None:
             sink.append(line)
@@ -1193,6 +1978,89 @@ class TestTheReaderOnlyAnswersForItsOwnSubject:
         assert "judge" in inspect.signature(autonudge_authz.authorize_and_update_nudge).parameters
         assert "judge=judge" in inspect.getsource(autonudge_authz.authorize_and_update_nudge)
         assert "judge" in inspect.signature(AutoNudgeService.update).parameters
+
+
+class TestTheReaderAnswersForTheShapeAMonitorActuallyStores:
+    """The watched side is read from a real ``MonitorState``, not a hand-written string.
+
+    ``infer_monitor`` stores the CANONICAL subject (``owner/name#123``) and the
+    inferred kind, not the URL the owner armed with. A check that puts that stored
+    subject back through inference gets nothing -- the shorthand carries no host by
+    design -- so every judged pull-request watch had its target dropped and answered
+    FALLBACK on every tick, which fires and spends the turn the judge exists to save.
+
+    Hand-written monitor fields hid that: they spelled the watched side as the URL
+    and the kind as the wire name, so the comparison ran on two values neither
+    producer emits.
+    """
+
+    MESSAGE = "Watch https://github.com/kirodotdev/KiroCrew/pull/12787 until CI is green."
+
+    def _stored(self) -> tuple[str, str]:
+        monitor = infer_monitor(self.MESSAGE, now=1_000.0)
+        assert monitor is not None
+        return monitor.kind, monitor.target
+
+    def test_the_stored_subject_is_the_canonical_shorthand(self) -> None:
+        """The premise: what is stored is not what the owner typed."""
+        kind, watched = self._stored()
+        assert watched == "kirodotdev/KiroCrew#12787"
+        assert kind == "gh-pr"
+        assert judge._pr_identity(watched) is None
+
+    def test_the_target_the_message_yields_is_accepted(self) -> None:
+        """The whole point: a URL-armed loop's own target reaches its own observation."""
+        kind, watched = self._stored()
+        targets = judge.parse_targets(None, self.MESSAGE)
+        assert targets, "the message names a pull request"
+        for target in targets:
+            assert (
+                judge.pr_observation_is_about(
+                    target,
+                    monitor_kind=kind,
+                    monitor_target=watched,
+                    observation={},
+                )
+                is True
+            )
+
+    def test_another_pull_request_is_still_refused_against_a_stored_subject(self) -> None:
+        kind, watched = self._stored()
+        assert (
+            judge.pr_observation_is_about(
+                "https://github.com/kirodotdev/KiroCrew/pull/12788",
+                monitor_kind=kind,
+                monitor_target=watched,
+                observation={},
+            )
+            is False
+        )
+
+    def test_the_same_number_on_another_repository_is_still_refused(self) -> None:
+        kind, watched = self._stored()
+        assert (
+            judge.pr_observation_is_about(
+                "https://github.com/other/repo/pull/12787",
+                monitor_kind=kind,
+                monitor_target=watched,
+                observation={},
+            )
+            is False
+        )
+
+    def test_a_kind_the_monitor_is_not_bound_to_is_refused(self) -> None:
+        _kind, watched = self._stored()
+        targets = judge.parse_targets(None, self.MESSAGE)
+        assert all(
+            judge.pr_observation_is_about(
+                target,
+                monitor_kind="gitlab-mr",
+                monitor_target=watched,
+                observation={},
+            )
+            is False
+            for target in targets
+        )
 
 
 class TestAgeParsing:
@@ -1495,8 +2363,11 @@ class TestNudgeWakeConfigSection:
         assert DecisionsConfig.from_raw({"nudge_wake": raw}).nudge_wake.quiet_streak_floor == stored
 
     def test_an_over_large_stored_floor_is_clamped_by_the_engine(self) -> None:
-        """``config.json`` is agent-writable, so the ceiling holds on read."""
-        from kiro_crew.autonudge import _JUDGE_QUIET_STREAK_FLOOR_MAX
+        """The knob only ever shortens the window, so the shipped floor IS the ceiling.
+
+        ``config.json`` is agent-writable, and a floor that could be raised would be a
+        second way to silence a watch with no new code -- only a number.
+        """
         from kiro_crew.config.sections import DecisionsConfig
 
         stored = DecisionsConfig.from_raw({"nudge_wake": {"quiet_streak_floor": 9999}}).nudge_wake
@@ -1506,7 +2377,7 @@ class TestNudgeWakeConfigSection:
 
         service = AutoNudgeService.__new__(AutoNudgeService)
         with patch("kiro_crew.config.live.snapshot", return_value=_Snapshot()):
-            assert service._judge_quiet_streak_floor() == _JUDGE_QUIET_STREAK_FLOOR_MAX
+            assert service._judge_quiet_streak_floor() == _JUDGE_QUIET_STREAK_FLOOR_DEFAULT
 
     @pytest.mark.parametrize("section", [None, "jev", 7, [], True])
     def test_a_non_object_section_reads_as_the_defaults(self, section: object) -> None:

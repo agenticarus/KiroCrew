@@ -108,11 +108,10 @@ export interface LegacyGoalLoop {
    *  This record is what the session popover renders a loop from, so a judge the
    *  REST read publishes reaches the owner only by being carried here: the
    *  popover's own loop shape is rebuilt from this one field by field, and a
-   *  value absent here is indistinguishable to it from a plain timer. The three
-   *  keep snake_case names because the same normalizer parses both the REST row
+   *  value absent here is indistinguishable to it from a plain timer. Both keep
+   *  snake_case names because the same normalizer parses both the REST row
    *  and the popover's own edited loop back into this shape. */
   judge?: { wake_when?: string; quiet_when?: string; targets?: string[] }
-  judge_quiet_streak?: number
   judge_last_verdict?: { outcome?: string; evidence_items?: number; at?: number }
 }
 
@@ -252,7 +251,6 @@ function judgeFields(loop: JsonObject): Partial<LegacyGoalLoop> {
       targets,
     }
   }
-  if (owns(loop, 'judge_quiet_streak')) fields.judge_quiet_streak = count(loop.judge_quiet_streak)
   const verdict = object(loop.judge_last_verdict)
   if (verdict) {
     fields.judge_last_verdict = {

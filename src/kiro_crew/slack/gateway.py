@@ -7951,7 +7951,7 @@ class GatewayOrchestrator:
                     # closes exactly that with an explicitly terminal `interrupted`.
                     _publish()
 
-        async def _collect_judge_evidence(loop: NudgeLoop) -> tuple[list[dict], int]:
+        async def _collect_judge_evidence(loop: NudgeLoop) -> tuple[list[dict], int, dict]:
             """The wake judge's evidence for one tick: new worker rows, plus the probe.
 
             A closure rather than a method on the service, for the reason ``_fire`` and
@@ -7973,7 +7973,9 @@ class GatewayOrchestrator:
 
             state = self.dashboard_state
             if state is None:
-                return [], 0
+                # No cursors either, and an empty map is the truthful third value: with
+                # no dashboard state nothing was read, so nothing advanced.
+                return [], 0, {}
 
             async def _read_session(target: str, since: int) -> tuple[list[dict], int]:
                 # Off the loop: this authorizes, may write a SEL row, and reads slot
@@ -8007,6 +8009,26 @@ class GatewayOrchestrator:
                 observed = getattr(monitor, "last_observation", None) if monitor else None
                 if monitor is None or not isinstance(observed, dict):
                     return None
+                # A factless observation is an UNREAD target only when nothing read the
+                # subject this tick. The canonical field has one writer, the structured
+                # controller's provider, and a judged loop is a GATED one observing
+                # through the raise-based kernel, whose verdict carries no facts -- so
+                # this reader sees an empty canonical for every loop the judge screens.
+                # On that path the probe HAS read this subject and returned quiet, which
+                # is the only reason the judge is being asked, so the subject is read and
+                # this target is not a drop: it contributes nothing and the probe's own
+                # quiet stands. Calling it unread would fire a turn the probe already
+                # settled, every interval, for the life of the watch.
+                probe_covers_subject = monitor.outcome is None and bool(
+                    getattr(loop, "gate", False)
+                )
+                if _judge.pr_target_is_unread(observed, probe_covers_subject=probe_covers_subject):
+                    logger.debug(
+                        "AutoNudge: no pull-request reading for loop %s -- counting the "
+                        "target as unread",
+                        loop.id,
+                    )
+                    return None
                 # A loop holds ONE monitor, so this returns the same observation for
                 # every subject it is asked about. The brief's targets are the owner's
                 # strings and may name a DIFFERENT pull request, which would label the
@@ -8032,15 +8054,34 @@ class GatewayOrchestrator:
                     payload["observed_at"] = float(at)
                 return payload
 
-            cursors = dict(loop.judge_cursors)
+            targets = _judge.parse_targets(_judge.spec_of(loop), loop.message)
+            # Pruned to the targets this tick actually reads, not merely copied. The
+            # collector only ever ADDS a key, the targets come from ``loop.message``, and
+            # ``asdict`` persists whatever the map holds, so without this a retarget
+            # leaves the departed target's cursor in the store for the life of the loop.
+            #
+            # Pruning at the write is what bounds retention in the process doing the
+            # writing. The load cap is not that bound: it keeps an arbitrary 16, so it
+            # can discard the cursor of a target still being read, and a lost cursor
+            # replays rows the judge already screened. With the population pruned to the
+            # current targets, the two bounds that disagree -- 16 cursors against 8
+            # targets -- collapse into the smaller one and the cap never binds.
+            wanted = set(targets)
+            cursors = {t: c for t, c in loop.judge_cursors.items() if t in wanted}
             evidence, dropped = await _judge.collect_evidence(
-                _judge.parse_targets(_judge.spec_of(loop), loop.message),
+                targets,
                 read_session=_read_session,
                 read_pr=_read_pr,
                 cursors=cursors,
             )
-            loop.judge_cursors = cursors
-            return evidence, dropped
+            # RETURNED, not assigned onto the loop. The advanced positions are a
+            # consequence of a reading that has not been judged yet, and the judge await
+            # that follows is cancellable -- a user typing cancels exactly that task --
+            # so publishing here moves the cursors for a verdict that never commits. The
+            # next tick then reads nothing new, answers quiet, and the wake the skipped
+            # row had earned is gone. The caller owns the one point where a verdict is
+            # committed, so the caller publishes them.
+            return evidence, dropped, cursors
 
         async def _emit_judge_notice(loop: NudgeLoop, line: str) -> None:
             """Write ONE ``notice`` row on the owning session for a judge verdict.
@@ -8071,7 +8112,6 @@ class GatewayOrchestrator:
             if slot is None:
                 return
             from kiro_crew.dashboard.state import append_and_surface
-            from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
             text, _ = redact_exfiltration_urls(line)
             text, _ = redact_credentials(text)
