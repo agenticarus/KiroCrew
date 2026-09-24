@@ -470,8 +470,20 @@ class TestReserveDashboardPort:
                 assert ipv4_sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) != 0
 
             if socket.has_ipv6 and hasattr(socket, "IPPROTO_IPV6"):
-                ipv6_sock = srv._bind_once("::1", 0)
-                assert ipv6_sock.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) != 0
+                # `has_ipv6` reports how this PYTHON WAS BUILT, not whether the
+                # host can bind an IPv6 address: a container with IPv6 disabled
+                # on its interfaces satisfies it and still answers `::1` with
+                # EADDRNOTAVAIL. Bind first and treat an unavailable loopback
+                # as "no IPv6 here" -- the assertion below is about the option
+                # _bind_once sets, so a host that cannot offer the socket has
+                # nothing to say about it.
+                try:
+                    ipv6_sock = srv._bind_once("::1", 0)
+                except OSError as exc:
+                    if exc.errno not in (errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT):
+                        raise
+                else:
+                    assert ipv6_sock.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) != 0
 
             assert "SO_EXCLUSIVEADDRUSE" in inspect.getsource(srv._bind_once)
         finally:
