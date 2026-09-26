@@ -65,6 +65,8 @@ from kiro_crew.acp.client import (
     _jsonrpc_error_code,
     _push_model_via_effort_split,
     _raise_acp_error,
+    advertised_model_ids,
+    catalog_row_would_drop,
     compaction_failure_detail,
     compaction_failure_is_transient,
     format_command_result,
@@ -100,6 +102,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
+    ACP_BACKENDS_HOOKS_LIST,
     ACP_BACKENDS_INLINE_COMPACTION,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
@@ -146,6 +149,7 @@ from kiro_crew.acp.types import (
     STOP_REASON_REFUSAL,
     STOP_REASON_STALE_RECOVER,
     STOP_REASON_TOOL_STALL,
+    TERMINAL_TOOL_STATUSES,
     UPDATE_AGENT_MESSAGE_CHUNK,
     UPDATE_AGENT_THOUGHT_CHUNK,
     UPDATE_CURRENT_MODE,
@@ -158,6 +162,7 @@ from kiro_crew.acp.types import (
     effort_config_option_id,
 )
 from kiro_crew.agent_sdk.capabilities import capabilities_for
+from kiro_crew.agent_sdk.drivers.acp import EntitlementRevalidating  # noqa: F401 - raised here
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.executors import subprocess_executor
@@ -170,7 +175,50 @@ from kiro_crew.validation import MAX_ACP_SESSION_ID_LEN
 
 logger = logging.getLogger(__name__)
 
+#: Hook executions one session may have running at once. A hook runs for up to
+#: its own timeout, so this bounds the processes a peer can hold open.
+_MAX_INFLIGHT_HOOK_EXECUTIONS = 4
+
+#: The backend's hooks requests, answered by
+#: :meth:`AcpSessionHandle._answer_kas_hooks_request`. A frozenset so the
+#: dispatch test is one membership check. ``executeHook`` is the one that runs a
+#: command, and :func:`kas_wire.hooks_execute` owns every gate it passes.
+_KAS_HOOKS_METHODS = frozenset(
+    {
+        kas_wire.METHOD_HOOKS_LIST,
+        kas_wire.METHOD_HOOKS_SESSION_START,
+        kas_wire.METHOD_HOOKS_EXECUTE,
+    }
+)
+
 # ── Constants ──
+
+# Read-path entitlement revalidation (see
+# ``AcpSessionHandle.maybe_refresh_available_models``). These bound how eagerly
+# the dashboard picker re-asks the backend what the account can run; they are a
+# scheduling policy, never an entitlement decision.
+#
+# A session-init snapshot captured within this many seconds of the runtime's
+# spawn fell inside the startup window where the degraded (free-tier default)
+# answer is resolved, so it is treated as suspect and revalidated.
+_READ_PATH_SPAWN_RACE_SECS = 90.0
+# A session probes on the read path at most once per this interval, so a hot
+# dashboard poll does not re-probe on every runtime-probe TTL expiry forever.
+# The interval binds a probe-CONFIRMED snapshot and every non-auto-only
+# snapshot; an UNCONFIRMED auto-only snapshot may re-probe (it always earns a
+# probe), bounded by the runtime's own single-flight probe TTL — which now
+# covers the failure/empty path too, so even a failing probe is re-asked at
+# most once per that TTL, not on every read.
+_READ_PATH_REPROBE_MIN_INTERVAL_SECS = 300.0
+# The picker read path awaits the probe at most this long, then raises
+# EntitlementRevalidating so the endpoint returns its degraded (503) response
+# and the frontend keeps its last-good list and polls again; the shielded probe
+# keeps running and the next read serves its landed result. Kept under the
+# remote-hub cold-path budget (DEFAULT_MODELS_CAPABILITY_PROXY_TIMEOUT_SECS in
+# instances/constants.py: 5 + 10 + 3 < 20) so proxied /api/models never times
+# out mid-revalidation.
+_READ_PATH_PROBE_DEADLINE_SECS = 3.0
+
 
 # The stopReason values the pre-turn drain may NAME in its warning: the closed
 # protocol values (``types.STOP_REASON_*``) only. A discarded terminal whose
@@ -725,6 +773,27 @@ class AcpRuntimeProtocol(Protocol):
         ...
 
     @property
+    def spawn_monotonic(self) -> float | None:
+        """Monotonic time the process was spawned, or ``None`` before spawn.
+
+        The read-path entitlement revalidation uses it to tell a snapshot
+        captured inside the startup race window (when the degraded free-tier
+        answer is resolved) from one captured well after the process settled.
+        """
+        ...
+
+    @property
+    def entitlement_probe_result_at(self) -> float:
+        """Monotonic time the stored probe answer arrived (0.0 before any).
+
+        Whether :meth:`probe_advertised_models` served a fresh answer or replayed
+        the stored one, the answer is dated by this clock; the handle dates the
+        snapshot it stores from here so its own freshness floor never rises above
+        the data it holds.
+        """
+        ...
+
+    @property
     def acp_backend(self) -> str:
         """Which ACP backend the process speaks.
 
@@ -755,9 +824,16 @@ class AcpRuntimeProtocol(Protocol):
 
     async def send_request(self, method: str, params: dict[str, Any]) -> int: ...
 
-    async def probe_advertised_models(self) -> list[dict[str, str]]:
+    async def probe_advertised_models(
+        self, *, force: bool = False, not_before: float = 0.0
+    ) -> list[dict[str, str]]:
         """Fresh advertised-model snapshot from a throwaway ``session/new``
-        (``[]`` = probe failed / advertised nothing — never evidence)."""
+        (``[]`` = probe failed / advertised nothing — never evidence).
+
+        ``force=True`` skips the failed/empty attempt-clock replay (a user action
+        earns a fresh probe); a recent non-empty success is still replayed.
+        ``not_before`` is the monotonic capture time of the caller's snapshot: a
+        replayed result is served only if it is at least as new as that."""
         ...
 
     async def send_notification(self, method: str, params: dict[str, Any]) -> None: ...
@@ -807,8 +883,20 @@ class AcpSessionHandle:
         runtime: AcpRuntimeProtocol,
         watchdog: WatchdogSettings | None = None,
         crew_agent: str = "",
+        session_key: str = "",
     ) -> None:
         self._session_id = session_id
+        # The Kiro Crew session that OWNS this ACP session, threaded from the
+        # runtime's create/load paths the way ``crew_agent`` is, and rebound on a
+        # warm-pool claim. The hooks execute path keys its listed-id record and
+        # its governance resolution by it; the ACP ``sessionId`` a request names is
+        # host-supplied and is never used for either. Empty for a pooled session
+        # nobody has claimed yet, which the execute path refuses.
+        self._session_key = session_key
+        self._listed_hooks = kas_wire.ListedHookStore()
+        # Strong references to in-flight hook executions: the loop holds only a
+        # weak one, and a collected task would leave its request unanswered.
+        self._hook_tasks: set[asyncio.Task[None]] = set()
         self.native_context_documents: dict[str, str] = {}
         self._queue = queue
         self._runtime = runtime
@@ -844,9 +932,11 @@ class AcpSessionHandle:
         # submitting a second job, so a wedged walk cannot stack blocked workers
         # in the shared subprocess_executor().
         self._consult_future: asyncio.Future[tuple[str, str]] | None = None
-        # Snapshot of the most recent EVENT_TOOL_CALL (title/redacted input/
-        # dispatch time/shell flag) — the oracle's attribution key. Cleared on
-        # EVENT_TOOL_RESULT alongside _tool_dispatched.
+        # Parallel calls can finish in either order; retain each attribution
+        # until its terminal result so the oracle never inspects a finished call.
+        self._active_tool_calls: dict[
+            str, tuple[ToolCallState, InteractiveClassification | None]
+        ] = {}
         self._inflight_tool: ToolCallState | None = None
         # Pre-dispatch interactive classification of the in-flight SHELL tool
         # (``classify_interactive_command``); ``None`` when no shell tool is in
@@ -1044,6 +1134,29 @@ class AcpSessionHandle:
         self._resolved_model_id: str = ""
         self._config_options: list[dict[str, Any]] = []
         self._available_models: list[dict[str, str]] = []
+        # Read-path revalidation bookkeeping (see maybe_refresh_available_models).
+        # The session-init snapshot is one unconfirmed answer captured at one
+        # instant, and the read path (the dashboard picker filter) has no
+        # explicit-pick refusal to trigger the refresh-before-refuse path — so it
+        # must decide for itself whether a snapshot that would NARROW the catalog
+        # is trustworthy. These three fields are the staleness signals it reads;
+        # each is a monotonic timestamp or a confirmation flag, never entitlement
+        # evidence (the keep/drop verdict stays with ``catalog_row_would_drop``).
+        # 0.0 = never captured (no session/new stored a list yet).
+        self._available_models_captured_at: float = 0.0
+        # True once a probe (refresh_available_models) has confirmed the snapshot
+        # against the live backend — the strongest "trust it" signal.
+        self._available_models_probe_confirmed: bool = False
+        # Monotonic time the read-path heuristic last kicked a probe for THIS
+        # session, so a hot dashboard poll cannot re-probe every TTL expiry
+        # forever once a legitimately-narrow snapshot has been confirmed.
+        self._available_models_read_probe_at: float = 0.0
+        # Single in-flight read-path refresh task per handle. The read path
+        # shields it, so a deadline miss raises EntitlementRevalidating (the
+        # endpoint answers 503 and the client re-polls) WITHOUT cancelling the
+        # probe — the task keeps running to completion so its throwaway session
+        # is cleaned up and the next read serves its result.
+        self._read_refresh_task: asyncio.Task[list[dict[str, str]]] | None = None
         # Last KAS mode id seen on a current_mode_update, so a re-assert of the
         # already-current mode does not surface a spurious agent-switch echo
         # (kiro-cli only emits on a real _kiro.dev/agent/switched). None = unseen.
@@ -1291,6 +1404,7 @@ class AcpSessionHandle:
         # A new turn starts with no infrastructure verdict carried over.
         self.last_infra_error = None
         self._tool_dispatched = False
+        self._active_tool_calls.clear()
         self._inflight_tool = None
         self._inflight_interactive = None
         self._inflight_tool_call_id = ""
@@ -1752,6 +1866,7 @@ class AcpSessionHandle:
         """
         self._stale_probe = _stale_probe
         self._cancelled = True
+        self._cancel_hook_tasks()
         self._cancel_ts = time.monotonic()
         self._cancel_grace_secs = max(_CANCEL_GRACE_SECS, grace_secs)
         # cancel is a JSON-RPC notification (no id, no response) — use
@@ -2744,6 +2859,15 @@ class AcpSessionHandle:
         self._watchdog = settings if settings is not None else _load_watchdog_settings(crew_agent)
         self._oracle._sample_min_secs = self._watchdog.wellness_sample_secs
 
+    def bind_session_key(self, session_key: str) -> None:
+        """Rebind the owning Kiro Crew session on a warm-pool claim.
+
+        The listed-hook record is keyed by that session, so ids listed before the
+        claim are unreachable from the new key, and its next list answer replaces
+        them.
+        """
+        self._session_key = session_key
+
     def store_session_config(self, resp: dict[str, Any]) -> None:
         """Extract configOptions and available models from session/new or session/load response.
 
@@ -2787,6 +2911,7 @@ class AcpSessionHandle:
                 self._available_models = parse_advertised_models(
                     {"models": {"availableModels": avail}}
                 )
+                self._mark_available_models_captured()
             # A backend may advertise its model list without echoing
             # ``currentModelId`` (it is best-effort in the ACP shape). When it
             # names exactly one model that IS the served model unambiguously, so
@@ -2800,6 +2925,7 @@ class AcpSessionHandle:
                 self._resolved_model_id = self._available_models[0]["modelId"]
         elif isinstance(models, list):
             self._available_models = parse_advertised_models({"availableModels": models})
+            self._mark_available_models_captured()
 
     async def ensure_served_default(self) -> None:
         """Move an inheriting pooled session off a backend default it cannot run.
@@ -2874,7 +3000,7 @@ class AcpSessionHandle:
             )
         return captured
 
-    async def refresh_available_models(self) -> list[dict[str, str]]:
+    async def refresh_available_models(self, *, force: bool = False) -> list[dict[str, str]]:
         """Re-resolve the advertised-model snapshot against the live backend.
 
         ``_available_models`` is otherwise written once, from this session's own
@@ -2890,11 +3016,191 @@ class AcpSessionHandle:
         empty probe is not evidence about entitlement, so the prior snapshot is
         kept. Returns the probe result either way, so callers can distinguish
         "revalidated" from "could not revalidate".
+
+        ``force`` is forwarded to the runtime probe: a user action (the
+        explicit-pick refusal heal, the spawn-time pin withhold) passes
+        ``force=True`` so it earns a fresh probe instead of being refused on a
+        recent no-evidence failure replay. The read path leaves it False.
         """
-        fresh = await self._runtime.probe_advertised_models()
+        # The floor is this snapshot's capture time, so a non-empty return is
+        # always at least as new as the snapshot it replaces: a broader answer
+        # cached on the shared runtime before this session captured a narrower
+        # one is never replayed over it. The stored snapshot is then dated by the
+        # ANSWER's own clock (the runtime's result clock, which is the arrival
+        # time of a fresh answer and the original arrival time of a replayed
+        # one), never by this call's time: dating a replay by the call would
+        # raise this handle's floor above the data it holds, so its next refresh
+        # within the TTL would open a real session/new instead of replaying, and
+        # a replay captured inside the spawn-race window would be re-dated past
+        # it and marked confirmed, disabling the read-path heal for this handle.
+        asked_at = time.monotonic()
+        fresh = await self._runtime.probe_advertised_models(
+            force=force, not_before=self._available_models_captured_at
+        )
         if fresh:
+            served_at = self._runtime.entitlement_probe_result_at
             self._available_models = list(fresh)
+            # A runtime that answered without stamping its result clock (a probe
+            # seam that bypasses the store) is dated by the call instead, which
+            # is still never later than the answer.
+            self._available_models_captured_at = served_at if served_at > 0.0 else asked_at
+            self._available_models_probe_confirmed = True
         return fresh
+
+    def _mark_available_models_captured(self) -> None:
+        """Stamp the session-init snapshot's capture time (an unconfirmed
+        answer). A snapshot written from ``session/new`` is NOT probe-confirmed:
+        only :meth:`refresh_available_models` sets that flag, because only a live
+        re-probe proves the answer is not the startup-race default."""
+        self._available_models_captured_at = time.monotonic()
+        self._available_models_probe_confirmed = False
+
+    async def maybe_refresh_available_models(self, catalog_ids: list[str]) -> list[dict[str, str]]:
+        """Revalidate the snapshot on the READ path when it would narrow the catalog.
+
+        The dashboard picker filter narrows the ``--list-models`` catalog through
+        the newest live session's ``availableModels`` snapshot. When that snapshot
+        is the startup-race default (an entitlement lookup racing a token refresh
+        answered with the free tier), the picker hides models the account has and
+        ``auto`` chats silently inherit the degraded default — and because no
+        explicit pick is ever refused, the refresh-before-refuse path never fires.
+        This is the read-path counterpart: revalidate the snapshot BEFORE the
+        picker trusts it to hide anything.
+
+        ``catalog_ids`` is the full ``--list-models`` catalog (the ids the picker
+        would offer unfiltered). The verdict of what to keep/drop is NOT decided
+        here — it is :func:`catalog_row_would_drop`, the same per-row verdict the
+        picker endpoint applies, built on ``model_is_unusable`` (the single
+        spelling of "what this account can run") and ``resolve_pin_spelling``.
+        This method only decides WHETHER
+        the snapshot is trustworthy enough to narrow with, and reuses the existing
+        :meth:`refresh_available_models` heal path when it is not (no second
+        probe, no second parser).
+
+        Staleness heuristic (a scheduling decision, never an entitlement one):
+        probe only when the snapshot would actually narrow the catalog (some row
+        drops and the endpoint does not fail open to the full catalog) AND one of
+
+        * it was never probe-confirmed, or
+        * it was captured within ``_READ_PATH_SPAWN_RACE_SECS`` of runtime spawn
+          (the exact window the degraded answer is resolved in), or
+        * it advertises only ``auto`` against a richer catalog — the strongest
+          staleness signal.
+
+        Rate limit: a probe is skipped when this session probed on the read path
+        within ``_READ_PATH_REPROBE_MIN_INTERVAL_SECS`` AND the snapshot is either
+        probe-confirmed or not auto-only, so a hot poll does not re-probe on every
+        runtime TTL expiry forever. An UNCONFIRMED auto-only snapshot is exempt
+        from the interval — it always gets to probe — while a probe-CONFIRMED
+        auto-only snapshot (a genuine free-tier account really is ``auto``-only)
+        honours the interval like any other rather than re-probing forever. The
+        runtime's own single-flight probe TTL bounds the cost of the exempt case.
+
+        Fast path: the probe runs as a single in-flight task per handle, shielded
+        under ``_READ_PATH_PROBE_DEADLINE_SECS``. On deadline expiry this RAISES
+        :class:`EntitlementRevalidating` while the task KEEPS RUNNING to
+        completion — so its throwaway probe session is cleaned up and a later
+        read serves the corrected list, and the endpoint returns its degraded
+        response (rather than serving the un-revalidated snapshot as a live 200
+        the frontend caches). A subsequent read while the same task is still in
+        flight awaits it too, so it never bypasses the raise. A probe FAILURE
+        (as opposed to a timeout) NEVER makes the picker worse: the current
+        snapshot is returned unchanged (fail open).
+        """
+        snapshot = list(self._available_models)
+        advertised = advertised_model_ids(snapshot)
+        if not advertised:
+            # No live list to narrow with — nothing to revalidate, fail open.
+            return snapshot
+        # Count only rows the picker would actually hide AND a fresher snapshot
+        # could restore, using the endpoint's own per-row verdict
+        # (``catalog_row_would_drop``): ``auto`` is always kept, an advertised or
+        # ``ns::``-foldable row is kept, and an empty id drops against every
+        # snapshot, so none of those can justify a probe.
+        dropped = [
+            cid for cid in catalog_ids if cid.strip() and catalog_row_would_drop(cid, advertised)
+        ]
+        survivors = [
+            cid
+            for cid in catalog_ids
+            if cid.strip()
+            and cid.strip().lower() not in ("auto", "default")
+            and not catalog_row_would_drop(cid, advertised)
+        ]
+        advertises_auto = any(a.strip().lower() in ("auto", "default") for a in advertised)
+        # The endpoint FAILS OPEN — serves the whole catalog unfiltered — when the
+        # snapshot does not advertise ``auto`` and no non-``auto`` row survives
+        # (a namespace mismatch rather than an entitlement answer). A snapshot in
+        # that state hides nothing, so it is not narrowing either.
+        fails_open = not advertises_auto and not survivors
+        would_narrow = bool(dropped) and not fails_open
+        if not would_narrow:
+            # The snapshot keeps the whole catalog, so a stale snapshot cannot
+            # currently hide anything — do not spend a probe.
+            return snapshot
+        auto_only = len(advertised) == 1 and advertised[0].strip().lower() == "auto"
+        now = time.monotonic()
+        spawn_at = self._runtime.spawn_monotonic
+        within_spawn_race = (
+            spawn_at is not None
+            and self._available_models_captured_at > 0.0
+            and (self._available_models_captured_at - spawn_at) <= _READ_PATH_SPAWN_RACE_SECS
+        )
+        suspect = not self._available_models_probe_confirmed or within_spawn_race or auto_only
+        if not suspect:
+            return snapshot
+        # An in-flight probe from an earlier read (its deadline expired but the
+        # shielded task kept running) MUST be awaited, not bypassed: on the
+        # frontend's degraded re-poll the interval gate below would otherwise
+        # return the un-revalidated snapshot as a normal answer, the endpoint
+        # would serve it as a live 200, and the corrected list this very probe is
+        # fetching would never reach the picker. So when a task is still running,
+        # skip the interval gate and fall through to await it — the poll gets the
+        # landed result or raises EntitlementRevalidating again.
+        task = self._read_refresh_task
+        in_flight = task is not None and not task.done()
+        if not in_flight:
+            recently_probed = (
+                self._available_models_read_probe_at > 0.0
+                and (now - self._available_models_read_probe_at)
+                < _READ_PATH_REPROBE_MIN_INTERVAL_SECS
+            )
+            # The interval applies to a probe-CONFIRMED snapshot and to every
+            # non-auto-only snapshot: a genuine free-tier account is legitimately
+            # auto-only, so once confirmed it must not re-probe on every poll. An
+            # UNCONFIRMED auto-only snapshot is exempt from the interval — it
+            # always gets to probe (its docstring promise), and the runtime's own
+            # single-flight probe TTL still bounds the cost of a burst.
+            if recently_probed and (self._available_models_probe_confirmed or not auto_only):
+                return snapshot
+            self._available_models_read_probe_at = now
+            task = asyncio.ensure_future(self.refresh_available_models())
+            self._read_refresh_task = task
+        # Non-None in both branches: in-flight reused an existing task, else one
+        # was just started above.
+        assert task is not None
+        try:
+            # Shield so a timeout leaves the task RUNNING (it finishes the probe
+            # and cleans up its throwaway session); we just stop waiting on it.
+            await asyncio.wait_for(asyncio.shield(task), timeout=_READ_PATH_PROBE_DEADLINE_SECS)
+        except (TimeoutError, asyncio.TimeoutError):
+            # The probe did not land inside the deadline and is STILL RUNNING.
+            # We must not return the un-revalidated snapshot as a normal answer:
+            # the picker endpoint serves that as a live HTTP 200 that the
+            # frontend caches with no refetch, so the corrected list this probe
+            # is fetching would never be served. Signal "revalidation in flight"
+            # so the endpoint returns its degraded response and the frontend
+            # keeps its last-good list and polls again; the next read (once the
+            # task has landed) serves the corrected list.
+            raise EntitlementRevalidating from None
+        except Exception:
+            # Fail open exactly as today: no evidence never worsens the picker.
+            logger.debug("read-path entitlement revalidation failed", exc_info=True)
+            return list(self._available_models)
+        # refresh_available_models already replaced the snapshot in place on a
+        # non-empty probe and kept it on an empty one; either way the live
+        # snapshot is the answer to narrow with.
+        return list(self._available_models)
 
     def _sync_effort_levels(self) -> None:
         """Push ACP-reported effort levels to the global validation set (parity
@@ -2953,6 +3259,7 @@ class AcpSessionHandle:
         # sequential form skipped the cleanup on the path that produces the most
         # of these files, and every survivor is permanent: nothing else deletes
         # an ephemeral session's transcript.
+        self._cancel_hook_tasks()
         try:
             await self._runtime.terminate_session(self._session_id)
         finally:
@@ -3637,6 +3944,22 @@ class AcpSessionHandle:
                         logger.debug("Dropping stray response frame id=%s (no waiter)", msg.id)
                     continue
 
+                # The backend's hooks requests, answered here rather
+                # than through the shared classifier: that classifier is also read
+                # by the single-session client, which serves no hooks surface, and
+                # naming an action there that only this loop handles would leave
+                # the request unanswered on that path instead of refused.
+                #
+                # Gated on the capability set, not on the method name alone. This
+                # loop is shared by every backend the runtime demuxes, and only one
+                # of them defines this channel -- the answers carry
+                # operator-authored hook commands, so a backend that never asked for
+                # the surface is answered -32601 like any other method it does not
+                # serve.
+                if self._is_kas_hooks_request(msg):
+                    await self._answer_kas_hooks_request(msg)
+                    continue
+
                 # Dispatch by method
                 action = self._classify(msg)
 
@@ -4141,8 +4464,9 @@ class AcpSessionHandle:
             rec = get_recorder()
             rec.counter("kirocrew.watchdog.action", attrs=attrs)
             # ms, like every other kirocrew duration histogram: the dashboard's
-            # generic aggregation reports all histograms under *_ms keys, so a
-            # seconds-unit instrument would render 1000x off there.
+            # generic aggregation reports a histogram under *_ms keys unless its
+            # emitting module declares a non-millisecond unit for it, and this
+            # one declares none, so a seconds-unit value would render 1000x off.
             rec.histogram(
                 "kirocrew.watchdog.idle.duration",
                 float(idle) * 1000.0,
@@ -4540,6 +4864,131 @@ class AcpSessionHandle:
         """Classify a notification message into an action string."""
         return classify_notification(msg)
 
+    def _is_kas_hooks_request(self, msg: JsonRpcMessage) -> bool:
+        """Whether this frame is a hooks request THIS session may answer.
+
+        A named predicate rather than an inline condition, so the backend clause
+        has a test that fails when it is removed: asserting the membership set's
+        contents cannot catch a deleted membership CHECK, and the check is the part
+        that keeps operator-authored hook commands away from a backend that never
+        defined the channel.
+
+        Five conditions, all required: the frame is a request (it carries an id and
+        so needs a response), its method is a string, that string is one of the
+        hooks methods, this session's backend is in the capability set, and -- for
+        ``executeHook``, the one that runs a command -- the handshake announced
+        hooks. The type check is load-bearing, not defensive: ``method`` carries
+        whatever the peer put on the wire, and a JSON list or object there makes the
+        membership test raise :class:`TypeError` inside the dispatch loop.
+
+        The announce clause keeps the execute path dark in fact, not only by hint:
+        a backend that sends ``executeHook`` unasked is answered ``-32601`` like any
+        method it was never offered.
+        """
+        return (
+            msg.id is not None
+            and isinstance(msg.method, str)
+            and msg.method in _KAS_HOOKS_METHODS
+            and self._runtime.acp_backend in ACP_BACKENDS_HOOKS_LIST
+            and (msg.method != kas_wire.METHOD_HOOKS_EXECUTE or kas_wire.hooks_announced())
+        )
+
+    async def _answer_kas_hooks_request(self, msg: JsonRpcMessage) -> None:
+        """Answer one hooks request from the backend.
+
+        The answers are built in :mod:`kiro_crew.acp.kas_wire`, which owns the
+        shapes; this is the route that carries them.
+
+        ``list`` and ``sessionStart`` stay on this loop: each reads an in-memory
+        dict and nothing else, so a thread hop would buy nothing. ``list`` records
+        what it answered under this handle's OWNING session, which is the record
+        ``executeHook`` checks.
+
+        ``executeHook`` runs as a task of its own. It waits on a subprocess for up
+        to the hook's timeout, and this loop demuxes every frame of the turn --
+        including the cancel that would end it.
+        """
+        params = msg.params if isinstance(msg.params, dict) else {}
+        if msg.method == kas_wire.METHOD_HOOKS_EXECUTE:
+            if len(self._hook_tasks) >= _MAX_INFLIGHT_HOOK_EXECUTIONS:
+                # Refused before a task exists, so a flood of execute frames
+                # holds a bounded number of hook processes, never one per frame.
+                # Audited like every other refusal on this path.
+                reason = "too many hooks already running"
+                await asyncio.to_thread(
+                    kas_wire.audit_execute_refusal,
+                    self._session_key,
+                    self._crew_agent,
+                    params,
+                    reason,
+                )
+                await self._send_hook_error(msg.id, f"Refused by Kiro Crew: {reason}")
+                return
+            task = asyncio.create_task(self._answer_kas_hook_execute(msg.id, params))
+            self._hook_tasks.add(task)
+            task.add_done_callback(self._hook_tasks.discard)
+            return
+        if msg.method == kas_wire.METHOD_HOOKS_LIST:
+            result = kas_wire.hooks_list_response(
+                params, session_key=self._session_key, listed=self._listed_hooks
+            )
+        else:
+            result = kas_wire.hooks_session_start_response(params)
+        await self._runtime.send_response(msg.id, result)
+
+    async def _answer_kas_hook_execute(self, request_id: Any, params: dict) -> None:
+        """Run one listed hook and answer the request, refusal included.
+
+        A refusal is answered as a JSON-RPC error carrying its reason, never as a
+        result: a result carries an exit code, and a command that never started has
+        none. An unexpected failure is answered the same way, and a cancelled run
+        is answered ``cancelled`` before the cancellation propagates, so the
+        backend's turn is never left waiting on a request nobody will answer.
+        """
+        try:
+            result = await kas_wire.hooks_execute(
+                params,
+                session_key=self._session_key,
+                agent=self._crew_agent,
+                listed=self._listed_hooks,
+            )
+        except asyncio.CancelledError:
+            try:
+                await self._runtime.send_response(request_id, {"exitCode": -1, "cancelled": True})
+            except Exception:
+                logger.warning(
+                    "KAS executeHook cancel answer undeliverable for %s", self._session_id
+                )
+            raise
+        except kas_wire.HookExecuteRefused as exc:
+            logger.info("KAS executeHook refused for %s: %s", self._session_id, exc)
+            await self._send_hook_error(request_id, f"Refused by Kiro Crew: {exc}")
+            return
+        except Exception:
+            logger.exception("KAS executeHook failed for %s", self._session_id)
+            await self._send_hook_error(request_id, "Kiro Crew could not run the hook")
+            return
+        try:
+            await self._runtime.send_response(request_id, result)
+        except Exception:
+            logger.warning("KAS executeHook answer undeliverable for %s", self._session_id)
+
+    def _cancel_hook_tasks(self) -> None:
+        """Cancel every in-flight hook execution this session started.
+
+        ``run_script_hook`` kills the hook's process tree when it is cancelled
+        mid-wait, so a cancelled turn or a torn-down session leaves no hook running.
+        """
+        # Read defensively: a handle assembled without ``__init__`` carries none.
+        for task in list(getattr(self, "_hook_tasks", ())):
+            task.cancel()
+
+    async def _send_hook_error(self, request_id: Any, message: str) -> None:
+        try:
+            await self._runtime.send_error(request_id, kas_wire.HOOK_EXECUTE_REFUSED_CODE, message)
+        except Exception:
+            logger.warning("KAS executeHook refusal undeliverable for %s", self._session_id)
+
     def _build_permission_event(self, msg: JsonRpcMessage) -> AcpEvent:
         """Build an AcpEvent for a permission request via the shared parser.
 
@@ -4563,6 +5012,7 @@ class AcpSessionHandle:
             # parent toolCallId to inherit trusted params for a different
             # operation, while same-origin repeat frames still resolve.
             cache_scope=str(_perm_params.get("sessionId") or self._session_id),
+            kas_consent_meta=self._runtime.acp_backend == ACP_BACKEND_KAS,
         )
         if recorded is not None and event.request_id != "":
             self._permission_options[event.request_id] = recorded
@@ -5078,7 +5528,7 @@ class AcpSessionHandle:
             filtered_events.append(ev)
             if ev.kind == EVENT_TEXT_CHUNK:
                 self.last_prompt_stats.text_chunks += 1
-                self._stale_eligible = True
+                self._stale_eligible = not self._active_tool_calls
                 self._prompt_or_tool_seen = True
             elif ev.kind == EVENT_TOOL_CALL:
                 self._stale_eligible = False
@@ -5134,16 +5584,32 @@ class AcpSessionHandle:
                     tool_name=ev.tool_name,
                     interactive_risk=(interactive.risk if interactive else INTERACTIVE_NONE),
                 )
+                self._active_tool_calls[self._inflight_tool_call_id] = (
+                    self._inflight_tool,
+                    interactive,
+                )
                 self._retire_liveness_state()
             elif ev.kind == EVENT_TOOL_RESULT:
                 if not ev.tool_final and ev.tool_call_id:
                     # Streamed partial output: the command has acted, so any
                     # later non-interactive retry of it is not a safe replay.
                     self._tool_output_seen.add(ev.tool_call_id)
-                self._tool_dispatched = False
-                self._inflight_tool = None
-                self._inflight_interactive = None
-                self._inflight_tool_call_id = ""
+                if ev.tool_status in TERMINAL_TOOL_STATUSES:
+                    self._active_tool_calls.pop(ev.tool_call_id or "", None)
+                    self._tool_dispatched = bool(self._active_tool_calls)
+                    self._stale_eligible = not self._active_tool_calls
+                    if self._inflight_tool_call_id not in self._active_tool_calls:
+                        if self._active_tool_calls:
+                            self._inflight_tool_call_id = next(reversed(self._active_tool_calls))
+                            self._inflight_tool, self._inflight_interactive = (
+                                self._active_tool_calls[self._inflight_tool_call_id]
+                            )
+                        else:
+                            self._inflight_tool = None
+                            self._inflight_interactive = None
+                            self._inflight_tool_call_id = ""
+                        self._input_wait_emitted = False
+                        self._retire_liveness_state()
                 # L1 of the recovery ladder: classify the result text ONCE, at
                 # the layer that owns the protocol. A ``-32001 capacity``
                 # refusal from the MCP stub or a gateway ``recoverable_infra``

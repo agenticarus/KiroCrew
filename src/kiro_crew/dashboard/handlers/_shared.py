@@ -51,12 +51,227 @@ from kiro_crew.messaging.privacy_mode import is_temporary as is_thread_temporary
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 from kiro_crew.skill_trust import is_project_trusted as _is_project_trusted
 from kiro_crew.skills import _trusted_skill_roots, skills_dir
+from kiro_crew.terminal_safe import normalize_for_scanning, strip_control_characters
 
 if TYPE_CHECKING:
     from kiro_crew.execution_context import ExecutionContext
     from kiro_crew.platform.interfaces import CapabilityManager
 
 logger = logging.getLogger(__name__)
+
+
+def _scrub_text(val: str) -> str:
+    """Redact ``val``, dropping control characters but keeping the content around them.
+
+    Invisible characters split a token, and both redactors decide by matching a pattern,
+    so a token split by one matches nothing and the field egresses carrying it. They do
+    not all deserve the same treatment on the way out, though, and that is the whole of
+    this function's shape.
+
+    A CONTROL character other than tab, newline and carriage return is terminal-escape
+    material rather than text a user wrote, so it always leaves: it drives a terminal that
+    renders the field verbatim, and no consumer is worse off without it. Those three are
+    content and stay, which is why a token split by one of them is still split afterwards.
+    Removing a control character can JOIN a token back together, which is why the redactors
+    run again afterwards rather than trusting the first verdict.
+
+    A FORMAT character is usually content. A soft hyphen inside a word, a joiner holding an
+    emoji together, a mark ordering a Latin digit before Arabic -- deleting those rewrites
+    what the user stored, on a path that runs for every row of every listing, and the
+    caller that compares this function's output with its input to decide whether a
+    document is editable then refuses every write to it. So a copy with the format
+    characters removed is scanned as EVIDENCE, and handed back only when it reveals a
+    credential the output still hides: that field holds a credential, so its exact bytes
+    are the thing that must not egress, and its own format characters go with them.
+
+    Scanning the text as stored first is not redundant with scanning that copy. Removing
+    an invisible character can destroy a boundary a pattern requires, so a token the
+    stored text matches can stop matching once the copy is joined up.
+    """
+    out, _ = redact_exfiltration_urls(val)
+    out, _ = redact_credentials(out)
+    stripped = strip_control_characters(out)
+    if stripped != out:
+        out, _ = redact_exfiltration_urls(stripped)
+        out, _ = redact_credentials(out)
+    normalised = normalize_for_scanning(out)
+    if normalised == out:
+        return out
+    scanned, _ = redact_exfiltration_urls(normalised)
+    scanned, _ = redact_credentials(scanned)
+    if scanned == normalised:
+        return out
+    return scanned
+
+
+#: Deepest JSON nesting this scrub walks. A stored memory payload is a handful of levels
+#: deep, so the cap costs real data nothing; what it buys is a bound on the descent below,
+#: which would otherwise recurse as deep as a hostile document asks it to.
+_MAX_JSON_SCRUB_DEPTH = 64
+
+#: Stands in for a JSON payload this chain cannot scan to the bottom. Serialised as a JSON
+#: string so the field a consumer parses still parses.
+_UNSCANNABLE_JSON = "[REDACTED: unscannable JSON payload]"
+
+
+class _UnscannableJSON(Exception):
+    """A JSON payload that cannot be scanned to the bottom, so it must not egress."""
+
+
+def _decode_unique(val: str) -> object:
+    """Decode a JSON document, refusing one whose object names are not unique.
+
+    ``json.loads`` keeps the LAST value for a repeated name and discards the rest, so a
+    credential sitting in an earlier duplicate is gone before the scan below ever sees it.
+    What survives decoding then looks exactly like a clean document, the comparison
+    downstream finds nothing changed, and the raw text egresses still carrying it. Reading
+    all of a document is what certifies it, so a repeated name makes it unscannable.
+    """
+
+    def unique(items: list[tuple[str, object]]) -> dict[str, object]:
+        out: dict[str, object] = {}
+        for key, value in items:
+            if key in out:
+                raise _UnscannableJSON
+            out[key] = value
+        return out
+
+    return json.loads(val, object_pairs_hook=unique)
+
+
+def _scrub_decoded(val: object, depth: int = 0) -> object:
+    """Scrub every string inside an already-decoded JSON value, shape preserved.
+
+    An object's NAMES are scrubbed alongside its values, by the same path. A name is text
+    the document carries and the field egresses, so a credential sitting in one leaves
+    untouched if only values are walked, and the name is the easier place to put it:
+    whoever writes structured memory chooses both halves of a pair. A name can also be a
+    document in its own right, so it takes the descent below rather than a text scrub
+    alone, and the two halves of a pair are defended identically.
+
+    A string is handed back to the transport scrub, because one decode does not reach the
+    bottom of every field. A memory record keeps its own value as a JSON document, so a
+    revision snapshot of that record is a document holding a document: the outer decode
+    yields a string whose escapes are still printable text, where no control character
+    exists to remove and no split credential matches. Descending again is what reaches it.
+
+    Scrubbing two different names can produce the same name, and a dict holds one value
+    per name. Keeping either silently drops the other's value, so this raises instead and
+    lets the caller withhold the whole document. Depth is bounded for the same reason it
+    is bounded anywhere: the walk below is recursive and the document is untrusted. The
+    count spans encoding levels as well as structural ones, so the descent above cannot
+    restart it and escape the bound.
+    """
+    if depth > _MAX_JSON_SCRUB_DEPTH:
+        raise _UnscannableJSON
+    if isinstance(val, str):
+        return _scrub_json_transport(_scrub_text(val), depth + 1, original=val)
+    if isinstance(val, list):
+        return [_scrub_decoded(item, depth + 1) for item in val]
+    if isinstance(val, dict):
+        cleaned: dict[object, object] = {}
+        for key, item in val.items():
+            name = (
+                _scrub_json_transport(_scrub_text(key), depth + 1, original=key)
+                if isinstance(key, str)
+                else key
+            )
+            if name in cleaned:
+                raise _UnscannableJSON
+            cleaned[name] = _scrub_decoded(item, depth + 1)
+        return cleaned
+    return val
+
+
+def _is_json_document(val: str) -> bool:
+    """Whether the text is a JSON document, judged before any scrub has touched it.
+
+    The scan below runs on scrubbed text, and a redactor's replacement can span JSON
+    structure: the credential-assignment patterns match across a name, its colon and its
+    value, so splicing one out leaves text that does not parse. Judging JSON-ness on that
+    text would call a real document prose and hand it back unscanned. This answers for the
+    stored bytes instead, so the two questions stay separate.
+
+    A decode that fails for any reason OTHER than malformed syntax still means the text is
+    JSON -- decoding merely could not finish -- so those count as a document here.
+    """
+    if val.lstrip()[:1] not in ("{", "[", '"'):
+        return False
+    try:
+        json.loads(val)
+    except json.JSONDecodeError:
+        return False
+    except (ValueError, RecursionError):
+        return True
+    return True
+
+
+def _scrubbed_document_or(val: str, original: str | None) -> str:
+    """Hand back scrubbed text that is not a document, or withhold one the scrub broke.
+
+    Reaching here means the text in hand does not parse. That is the safe case only when the
+    stored bytes did not parse either: then no JSON payload ever existed and the text scan
+    covered everything. When the stored bytes DID parse, the scrub's own replacement broke
+    the document, so its payload was never walked and handing the text back ships an
+    uncertified payload -- the hole this chain closes.
+    """
+    if original is not None and original != val and _is_json_document(original):
+        return json.dumps(_UNSCANNABLE_JSON)
+    return val
+
+
+def _scrub_json_transport(val: str, depth: int = 0, *, original: str | None = None) -> str:
+    """Scrub the PAYLOAD of a field that carries a JSON document, not just its text.
+
+    A JSON document is a transport encoding, and encoding hides the very characters the
+    scan looks for: a control character inside the payload is written as the six printable
+    characters ``\\u0001``, so the control pattern finds nothing to remove and the token it
+    splits stays split for both redactor passes. The field then egresses carrying the
+    credential, and whatever decodes the document -- a browser calling ``JSON.parse`` --
+    gets the control character back, where it renders as nothing and the credential reads
+    as whole. A memory row carries the same value twice, as text and as JSON, so scanning
+    only the text redacts one copy of a credential and ships the other.
+
+    Scrubbing therefore descends into the decoded value. The field is replaced only when
+    that changed something, so a document holding nothing sensitive is passed through
+    byte for byte rather than re-serialised into a different spelling of itself.
+
+    Only a document decoding to a string, list or dict is considered: a bare JSON number
+    or boolean carries no text to scan, and a plain prose field does not parse at all.
+
+    Two ways of failing are kept apart, because only one of them leaves a payload behind.
+    The dividing line is the PARSER's own verdict on the STORED bytes, not on the text in
+    hand: the scan runs on scrubbed text, and a credential-assignment pattern spans a name,
+    its colon and its value, so splicing one out can leave text that fails to parse even
+    though the stored document parses fine. Text the parser rejects AND that was never a
+    document
+    holds no JSON payload at all, so the text scrub already covered everything there was to
+    cover and the field passes through. Every other failure means a payload existed and
+    decoding could not finish -- nested past the cap, nested deeply enough to exhaust the
+    parser's own recursion, repeating an object name so decoding discards a member, holding
+    names that collide once scrubbed, tripping a limit of this interpreter that a consumer's
+    parser does not share such as the cap on converting a very long integer, or broken by
+    the scrub's own replacement. Such a document has a payload this chain cannot certify,
+    and shipping an uncertified payload is the hole being closed here, so the field is
+    withheld and a marker goes out instead.
+    """
+    if val.lstrip()[:1] not in ("{", "[", '"'):
+        return _scrubbed_document_or(val, original)
+    try:
+        decoded = _decode_unique(val)
+    except json.JSONDecodeError:
+        return _scrubbed_document_or(val, original)
+    except (_UnscannableJSON, ValueError, RecursionError):
+        return json.dumps(_UNSCANNABLE_JSON)
+    if not isinstance(decoded, (str, list, dict)):
+        return val
+    try:
+        cleaned = _scrub_decoded(decoded, depth)
+    except (_UnscannableJSON, RecursionError):
+        return json.dumps(_UNSCANNABLE_JSON)
+    if cleaned == decoded:
+        return val
+    return json.dumps(cleaned)
 
 
 @overload
@@ -92,13 +307,35 @@ def _redact_memory_field(val: object) -> object:
     tool here: binary is dropped to ``None`` rather than redacted, since it is not
     text this chain can scan and returning it unread would put an unscanned blob on an
     egress path. That case falls to the ``object`` overload.
+
+    The redactors run TWICE, once on the text as stored and once after invisible
+    characters are removed, because each pass catches what the other cannot.
+
+    Both redactors decide by matching a pattern. An invisible character embedded
+    mid-token splits the token so no pattern matches it, and the field would leave on
+    an egress path carrying credential material any consumer that drops those
+    characters can reassemble. Removing them first rejoins the token, which is what the
+    second pass sees.
+
+    The first pass is not redundant, because removing a character can also DESTROY a
+    match. A pattern guarded by a negative lookbehind for a non-word character is
+    satisfied by the invisible character itself, so joining a word character onto the
+    token defeats it -- a credential the text as stored would have given up survives
+    normalisation. Scanning the original first keeps that verdict.
+
+    Normalising between the two passes rather than after both is what makes the order
+    safe. Normalising after the last pass would reassemble the very token that pass had
+    just failed to match, and the field would egress the whole secret.
+
+    Tab, newline and carriage return are content and survive, so a token split by one of
+    those three stays split; see
+    :func:`kiro_crew.terminal_safe.normalize_for_scanning` for what is removed and why
+    no visible content is lost.
     """
     if isinstance(val, (bytes, memoryview)):
         return None
     if isinstance(val, str):
-        val, _ = redact_exfiltration_urls(val)
-        val, _ = redact_credentials(val)
-        return val
+        return _scrub_json_transport(_scrub_text(val), original=val)
     if isinstance(val, list):
         return [_redact_memory_field(item) for item in val]
     if isinstance(val, dict):
@@ -131,11 +368,61 @@ SESSION_SEARCH_TEXT_FIELDS: tuple[str, ...] = ("title", "snippet")
 _MAX_BODY_BYTES = 64 * 1024
 
 
+def _declares_json(content_type: str) -> bool:
+    """Is *content_type* a media type whose payload is a JSON document?
+
+    ``application/json`` and the ``+json`` structured-suffix family
+    (``application/merge-patch+json``, ``application/ld+json``) only. The suffix
+    family is in because the app SDK already lets a caller send one -- a scoped
+    API test pins ``application/merge-patch+json`` reaching the gateway -- so
+    refusing it would break a shape the product ships.
+
+    Everything else is out, including ``text/plain`` and an ABSENT header, which
+    aiohttp reports as ``application/octet-stream``. Absent and ``text/plain``
+    are the two spellings that matter: both are CORS *simple* request types, so a
+    cross-origin page sends them with no preflight, and a plain HTML form can
+    emit either. ``application/json`` is not simple, so requiring it means the
+    browser must ask permission before the body is ever delivered.
+    """
+    ct = content_type.strip().lower()
+    return ct == "application/json" or (ct.startswith("application/") and ct.endswith("+json"))
+
+
+def _json_content_type_error(request: web.Request) -> web.Response | None:
+    """415 unless a request that HAS a body declares a JSON content type.
+
+    Checked only when a body is actually present. An empty body carries no JSON
+    document to be misread, so gating it would change the status of a bodiless
+    POST (today a 400 ``invalid_json``, or ``{}`` under ``allow_absent``) while
+    removing no attack primitive.
+
+    415 rather than 400: the body may be perfectly well-formed JSON, and what is
+    refused is the media type the client declared for it.
+
+    Runs AFTER the capped path's Content-Length precheck, so a caller who
+    declared too many bytes still gets 413 rather than being told about its
+    header instead. Both refuse before anything is read, so the order is about
+    which fact the client is told, not about work done.
+    """
+    if not request.can_read_body:
+        return None
+    if _declares_json(request.content_type or ""):
+        return None
+    return web.json_response(
+        {
+            "error": "JSON body requires Content-Type: application/json",
+            "code": "unsupported_media_type",
+        },
+        status=415,
+    )
+
+
 async def read_bounded_json(
     request: web.Request,
     max_bytes: int | None = _MAX_BODY_BYTES,
     *,
     allow_absent: bool = False,
+    require_json_content_type: bool = True,
 ) -> tuple[dict[str, Any] | None, web.Response | None]:
     """Read and parse a JSON *object* request body, capped at *max_bytes*.
 
@@ -145,6 +432,56 @@ async def read_bounded_json(
     list, string, or number for a body that is valid JSON but not an object, and
     a handler that then calls ``.get()`` on the result turns a client mistake
     into a 500.
+
+    A request that HAS a body must also DECLARE a JSON content type, or it is
+    refused 415 ``unsupported_media_type`` before the body is read -- see
+    :func:`_json_content_type_error`. Parsing a ``text/plain`` or
+    content-type-less body as JSON is what lets a cross-origin page deliver a
+    JSON command to a local endpoint with no CORS preflight; requiring the
+    header puts the preflight back. In-tree callers are unaffected: every client
+    that sends a body already sets ``application/json`` (the frontend
+    ``post``/``put``/``patch``/``del`` helpers, ``mcp_core``, ``cron_script``,
+    ``cli_*``, ``pod.runtime``, ``remote_relay``), and the bodiless requests
+    (``app_lifecycle_client``, ``cron_trigger``) are not checked.
+
+    ONE caller opts OUT, and must: ``POST /api/messaging/teams``, where
+    Microsoft's Bot Framework Connector posts activities, passes
+    ``require_json_content_type=False``. Two reasons, and the second is the
+    load-bearing one:
+
+    * Refusing a media type there is a change to an EXTERNAL contract. The route
+      is the single entry in ``token_auth.CSRF_EXEMPT_EXACT_METHODS``, so the
+      Origin barrier does not stand in front of it, and a media-type refusal
+      would be the one refusal that could silently stop an external channel.
+    * The gate cannot be enforced there ANYWAY, and enforcing it costs the byte
+      cap. ``handlers/messaging.py`` forwards this helper's error only when it is
+      a 413, because a verdict derived from body CONTENT must not precede the JWT
+      check. A 415 is therefore dropped, the parsed body is never stashed, and
+      ``teams/client.py``'s fallback re-parses with a bare ``request.json()`` --
+      on a stream this helper returned from WITHOUT reading, so the re-parse is
+      bounded only by the app-wide ``client_max_size`` instead of
+      ``TEAMS_MAX_ACTIVITY_BYTES`` (64 KiB). Opting out keeps the capped read,
+      and with it the stash, so the body is parsed exactly once and never past
+      the cap.
+
+    Which generalizes to the rule any future caller must satisfy: because the
+    415 and the declared-oversize 413 return BEFORE a single byte is read, a
+    caller that does not return every error this helper hands back must pass
+    ``require_json_content_type=False``, or it inherits an unread stream that
+    nothing bounds. Every other caller in the tree returns the error
+    unconditionally (``chat_pins`` rewrites a 400's code and then returns it),
+    so the Teams route is the only opt-out.
+
+    Which also means: this gate is a SECOND barrier, not the first one. Every
+    other unsafe-method ``/api/`` route is already refused cross-origin by
+    ``csrf_middleware``, so on those routes the 415 removes no primitive that
+    was reachable -- it holds if a route is ever added to the CSRF-exempt list,
+    or the Origin barrier is ever mis-scoped, without waiting for that mistake
+    to be exploitable. Extending the refusal to the Teams route is a separate
+    decision about an external contract, not part of this one.
+
+    The other self-authenticating webhook, ``POST /api/hooks/agent``, reads
+    through ``handlers/hooks.py::_json_object`` and is untouched by this.
 
     NOT yet the dashboard's only such guard. Four siblings survive and diverge:
     ``handlers_channel._json_object`` (same ``invalid_json``/``body_not_object``
@@ -199,6 +536,16 @@ async def read_bounded_json(
     """
     if allow_absent and not request.can_read_body:
         return {}, None
+    # A DECLARED oversize keeps its 413, which is the actionable answer for a
+    # caller sending too much and was this helper's answer before the media-type
+    # gate existed. The gate runs next, still before a single byte is read.
+    if max_bytes is not None and request.content_length and request.content_length > max_bytes:
+        return None, web.json_response(
+            {"error": "payload too large", "code": "payload_too_large"}, status=413
+        )
+    ct_error = _json_content_type_error(request) if require_json_content_type else None
+    if ct_error is not None:
+        return None, ct_error
     if max_bytes is None:
         try:
             body = await request.json()
@@ -207,10 +554,6 @@ async def read_bounded_json(
                 {"error": "invalid JSON", "code": "invalid_json"}, status=400
             )
     else:
-        if request.content_length and request.content_length > max_bytes:
-            return None, web.json_response(
-                {"error": "payload too large", "code": "payload_too_large"}, status=413
-            )
         chunks: list[bytes] = []
         received = 0
         async for chunk in request.content.iter_chunked(8192):
@@ -1919,6 +2262,7 @@ def _collect_skills_under(
     out: dict[str, Path],
     depth: int,
     allow_leaf_symlink: bool = False,
+    mtimes: dict[Path, int | None] | None = None,
 ) -> None:
     """Add every ``<dir>/SKILL.md`` at or under *directory* to *out*.
 
@@ -1931,9 +2275,17 @@ def _collect_skills_under(
     the resolver refuses, and its ``skill://`` URI would name a file outside the
     root.
     Sensitive paths are rejected before and after symlink resolution.
+
+    *mtimes*, when given, receives the modification time of every directory
+    this walk reads -- *directory* itself and each skill directory whose
+    ``SKILL.md`` it checks -- taken BEFORE the read, so a change that lands
+    between the stat and the read still shows as a change afterwards. It is
+    what :meth:`SkillCatalogSnapshot.changed` compares against.
     """
     if depth <= 0:
         return
+    if mtimes is not None:
+        mtimes[directory] = _dir_mtime_ns(directory)
     try:
         entries = sorted(directory.iterdir())
     except OSError:
@@ -1956,6 +2308,8 @@ def _collect_skills_under(
             continue
         if not _leaf_is_contained(entry_resolved, root_resolved, allow_leaf_symlink):
             continue
+        if mtimes is not None:
+            mtimes[entry] = _dir_mtime_ns(entry)
         skill_md = entry / "SKILL.md"
         if skill_md.is_file():
             try:
@@ -1968,8 +2322,97 @@ def _collect_skills_under(
             out.setdefault(prefix + entry.relative_to(root).as_posix(), skill_md)
         else:
             _collect_skills_under(
-                entry, root, root_resolved, prefix, out, depth - 1, allow_leaf_symlink
+                entry, root, root_resolved, prefix, out, depth - 1, allow_leaf_symlink, mtimes
             )
+
+
+def _dir_mtime_ns(path: Path) -> int | None:
+    """``st_mtime_ns`` of *path*, or ``None`` when it cannot be stat'ed (absent)."""
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+# A directory's mtime comes from the kernel's coarse clock (a jiffy on Linux; a
+# whole second on some filesystems, two on FAT), so a change landing in the same
+# tick as the one a walk recorded leaves the mtime equal. A directory modified
+# this close to the walk is therefore treated as changed rather than trusted.
+_CATALOG_SETTLE_NS = 2_000_000_000
+
+
+class SkillCatalogSnapshot(NamedTuple):
+    """One walk of the skill roots: its keys, and what it read to build them.
+
+    ``entries`` is the catalog (see :func:`enumerate_skill_catalog`).
+    ``dir_mtimes`` is the modification time of every directory the walk read
+    (each root, absent ones as ``None``; each category directory it descended
+    into; each skill directory whose ``SKILL.md`` it checked), and
+    ``walked_at_ns`` the wall clock when the walk began.
+    """
+
+    entries: dict[str, Path]
+    dir_mtimes: dict[Path, int | None]
+    walked_at_ns: int
+
+    def changed(self) -> bool:
+        """Whether the skill roots may hold a different catalog now.
+
+        One ``stat`` per directory the walk read and no walk: ``True`` when any
+        of them has a different mtime (a skill directory created or removed, a
+        ``SKILL.md`` added to or taken from one, a root that appeared), or when
+        one was modified within :data:`_CATALOG_SETTLE_NS` of the walk, where an
+        equal mtime cannot prove nothing landed. ``False`` means the snapshot's
+        ``entries`` are still what a walk would return.
+        """
+        settled_before = self.walked_at_ns - _CATALOG_SETTLE_NS
+        for path, recorded in self.dir_mtimes.items():
+            current = _dir_mtime_ns(path)
+            if current != recorded:
+                return True
+            if current is not None and current >= settled_before:
+                return True
+        return False
+
+
+def walk_skill_catalog(state: DashboardState, session_key: str = "") -> SkillCatalogSnapshot:
+    """Walk the skill roots once; return the catalog with its staleness stamp.
+
+    The walk :func:`enumerate_skill_catalog` performs, plus the directory mtimes
+    :meth:`SkillCatalogSnapshot.changed` needs. A caller that must answer off a
+    catalog some time after it walked (the agent PATCH's receipt) keeps the
+    snapshot and re-walks only when the check says the roots moved. The check is
+    worth carrying because a walk is two orders of magnitude dearer than it: each
+    entry passes the sensitive-path check on top of its ``resolve`` calls, so a
+    200-skill tree walks in hundreds of milliseconds and re-checks in about one
+    (``test/skill_catalog_walk_bench.py`` measures both).
+    """
+    catalog: dict[str, Path] = {}
+    mtimes: dict[Path, int | None] = {}
+    walked_at_ns = time.time_ns()
+    for prefix, root in _skill_key_roots(state, session_key):
+        if is_sensitive_path(str(root)):
+            continue
+        if not root.is_dir():
+            # Recorded as absent so a root created later reads as a change.
+            mtimes[root] = None
+            continue
+        try:
+            root_resolved = root.resolve(strict=True)
+        except OSError:
+            mtimes[root] = None
+            continue
+        _collect_skills_under(
+            root,
+            root,
+            root_resolved,
+            prefix,
+            catalog,
+            _SKILL_NEST_DEPTH,
+            prefix == LEAF_SYMLINK_PREFIX,
+            mtimes,
+        )
+    return SkillCatalogSnapshot(catalog, mtimes, walked_at_ns)
 
 
 def enumerate_skill_catalog(state: DashboardState, session_key: str = "") -> dict[str, Path]:
@@ -1992,25 +2435,10 @@ def enumerate_skill_catalog(state: DashboardState, session_key: str = "") -> dic
     It is additionally the single source of truth for BOTH directions of the
     key <-> URI mapping, so they cannot disagree: a mapping written against a
     symlinked skill directory inverts back to the same key it was written from.
+
+    The walk itself is :func:`walk_skill_catalog`; this is its catalog alone.
     """
-    catalog: dict[str, Path] = {}
-    for prefix, root in _skill_key_roots(state, session_key):
-        if is_sensitive_path(str(root)) or not root.is_dir():
-            continue
-        try:
-            root_resolved = root.resolve(strict=True)
-        except OSError:
-            continue
-        _collect_skills_under(
-            root,
-            root,
-            root_resolved,
-            prefix,
-            catalog,
-            _SKILL_NEST_DEPTH,
-            prefix == LEAF_SYMLINK_PREFIX,
-        )
-    return catalog
+    return walk_skill_catalog(state, session_key).entries
 
 
 def _skill_uri_for_path(skill_md: Path) -> str:
@@ -2091,7 +2519,11 @@ def skill_uri_for_key(
 
 
 def agent_skill_views(
-    data: dict[str, Any], agent_path: Path, state: DashboardState, session_key: str = ""
+    data: dict[str, Any],
+    agent_path: Path,
+    state: DashboardState,
+    session_key: str = "",
+    catalog: dict[str, Path] | None = None,
 ) -> tuple[list[str], list[str]]:
     """``(catalog_keys, unmanaged_uris)`` for *data*, from ONE catalog walk.
 
@@ -2100,15 +2532,18 @@ def agent_skill_views(
     enumerated skill accounts for) which are shown read-only and preserved on
     every write. Both are order-preserving; keys are de-duplicated.
 
+    Pass *catalog* (from :func:`enumerate_skill_catalog`) to reuse a walk the
+    caller already did instead of enumerating the roots again.
+
     Filesystem-heavy (it enumerates the skill roots) — callers on the asyncio
     event loop MUST run this off the loop.
     """
-    catalog = enumerate_skill_catalog(state, session_key)
+    entries = catalog if catalog is not None else enumerate_skill_catalog(state, session_key)
     keys: list[str] = []
     unmanaged: list[str] = []
     seen: set[str] = set()
     for uri in skill_resource_uris(data):
-        key = skill_key_for_uri(uri, agent_path, state, catalog)
+        key = skill_key_for_uri(uri, agent_path, state, entries)
         if key is None:
             unmanaged.append(uri)
         elif key not in seen:
@@ -2118,15 +2553,20 @@ def agent_skill_views(
 
 
 def agent_skill_keys(
-    data: dict[str, Any], agent_path: Path, state: DashboardState, session_key: str = ""
+    data: dict[str, Any],
+    agent_path: Path,
+    state: DashboardState,
+    session_key: str = "",
+    catalog: dict[str, Path] | None = None,
 ) -> list[str]:
     """Catalog keys for the skills *data* maps, de-duplicated, order-preserving.
 
     Only catalog-resolvable entries are returned — this is the set the Agent
     Templates editor owns and can rewrite. Wildcard / hand-authored URIs are
     excluded here and reported separately by :func:`agent_unmanaged_skill_uris`.
+    Pass *catalog* to reuse one walk, as for :func:`agent_skill_views`.
     """
-    return agent_skill_views(data, agent_path, state, session_key)[0]
+    return agent_skill_views(data, agent_path, state, session_key, catalog)[0]
 
 
 def agent_unmanaged_skill_uris(
@@ -2147,12 +2587,21 @@ def apply_skill_mapping(
     state: DashboardState,
     keys: list[str],
     session_key: str = "",
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str], SkillCatalogSnapshot]:
     """Rewrite *data*'s ``skill://`` resources to *keys*, in place.
 
-    Returns ``(applied_keys, unknown_keys)``. Nothing is written when
-    *unknown_keys* is non-empty — the caller rejects the whole request so a
-    typo'd key can never partially apply.
+    Returns ``(applied_keys, unknown_keys, applied_uris, snapshot)``. ``applied_uris[i]``
+    is the ``skill://`` resource written for ``applied_keys[i]``, in request order --
+    the one statement of which entries of the rewritten list are the managed ones,
+    resolved against the same catalog walk that validated the keys, so a caller
+    that must re-apply the request's order onto a later read of the spec never
+    has to guess it from the list's shape. ``snapshot`` is that walk itself, with
+    the stamp :meth:`SkillCatalogSnapshot.changed` reads, so the caller can resolve
+    what it finally writes (:func:`agent_skill_keys` takes ``snapshot.entries``)
+    against the snapshot the keys were validated with, and walk the roots a second
+    time only when they moved in between. Nothing is written when *unknown_keys*
+    is non-empty -- the caller rejects the whole request so a typo'd key can never
+    partially apply.
 
     Invariants:
 
@@ -2168,7 +2617,8 @@ def apply_skill_mapping(
     # One enumeration for the whole write: every key resolved and every existing
     # URI inverted against the SAME snapshot, so a concurrent skill add/remove
     # cannot make the two halves disagree mid-request.
-    catalog = enumerate_skill_catalog(state, session_key)
+    snapshot = walk_skill_catalog(state, session_key)
+    catalog = snapshot.entries
     for key in keys:
         if key in seen:
             continue
@@ -2180,7 +2630,7 @@ def apply_skill_mapping(
         applied.append(key)
         uris.append(uri)
     if unknown:
-        return applied, unknown
+        return applied, unknown, uris, snapshot
 
     resources = data.get("resources") or []
     if not isinstance(resources, list):
@@ -2200,7 +2650,7 @@ def apply_skill_mapping(
         # key is absent/empty), and an agent with nothing mapped should fall
         # back to those defaults — so drop the key instead of writing [].
         data.pop("resources", None)
-    return applied, unknown
+    return applied, unknown, uris, snapshot
 
 
 def list_skill_tree(skill_root: Path) -> list[dict[str, Any]]:

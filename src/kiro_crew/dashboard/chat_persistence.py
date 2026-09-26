@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, deque
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from itertools import islice
 from pathlib import Path
 
@@ -39,6 +39,7 @@ from kiro_crew.dashboard.chat_utils import (
     _redact_meta_for_role,
     _sync_dashboard_slots,
     effective_session_key,
+    redact_display_content,
     session_key_for,
     slot_history_key,
     slot_transcript_key,
@@ -78,6 +79,7 @@ from kiro_crew.history import (
 )
 from kiro_crew.memory_stores import UnknownMemoryStore, named_store_or_empty
 from kiro_crew.messaging.link import is_channel_session_key
+from kiro_crew.platform_compat import file_lock
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.session_agent_selection import session_agent_selection_name
@@ -279,6 +281,9 @@ _REASONING_EFFORT_FALLBACK = EFFORT_VALUES
 # the read path too, not just the API.
 _reasoning_effort_values: set[str] = set(_REASONING_EFFORT_FALLBACK)
 _reasoning_effort_ordered: list[str] = list(_REASONING_EFFORT_FALLBACK_ORDER)
+# Levels backed by gateway-owned markers. At the advertised-level cap, a
+# marked restore outranks a peer level that no owner has selected.
+_reasoning_effort_marked: set[str] = set()
 
 # Re-exported (back-compat) for any caller importing the static allowlist.
 _REASONING_EFFORT_VALUES = EFFORT_VALUES
@@ -298,17 +303,93 @@ def get_reasoning_effort_ordered() -> list[str]:
 # "low\n" is rejected — ``$`` would match before the newline and let it through
 # to the persistence/subprocess boundary.
 _SAFE_EFFORT_RE = re.compile(r"[a-z][a-z0-9_-]{0,20}\Z")
+MAX_EFFORT_LEVELS_PER_CAPABILITY = 32
+MAX_RETAINED_REASONING_EFFORT_VALUES = 256
+# Crew panels are gateway-owned, precreated, and masked under both ordinary and
+# relocated data homes. Their record reader uses flat *.json names, so this
+# separate subdirectory cannot be mistaken for a panel.
+_VALIDATED_EFFORT_DIR = "crew-panels/validated_effort_levels"
+
+
+def _effort_marker_path(directory: Path, level: str) -> Path:
+    """Use a portable basename, including for Windows device names like con."""
+    return directory / hashlib.sha256(level.encode("utf-8")).hexdigest()
+
+
+def cap_effort_capability_levels(levels: Iterable[object], *, source: str) -> list[str]:
+    """Validate before applying the per-response cap, preserving safe input order."""
+    accepted: list[str] = []
+    dropped = 0
+    for level in levels:
+        if not isinstance(level, str) or not _SAFE_EFFORT_RE.fullmatch(level):
+            continue
+        if len(accepted) < MAX_EFFORT_LEVELS_PER_CAPABILITY:
+            accepted.append(level)
+        else:
+            dropped += 1
+    if dropped:
+        logger.warning(
+            "Dropped %d %s effort capability level(s): per-response limit %d reached",
+            dropped,
+            source,
+            MAX_EFFORT_LEVELS_PER_CAPABILITY,
+        )
+    return accepted
+
+
+def _retain_reasoning_effort_values(acp_levels: list[str], *, source: str) -> list[str]:
+    """Keep safe levels up to the process-wide cap, preserving input order."""
+    global _reasoning_effort_values
+    retained = set(_reasoning_effort_values)
+    accepted: list[str] = []
+    accepted_set: set[str] = set()
+    dropped = 0
+    for level in acp_levels:
+        if (
+            not isinstance(level, str)
+            or not _SAFE_EFFORT_RE.fullmatch(level)
+            or level in accepted_set
+        ):
+            continue
+        if level not in retained:
+            if len(retained) >= MAX_RETAINED_REASONING_EFFORT_VALUES:
+                dropped += 1
+                continue
+            retained.add(level)
+        accepted.append(level)
+        accepted_set.add(level)
+    if dropped:
+        logger.warning(
+            "Dropped %d %s effort level(s): retained limit %d reached",
+            dropped,
+            source,
+            MAX_RETAINED_REASONING_EFFORT_VALUES,
+        )
+    if retained != _reasoning_effort_values:
+        _reasoning_effort_values = retained
+    return accepted
+
+
+def register_reasoning_effort_values(acp_levels: list[str]) -> list[str]:
+    """Allow peer-advertised levels without replacing the local display order.
+
+    A remote crew's options can reach the composer before its first turn. They
+    must pass the hub's POST allowlist, but their order belongs to that slot,
+    not the process-global fallback for unrelated local sessions. Return only
+    retained levels so an over-cap peer option is never offered by the picker.
+    """
+    return _retain_reasoning_effort_values(acp_levels, source="peer")
 
 
 def update_reasoning_effort_values(acp_levels: list[str]) -> None:
     """Update valid effort levels from ACP session config.
 
     Preserves ACP order for display. The validation set grows monotonically —
-    it UNIONS the new levels onto the existing set (and the fallback) and never
-    shrinks, so a level that a prior session reported (and that a slot may have
-    persisted) stays valid even after another session reports a narrower config.
+    it UNIONS new levels onto the existing set (and the fallback) up to a named
+    total cap, and never shrinks. A retained level that a slot persisted stays
+    valid after another session reports a narrower config.
 
-    Sanitizes input: only lowercase alphanumeric strings pass through
+    Sanitizes input: only safe lowercase effort names pass through
     (defense-in-depth for subprocess boundary).
 
     Note: ``_reasoning_effort_ordered`` is a process-global *fallback* display
@@ -316,28 +397,97 @@ def update_reasoning_effort_values(acp_levels: list[str]) -> None:
     provider (see ``api_effort_levels``); this global is served only when no
     live provider is available.
     """
-    global _reasoning_effort_values, _reasoning_effort_ordered
-    safe_levels = [
-        level for level in acp_levels if isinstance(level, str) and _SAFE_EFFORT_RE.match(level)
-    ]
-    level_set = set(safe_levels)
-    # Union-only: never drop a previously-valid level (persistence safety).
-    merged = _reasoning_effort_values | set(_REASONING_EFFORT_FALLBACK) | level_set | {""}
-    ordered = [level for level in safe_levels if level]
-    if merged != _reasoning_effort_values or ordered != _reasoning_effort_ordered:
+    global _reasoning_effort_ordered
+    ordered = _retain_reasoning_effort_values(acp_levels, source="ACP")
+    if acp_levels and not ordered:
+        # Every advertised level was rejected at the cap. Keep the prior
+        # fallback menu instead of replacing it with an empty one.
+        return
+    if ordered != _reasoning_effort_ordered:
         logger.info("Effort levels updated from ACP: %s", ordered)
-        _reasoning_effort_values = merged
         _reasoning_effort_ordered = ordered
 
 
-def _validate_reasoning_effort(raw: object) -> str:
+def _remember_reasoning_effort_for_restore(level: str) -> None:
+    """Durably retain a selected ACP level before writing it to a transcript.
+
+    The transcript is agent-writable, so its value alone cannot expand the
+    restore allowlist. Each non-fallback level gets a separate owner-only marker
+    after ACP or a peer has validated it. Separate files avoid a lost update
+    when two slot-save workers select different levels concurrently.
+    """
+    if level in _REASONING_EFFORT_FALLBACK or level not in _reasoning_effort_values:
+        return
+    if not _SAFE_EFFORT_RE.fullmatch(level):
+        return
+    directory = config_dir() / _VALIDATED_EFFORT_DIR
+    if directory.parent.is_symlink():
+        raise OSError("validated effort parent is a symlink")
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if directory.is_symlink():
+        raise OSError("validated effort directory is a symlink")
+    path = _effort_marker_path(directory, level)
+    # Old raw-name markers remain readable after upgrade. Avoid creating a
+    # duplicate that would count twice against the durable bound.
+    lock_fd = os.open(directory / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(lock_fd, "r+b") as lock_file, file_lock(lock_file.fileno(), required=True):
+        if path.is_symlink():
+            raise OSError("validated effort marker is a symlink")
+        if not _has_validated_effort_marker(level):
+            max_markers = max(
+                0, MAX_RETAINED_REASONING_EFFORT_VALUES - len(_REASONING_EFFORT_FALLBACK)
+            )
+            markers = sum(
+                1
+                for entry in directory.iterdir()
+                if entry.name != ".lock" and not entry.is_symlink() and entry.is_file()
+            )
+            if markers >= max_markers:
+                raise ValueError("validated effort marker limit reached")
+            atomic_write(path, "", fsync=True, restrict_to_owner=True)
+    _reasoning_effort_marked.add(level)
+
+
+def _has_validated_effort_marker(raw: object) -> bool:
+    """Read a gateway-owned marker during the off-loop restore prefetch."""
+    if not isinstance(raw, str) or not _SAFE_EFFORT_RE.fullmatch(raw):
+        return False
+    directory = config_dir() / _VALIDATED_EFFORT_DIR
+    if directory.parent.is_symlink() or directory.is_symlink():
+        return False
+    for marker in (_effort_marker_path(directory, raw), directory / raw):
+        try:
+            if not marker.is_symlink() and marker.is_file():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _validate_reasoning_effort(raw: object, *, persisted_marker: bool = False) -> str:
     """Return *raw* if it's a valid reasoning_effort string, else "".
 
     Used by the persistence restore paths so a tampered/corrupted
     metadata file cannot smuggle an arbitrary string into the CC
     ``--effort`` subprocess argument.
     """
+    global _reasoning_effort_values
     if isinstance(raw, str) and raw in _reasoning_effort_values:
+        if persisted_marker:
+            _reasoning_effort_marked.add(raw)
+        return raw
+    if persisted_marker and isinstance(raw, str) and _SAFE_EFFORT_RE.fullmatch(raw):
+        retained = set(_reasoning_effort_values)
+        if len(retained) >= MAX_RETAINED_REASONING_EFFORT_VALUES:
+            unselected = retained - _REASONING_EFFORT_FALLBACK - _reasoning_effort_marked
+            if unselected:
+                retained.remove(min(unselected))
+            else:
+                logger.warning("Discarding persisted reasoning_effort at retained limit: %r", raw)
+                return ""
+        retained.add(raw)
+        _reasoning_effort_values = retained
+        _reasoning_effort_marked.add(raw)
         return raw
     if raw:
         logger.warning("Discarding invalid persisted reasoning_effort: %r", raw)
@@ -534,7 +684,7 @@ def _prefetch_rehydrate_inputs(
     kiro_model_map: dict[str, str] | None = None,
     with_status: bool = False,
 ) -> tuple[
-    dict, bool, list[dict] | None, dict[str, str] | None, tuple[str, str] | None, str | None
+    dict, bool, list[dict] | None, dict[str, str] | None, tuple[str, str] | None, str | None, bool
 ]:
     """Read everything :func:`_rehydrate_slot_from_history` needs, off the loop.
 
@@ -552,7 +702,9 @@ def _prefetch_rehydrate_inputs(
     retries", and treating the second as the first is what silently discards a
     live tab.
 
-    Returns ``(meta, readable, messages, model_map, member_identity, agent)``.
+    Returns ``(meta, readable, messages, model_map, member_identity, agent,
+    effort_marker)``. The marker check is filesystem work too, so it belongs
+    in this prefetch rather than the loop-affine apply phase.
     *messages* and *model_map* are ``None`` when there is nothing to build — no
     metadata, an unreadable read, or a session closed with ✕ that the caller did
     not opt to adopt — so a caller can decide without a second disk round trip.
@@ -565,7 +717,7 @@ def _prefetch_rehydrate_inputs(
     else:
         meta, readable = conv_log.get_metadata(history_key), True
     if not readable or not meta or (meta.get("closed") and not adopt_closed):
-        return meta or {}, readable, None, None, None, None
+        return meta or {}, readable, None, None, None, None, False
     return (
         meta,
         readable,
@@ -575,6 +727,7 @@ def _prefetch_rehydrate_inputs(
         # property of the slot name.
         _member_restore_identity(history_key.removeprefix("dashboard:")),
         _restored_agent_name(str(meta.get("linked_session_key") or history_key), meta),
+        _has_validated_effort_marker(meta.get("reasoning_effort")),
     )
 
 
@@ -614,7 +767,7 @@ def _restore_open_slots_steps(state: DashboardState) -> "Iterator[int]":
             # These reads MUST stay inside the per-tab guard. The async driver
             # has no except at its call site either, so anything escaping here
             # aborts dashboard startup and costs every LATER tab too.
-            meta, readable, messages, model_map, member_identity, agent = (
+            meta, readable, messages, model_map, member_identity, agent, effort_marker = (
                 _prefetch_rehydrate_inputs(
                     state.conversation_log,
                     slot_transcript_key(key),
@@ -631,6 +784,7 @@ def _restore_open_slots_steps(state: DashboardState) -> "Iterator[int]":
                 model_map=model_map,
                 member_identity=member_identity,
                 agent=agent,
+                effort_marker=effort_marker,
                 unrestored=unrestored,
             )
         except Exception:
@@ -735,6 +889,7 @@ def _apply_restored_open_slot(
     unrestored: set[str],
     member_identity: tuple[str, str] | None = _IDENTITY_UNRESOLVED,
     agent: str | None = None,
+    effort_marker: bool = False,
     conv_log: ConversationLog | None = None,
     started: float | None = None,
 ) -> int:
@@ -800,6 +955,7 @@ def _apply_restored_open_slot(
         _prefetched_messages=messages,
         _prefetched_member_identity=member_identity,
         _prefetched_agent=agent,
+        _prefetched_effort_marker=effort_marker,
     )
     return 1 if slot is not None else 0
 
@@ -885,7 +1041,7 @@ async def restore_open_slots_async(state: DashboardState) -> int:
                 continue
             try:
                 started = time.time()
-                meta, readable, messages, model_map, member_identity, agent = (
+                meta, readable, messages, model_map, member_identity, agent, effort_marker = (
                     await asyncio.to_thread(
                         _prefetch_rehydrate_inputs,
                         conv_log,
@@ -903,6 +1059,7 @@ async def restore_open_slots_async(state: DashboardState) -> int:
                     model_map=model_map,
                     member_identity=member_identity,
                     agent=agent,
+                    effort_marker=effort_marker,
                     unrestored=unrestored,
                     # Opts into the post-hop re-checks (close tombstone +
                     # deletion): this driver's read ran in a worker thread, so
@@ -1016,7 +1173,7 @@ def _attach_variants(slot: _ChatSlot, m: dict) -> None:
         slot.messages[-1]["variants"] = [  # type: ignore[assignment]
             {
                 **v,
-                "content": redact_credentials(redact_exfiltration_urls(v.get("content", ""))[0])[0],
+                "content": redact_display_content(v.get("content", "")),
             }
             for v in m["variants"]
             if isinstance(v, dict)
@@ -1338,6 +1495,7 @@ def _rehydrate_slot_from_history(
     _prefetched_messages: list[dict] | None = None,
     _prefetched_member_identity: tuple[str, str] | None = _IDENTITY_UNRESOLVED,
     _prefetched_agent: str | None = None,
+    _prefetched_effort_marker: bool = False,
 ) -> _ChatSlot | None:
     """Rehydrate a single dashboard slot from persisted history.
 
@@ -1513,7 +1671,9 @@ def _rehydrate_slot_from_history(
         # the slot on its persisted model -- the documented refusal -- and the owner
         # re-picks "Auto (Jev)" to route again.
         if meta.get("reasoning_effort"):
-            slot.reasoning_effort = _validate_reasoning_effort(meta["reasoning_effort"])
+            slot.reasoning_effort = _validate_reasoning_effort(
+                meta["reasoning_effort"], persisted_marker=_prefetched_effort_marker
+            )
         if meta.get("autocompact_pct") is not None:
             slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
         if meta.get("workspace"):
@@ -1762,8 +1922,7 @@ def _rehydrate_slot_from_history(
             # stays raw because its author is its only reader, but `system` MUST be
             # redacted — the write path excludes it, so system bytes reach disk raw.
             if role != "user":
-                content, _ = redact_exfiltration_urls(content)
-                content, _ = redact_credentials(content)
+                content = redact_display_content(content)
             slot.append(
                 role,
                 content,
@@ -1892,12 +2051,14 @@ async def rehydrate_slot_from_history_async(
     conv_log = state.conversation_log
 
     started = time.time()
-    _meta, _readable, messages, model_map, _member_id, agent = await asyncio.to_thread(
-        _prefetch_rehydrate_inputs,
-        conv_log,
-        history_key,
-        adopt_closed=adopt_closed,
-        kiro_model_map=kiro_model_map,
+    _meta, _readable, messages, model_map, _member_id, agent, effort_marker = (
+        await asyncio.to_thread(
+            _prefetch_rehydrate_inputs,
+            conv_log,
+            history_key,
+            adopt_closed=adopt_closed,
+            kiro_model_map=kiro_model_map,
+        )
     )
     # ``messages is None`` covers both "never persisted" and "closed with ✕"
     # — the prefetch already applied the same guards the synchronous form does.
@@ -1971,6 +2132,7 @@ async def rehydrate_slot_from_history_async(
         _prefetched_messages=messages,
         _prefetched_member_identity=_member_id,
         _prefetched_agent=agent,
+        _prefetched_effort_marker=effort_marker,
     )
     if _restored is not None:
         # Claim recovery belongs HERE, not in each caller: this function is how
@@ -2016,14 +2178,14 @@ def _prefetch_recent_session(
     *,
     folders_only: bool,
     cutoff: float | None,
-) -> tuple[dict | None, list[dict] | None, tuple[str, str] | None, str | None]:
+) -> tuple[dict | None, list[dict] | None, tuple[str, str] | None, str | None, bool]:
     """Read one candidate session's metadata + transcript, off the loop.
 
     Applies the selection filters BETWEEN the two reads so a session that is
     going to be skipped never pays for its transcript walk — the metadata read is
     what the filters need, and it is the cheap one.
 
-    Returns ``(None, None, None, None)`` for a session this pass must skip (not
+    Returns ``(None, None, None, None, False)`` for a session this pass must skip (not
     folder'd / pinned under ``folders_only``, closed with ✕, or outside the
     mtime window). The third element is the prefetched
     ``_member_restore_identity`` answer — dm.json is file IO too, and the apply
@@ -2044,16 +2206,16 @@ def _prefetch_recent_session(
         # deleted. ``_rehydrate_slot_from_history`` already refuses on empty
         # metadata for exactly this reason ("don't create a phantom slot"); this
         # makes the recent-sessions path agree with it.
-        return None, None, None, None
+        return None, None, None, None, False
     has_folder = bool(meta.get("folder_id"))
     has_pin = bool(meta.get("pinned"))
     if folders_only and not has_folder and not has_pin:
-        return None, None, None, None
+        return None, None, None, None, False
     if meta.get("closed"):
-        return None, None, None, None
+        return None, None, None, None, False
     if not has_folder and not has_pin:
         if cutoff is not None and session.get("modified", 0) < cutoff:
-            return None, None, None, None
+            return None, None, None, None, False
     return (
         meta,
         conv_log.read_messages_chained(key),
@@ -2065,6 +2227,7 @@ def _prefetch_recent_session(
             ),
             meta,
         ),
+        _has_validated_effort_marker(meta.get("reasoning_effort")),
     )
 
 
@@ -2081,6 +2244,7 @@ def _apply_recent_session(
     restore_cfg: "KiroCrewConfig | None",
     member_identity: tuple[str, str] | None = _IDENTITY_UNRESOLVED,
     agent: str | None = None,
+    effort_marker: bool = False,
 ) -> None:
     """Build the slot for one prefetched recent session.
 
@@ -2168,7 +2332,9 @@ def _apply_recent_session(
     # `jev_route` is neither written nor read here, for the reason the rehydrate
     # path above states: it is an owner pick, and this file is agent-writable.
     if meta.get("reasoning_effort"):
-        slot.reasoning_effort = _validate_reasoning_effort(meta["reasoning_effort"])
+        slot.reasoning_effort = _validate_reasoning_effort(
+            meta["reasoning_effort"], persisted_marker=effort_marker
+        )
     if meta.get("autocompact_pct") is not None:
         slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
     if meta.get("workspace"):
@@ -2302,8 +2468,7 @@ def _apply_recent_session(
         # measured rationale (content ~0.4s / ~204 readers, meta ~5.5s /
         # 31 readers that touch only control fields outside the emit sites).
         if role != "user":
-            content, _ = redact_exfiltration_urls(content)
-            content, _ = redact_credentials(content)
+            content = redact_display_content(content)
         slot.append(
             role,
             content,
@@ -2351,7 +2516,7 @@ def _restore_recent_sessions_steps(
         slot_name = _recent_session_slot_name(key)
         if slot_name is None or slot_name in state._slots:
             continue
-        meta, messages, _member_id, agent = _prefetch_recent_session(
+        meta, messages, _member_id, agent, effort_marker = _prefetch_recent_session(
             conv_log, key, s, folders_only=folders_only, cutoff=cutoff
         )
         if meta is None or messages is None:
@@ -2368,6 +2533,7 @@ def _restore_recent_sessions_steps(
             restore_cfg=_restore_cfg,
             member_identity=_member_id,
             agent=agent,
+            effort_marker=effort_marker,
         )
         restored += 1
         # Recover an app flag whose claim outlived its row, as the open-slots
@@ -2431,7 +2597,7 @@ async def restore_recent_sessions_async(
             if slot_name is None or slot_name in state._slots:
                 continue
             started = time.time()
-            meta, messages, _member_id, agent = await asyncio.to_thread(
+            meta, messages, _member_id, agent, effort_marker = await asyncio.to_thread(
                 _prefetch_recent_session,
                 conv_log,
                 key,
@@ -2501,6 +2667,7 @@ async def restore_recent_sessions_async(
                 restore_cfg=_restore_cfg,
                 member_identity=_member_id,
                 agent=agent,
+                effort_marker=effort_marker,
             )
             restored += 1
             # Same recovery, with the spool read awaited: this driver is
@@ -3669,6 +3836,8 @@ def _save_slot_to_history(
                 #   truthy, exactly like the full save (origin's fail-closed
                 #   sentinel and the once-flags must never be erased by a
                 #   writer that has not learned them).
+                if slot.reasoning_effort:
+                    _remember_reasoning_effort_for_restore(slot.reasoning_effort)
                 fields: dict = {
                     "folder_id": slot.folder_id or "",
                     "tags": list(slot.tags),
@@ -4043,6 +4212,12 @@ def _save_slot_to_history(
                     history_key,
                     expected_slot_name,
                 )
+                # A refusal is not a commit, and the periodic writer cannot tell
+                # the difference: it clears ``_dirty`` on any return that did not
+                # raise. Keeping the state owed is what makes this guard safe for
+                # a caller whose edit lives only in memory -- the same treatment
+                # the other retryable refusals in this function already apply.
+                _keep_owed_after_refusal(slot)
                 return False
             path.parent.mkdir(parents=True, exist_ok=True)
             meta_line: dict = {
@@ -4105,6 +4280,7 @@ def _save_slot_to_history(
                 meta_line["agent"] = slot.agent
             meta_line["model"] = slot.model
             if slot.reasoning_effort:
+                _remember_reasoning_effort_for_restore(slot.reasoning_effort)
                 meta_line["reasoning_effort"] = slot.reasoning_effort
             # Unconditional, matching the empty-window merge mirror: None is
             # the cleared "follow the global" value, not an absent field.
@@ -4727,6 +4903,32 @@ def session_was_deleted(state: DashboardState, slot: _ChatSlot) -> bool:
     return False
 
 
+def register_guarded_history_write(slot: _ChatSlot, save: "asyncio.Future[bool]") -> None:
+    """Make a truncating write visible to a retraction of this slot's name.
+
+    A close fences the slot, then waits for every future in this registry to
+    finish before it pops the name. A write that is not registered here is
+    invisible to that wait, so the close can pop while the write is still on its
+    way to the rename and a same-name replacement then adopts the truncated
+    transcript.
+
+    The registry holds FUTURES, not a count: a count released in an awaiter's
+    ``finally`` reads zero as soon as that awaiter is cancelled, while the worker
+    thread it dispatched runs on. A future completes when the thread returns,
+    whatever happened to the awaiter.
+
+    Anything that is not a real set is treated as an absent registry: a
+    compatibility caller may pass a slot double that synthesizes attributes, and
+    a synthesized object must not reach the done callback.
+    """
+    writes = getattr(slot, "_guarded_history_writes", None)
+    if not isinstance(writes, set):
+        writes = set()
+        slot._guarded_history_writes = writes
+    writes.add(save)
+    save.add_done_callback(writes.discard)
+
+
 async def save_slot_off_loop(
     state: DashboardState,
     slot: _ChatSlot,
@@ -4740,6 +4942,7 @@ async def save_slot_off_loop(
     expected_history_key: str | None = None,
     expected_slot_name: str | None = None,
     rows_only: bool = False,
+    issued_by_the_retraction: bool = False,
 ) -> bool:
     """Persist a slot from the event loop without blocking or dropping the save.
 
@@ -4791,7 +4994,11 @@ async def save_slot_off_loop(
     Returns ``False`` only when the save was skipped WITHOUT writing: the
     session was permanently deleted while the save awaited the lock (the
     delete-won guard in :func:`_save_slot_to_history`), or the routing moved
-    off ``expected_history_key``. Neither skip raises, for either
+    off ``expected_history_key``. A guarded write is also skipped when the slot
+    is already fenced for close, because the retraction of its name has passed
+    the point where it can wait for this write -- unless the retraction itself
+    issued it (``issued_by_the_retraction``), which the handover drain does and
+    nothing else does. Neither skip raises, for either
     ``best_effort`` mode, so a clean return does NOT prove a committed write.
     Callers that go on to republish the slot's content elsewhere (fork, the
     transfer export) must check the return; archival callers (close/cleanup)
@@ -4826,6 +5033,76 @@ async def save_slot_off_loop(
             inflight - 1 if type(inflight) is int and inflight > 0 else 0
         )
 
+    def _register_guarded_write(save: "asyncio.Future[bool]") -> None:
+        """Hold a guarded write's executor future until the WORKER completes.
+
+        ``_finish_guarded_metadata_write`` runs in THIS coroutine's ``finally``,
+        so a caller cancelled while the executor is running releases the count
+        with the worker thread still on its way to the rename. The future does
+        not share that fate: cancelling the awaiter either cancels the work
+        before it starts, in which case nothing is written, or fails to cancel a
+        thread already running and the future still completes when that thread
+        returns. A retraction of this slot's name orders itself after that
+        completion, which is a guarantee the count cannot give.
+        """
+        register_guarded_history_write(slot, save)
+
+    async def _dispatch_to_worker(active_loop: asyncio.AbstractEventLoop) -> bool:
+        if guarded_metadata and not issued_by_the_retraction and getattr(slot, "is_closing", False):
+            # A retraction of this slot's name is already past its own wait for
+            # the guarded writes registered below, so dispatching now would put a
+            # worker thread on its way to the rename with nothing left to order
+            # against it. The caller that reached here checked the same fence
+            # before its own awaits, and those awaits are where the fence went
+            # up; re-reading it HERE is what makes the pair decidable. There is
+            # no suspension between this read and the registration below, so the
+            # two possible interleavings are the only ones: fence first and this
+            # write refuses, or registration first and the retraction waits.
+            #
+            # The fence asks whether this write races a retraction. A write the
+            # retraction ITSELF issues does not: the handover drain runs inside
+            # the close that raised the fence, is sequenced by it, and is the
+            # last chance the original's unsaved rows have to reach disk.
+            # ``issued_by_the_retraction`` is how that caller says so, and only
+            # that caller passes it.
+            #
+            # Refusing writes nothing, which is the ``False`` contract this
+            # function already documents for a write its own guards decline. The
+            # close's archival save is unaffected for a second reason: it carries
+            # no authorized transcript key, so it is not a guarded write.
+            logger.warning(
+                "Refusing a guarded history write for %s: the conversation is being closed",
+                getattr(slot, "key", "?"),
+            )
+            # Refusing must not be silently FINAL. A metadata-only mutation
+            # (recreate title, folder filing, tag, pin, mode) calls this with
+            # ``force=True``, does not otherwise set ``_dirty``, and its callers
+            # publish on the strength of the acknowledged edit without reading
+            # this return. A close can raise the fence and then leave the slot
+            # live -- it refuses on a breached wait, and the sweep raises and
+            # releases the fence around a deferral -- so an edit landing in that
+            # window would be dropped and the old value would come back after a
+            # restart. Arming the flush is the same remedy this function's own
+            # exception arms use below, and it converges once the fence is down.
+            try:
+                slot._dirty = True
+            except Exception:  # noqa: BLE001 - a slot double may not accept it
+                pass
+            return False
+        save = active_loop.run_in_executor(None, _do)
+        if not guarded_metadata:
+            return await save
+        _register_guarded_write(save)
+        # Shield the FUTURE from this caller's cancellation. Cancelling an
+        # asyncio future returned by ``run_in_executor`` succeeds whatever the
+        # worker thread is doing -- the chained cancel of the underlying
+        # concurrent future cannot stop a thread already running -- so an
+        # unshielded await would resolve the registration above while the write
+        # is still on its way to the rename, which is the exact blindness the
+        # registration exists to remove. The thread runs on either way; shielding
+        # only keeps it observable.
+        return await asyncio.shield(save)
+
     guarded_metadata = expected_history_key is not None
     try:
         loop = asyncio.get_running_loop()
@@ -4852,7 +5129,7 @@ async def save_slot_off_loop(
         if guarded_metadata:
             _begin_guarded_metadata_write()
         try:
-            return await loop.run_in_executor(None, _do)
+            return await _dispatch_to_worker(loop)
         except Exception:  # noqa: BLE001 - best-effort durable copy
             # See the inline branch above: re-arm the periodic flush so a
             # swallowed metadata/message save is retried rather than lost.
@@ -4869,7 +5146,7 @@ async def save_slot_off_loop(
     if guarded_metadata:
         _begin_guarded_metadata_write()
     try:
-        return await loop.run_in_executor(None, _do)
+        return await _dispatch_to_worker(loop)
     finally:
         if guarded_metadata:
             _finish_guarded_metadata_write()

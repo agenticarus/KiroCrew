@@ -1007,11 +1007,35 @@ class TestNewConversation:
 
         # Fresh session/new on the SAME runtime (cwd+agent from the runtime).
         runtime.create_session.assert_awaited_once_with(
-            cwd="/tmp/ws", agent="kirocrew", memory_mode="persistent"
+            cwd="/tmp/ws", agent="kirocrew", memory_mode="persistent", session_key=""
         )
         # Handle swapped to the fresh session → next prompt starts clean.
         assert provider._handle is new_handle
         assert provider.session_id == "fresh-session-2"
+
+    @pytest.mark.asyncio
+    async def test_owning_shutdown_stops_in_flight_hook_executions(self):
+        handle = _make_handle(session_id="owned")
+        handle._cancel_hook_tasks = MagicMock()
+        runtime = _make_runtime()
+        runtime.kill = AsyncMock()
+        provider = AcpSessionProvider(handle, runtime, owns_runtime=True)
+
+        await provider.shutdown()
+
+        handle._cancel_hook_tasks.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_the_fresh_session_keeps_the_providers_owner(self):
+        # The hooks execute path keys its record and its governance by the owning
+        # session, so a fresh conversation must not come back unowned.
+        old = _make_handle(session_id="old-session-1")
+        runtime, _new_handle = self._runtime_with_new_session()
+        provider = AcpSessionProvider(old, runtime, session_key="slot:owner")
+
+        await provider.new_conversation()
+
+        assert runtime.create_session.await_args.kwargs["session_key"] == "slot:owner"
 
     @pytest.mark.asyncio
     async def test_destroys_old_session_to_free_context(self):
@@ -1275,7 +1299,7 @@ class TestLivePathModelEntitlement:
             {"modelId": "claude-opus-5", "name": "claude-opus-5", "description": ""},
         ]
 
-        async def _refresh():
+        async def _refresh(*_a, **_kw):
             handle.available_models = fresh
             return fresh
 
@@ -1330,6 +1354,21 @@ class TestLivePathModelEntitlement:
 
         handle.refresh_available_models.assert_not_awaited()
         handle.set_model.assert_awaited_once_with("claude-opus-4.8")
+
+    @pytest.mark.asyncio
+    async def test_refusal_heal_forces_a_fresh_probe(self):
+        """D1: an explicit pick is a user action, so its revalidation passes
+        force=True — it must not be refused on a no-evidence failure the picker
+        read path may have cached in the shared attempt-clock window."""
+        from kiro_crew.acp.client import AcpModelUnavailable
+
+        provider, handle = self._provider(["claude-sonnet-4.6"])
+
+        with pytest.raises(AcpModelUnavailable):
+            await provider.set_model("claude-opus-4.8")
+
+        handle.refresh_available_models.assert_awaited_once()
+        assert handle.refresh_available_models.await_args.kwargs.get("force") is True
 
 
 class TestAdvertisedModelIds:

@@ -88,11 +88,16 @@ from kiro_crew.acp.session_handle import (
     _load_watchdog_settings,
     advertised_models_from_session,
 )
-from kiro_crew.acp.session_mcp import agent_spec_snapshot, session_mcp_server_is_disabled
+from kiro_crew.acp.session_mcp import (
+    agent_spec_snapshot,
+    session_mcp_disabled_tools,
+    session_mcp_server_is_disabled,
+)
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_MARKDOWN_AGENT_SPECS,
+    MCP_ROSTER_COMPLETE_NOTE,
     METHOD_MCP_OAUTH_REQUEST,
     METHOD_MCP_SERVER_INIT_FAILURE,
     METHOD_MCP_SERVER_INITIALIZED,
@@ -1755,7 +1760,14 @@ class AcpRuntime:
         # newer pass's descendants are dropped from both the record and the file.
         # Sessions start concurrently on a shared runtime, so this is reachable.
         self._descendant_scan_lock = asyncio.Lock()
-        self._entitlement_probe_at = 0.0
+        # Two independent clocks so a failure never extends the life of an old
+        # success: ``_result_at`` is stamped ONLY when a non-empty result is
+        # stored (that result may be replayed until it expires), while
+        # ``_attempt_at`` is stamped on EVERY completed attempt incl.
+        # failure/empty (it suppresses re-opening a session within the TTL but
+        # never replays a stale result).
+        self._entitlement_probe_result_at = 0.0
+        self._entitlement_probe_attempt_at = 0.0
         self._entitlement_probe_result: list[dict[str, str]] = []
         self._dead = False
         self._death_summary: str | None = None
@@ -1883,6 +1895,23 @@ class AcpRuntime:
     @property
     def pid(self) -> int | None:
         return self._pid
+
+    @property
+    def spawn_monotonic(self) -> float | None:
+        """Monotonic time this process was spawned, or ``None`` before spawn."""
+        return self._spawn_monotonic
+
+    @property
+    def entitlement_probe_result_at(self) -> float:
+        """Monotonic time the stored probe answer arrived (0.0 before any).
+
+        :meth:`probe_advertised_models` serves either a fresh answer or a replay
+        of this stored one; in both cases the answer is dated by this clock, so a
+        caller that stores what it was served dates its snapshot from here rather
+        than from its own call time, which for a replay would be LATER than the
+        data and would raise its own freshness floor above it.
+        """
+        return self._entitlement_probe_result_at
 
     @property
     def work_scratch_dir(self) -> Path | None:
@@ -2084,6 +2113,8 @@ class AcpRuntime:
         asks, because it also counts ``_session_inits_in_flight``: a runtime with
         an initializing session is treated as busy and parked to drain rather
         than killed, so no caller has to absorb that window with a respawn.
+        The init scope opens before ``create_session``'s admission gate, so a
+        claim still queued behind the gate already counts.
         """
 
         return bool(self._session_queues) or self._session_inits_in_flight > 0
@@ -4980,6 +5011,18 @@ class AcpRuntime:
         entries carry the roster names, and that is what makes the ABSENT
         servers nameable rather than only the present ones.
 
+        The text says what that roster IS. On kiro-cli the array holds only the
+        broker stubs Kiro Crew injects (``pooled_session_servers``); the agent
+        spec's own servers are started by the backend and are not in it, and
+        the backend's session-start steps after MCP init are not observable
+        from here at all. A bare ``4/4 MCP server(s) reported`` therefore read
+        as "all MCP is up, so MCP is the problem" -- a field report was
+        triaged that way on the strength of the suffix alone -- when it only
+        ever meant that the four injected servers had spoken. The count is
+        now labelled ``session-injected``, and a complete roster is followed
+        by what it does and does not cover, so a reader is not sent to chase
+        MCP for a stall that is past it.
+
         Reports are runtime-wide rather than per-session: a request that never
         answered has no session id to match its frames against, so a concurrent
         init is called out in the text instead of being silently folded in. What
@@ -5033,12 +5076,25 @@ class AcpRuntime:
             # len(reported) can exceed the denominator -- "2/1 reported". The
             # out-of-roster servers still appear by name in the failed and
             # awaiting-authorization buckets, where naming them is the point.
-            parts.append(f"{len(reported & set(roster))}/{len(roster)} MCP server(s) reported")
+            parts.append(
+                f"{len(reported & set(roster))}/{len(roster)} session-injected "
+                "MCP server(s) reported"
+            )
             silent = [n for n in roster if n not in reported]
             if silent:
                 parts.append(f"no report from {_capped_names(silent)}")
+            elif not set(failed) & set(roster):
+                # Every roster member reported READY. A member that reported an
+                # init failure counts as reported (so it is never chased as
+                # silent) but is named under ``failed:`` below, and the stall
+                # may be in it -- so the "not in those servers" verdict is
+                # withheld then.
+                parts.append(MCP_ROSTER_COMPLETE_NOTE)
         else:
-            parts.append(f"{len(reported)} MCP server(s) reported, roster unknown")
+            # No roster to attribute against: these reports belong to the agent
+            # spec's own servers or to a concurrent start, so the count is not
+            # labelled "session-injected" here.
+            parts.append(f"{len(reported)} MCP server report(s), roster unknown")
         if failed:
             parts.append(
                 "failed: "
@@ -5444,7 +5500,12 @@ class AcpRuntime:
         )
 
     async def _kas_custom_agents(
-        self, agent: str, *, member_dispatch: bool = False, session_key: str = ""
+        self,
+        agent: str,
+        *,
+        member_dispatch: bool = False,
+        crew_panel: bool = False,
+        session_key: str = "",
     ) -> SessionExtras:
         """The per-session payload for a wire-registered host, and what built it.
 
@@ -5467,6 +5528,7 @@ class AcpRuntime:
             work_dir=getattr(self, "_work_dir", None),
             mcp_gateway_overlay=self._mcp_gateway_overlay,
             member_dispatch=member_dispatch,
+            crew_panel=crew_panel,
             session_key=session_key,
         )
         # Judged HERE, on the payload, so every path that builds one -- session/new
@@ -5474,6 +5536,126 @@ class AcpRuntime:
         # ``custom_agents`` is None) never reaches the check.
         self._refuse_if_loader_unreachable(agent, extras.custom_agents)
         return extras
+
+    async def _mount_member_panel(
+        self,
+        mcp_servers: list[dict[str, Any]],
+        *,
+        member_session_key: str,
+        agent_name: str,
+        session_work_dir: Any,
+        stub_token: str,
+        resuming: bool = False,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Mount the crew-panel server into a member DM session's server array.
+
+        Returns the array and whether the GRANT may follow it. The two answers are
+        one call because they must agree: a grant that outlived the mount would
+        leave a switched-off server both named in ``tools`` and pre-approved on the
+        very session that is not mounting it, which is the shape
+        ``member_dispatch`` already avoids by deriving its flag from its own
+        withhold.
+
+        Asked on the resume path as well as on create, and it matters MORE there:
+        ``session/load`` re-initializes the session's servers, so an unasked
+        question would re-mount a switched-off server onto a conversation whose
+        ``session/new`` withheld it.
+
+        Two withholds, each the operator's own, and BOTH spellings of the switch:
+
+        * ``agent.crew_panel`` -- the config ceiling, read through
+          :func:`~kiro_crew.members.crew_panel_enabled`, which fails closed on an
+          unreadable or degraded config.
+        * a whole-server ``disabled`` on ``kirocrew-panel``. ``disabled`` has no
+          per-tool or per-call spelling, so a harness handed the server cannot
+          refuse a call to it, and the ``tools`` allowlist that keeps a disabled
+          server out of a projected array does not reach an entry appended here.
+        * a per-tool ``disabledTools`` naming any panel verb. Asked HERE and not
+          only on the client sibling, because the two paths serve different
+          backends and this one is the only path KAS takes: ``disabledTools`` is a
+          hand-editable documented key in the global ``settings/mcp.json`` that
+          :func:`~kiro_crew.acp.session_mcp.session_mcp_disabled_tools` reads, and
+          the KAS grant that follows this mount puts ``panel_publish`` into
+          ``allowedTools`` approval-free. KAS has no wire slot for hooks, so there
+          is no later point at which a call to the switched-off verb could be
+          refused -- withholding is the only faithful answer, and an operator's
+          per-tool switch-off would otherwise be silently undone.
+
+        The per-tool withhold takes the WHOLE server on every runtime-served
+        backend rather than only where withholding is the sole deny channel. The
+        mount and the grant are one answer here by construction, so keeping the
+        mount for a backend that can refuse per call (codex) while withholding the
+        grant would need two, and a grant that outlived a withhold is the failure
+        this coupling exists to prevent. Withholding a server is an availability
+        cost; forwarding an un-narrowed one is a capability the user switched off.
+
+        Asked PER SERVER rather than inherited from the dashboard server's answer:
+        the panel and session control are separate capabilities with separate
+        switches, so an operator who withdrew session control keeps the drawer
+        they never asked to lose, and one who switched the panel off loses only
+        the panel.
+        """
+        if not member_session_key:
+            return mcp_servers, False
+        # circular import: members' module graph is heavy; resolved at call time
+        # like the dispatch seam on both paths.
+        from kiro_crew.members import (
+            MEMBER_PANEL_SERVER,
+            crew_panel_enabled,
+            member_panel_session_server,
+        )
+
+        where = " on resume" if resuming else ""
+        if not await asyncio.to_thread(crew_panel_enabled):
+            logger.info(
+                "member session %s: agent.crew_panel is off, so the crew panel is "
+                "not mounted%s; the member keeps its other tools",
+                member_session_key,
+                where,
+            )
+            return mcp_servers, False
+        if await asyncio.to_thread(
+            session_mcp_server_is_disabled,
+            MEMBER_PANEL_SERVER,
+            agent_name,
+            work_dir=_disable_check_scope(self.acp_backend, session_work_dir),
+        ):
+            logger.warning(
+                "member session %s: %s is switched off for this session (disabled), "
+                "so the crew panel is not mounted%s; re-enable that server to restore it",
+                member_session_key,
+                MEMBER_PANEL_SERVER,
+                where,
+            )
+            return mcp_servers, False
+        narrowed = await asyncio.to_thread(
+            session_mcp_disabled_tools,
+            agent_name,
+            work_dir=_disable_check_scope(self.acp_backend, session_work_dir),
+        )
+        if any(server == MEMBER_PANEL_SERVER for server, _tool in narrowed):
+            logger.warning(
+                "member session %s: one of %s's tools is switched off, and the grant "
+                "that follows this mount is approval-free with no later point to "
+                "refuse the call, so the crew panel is not mounted%s; stop narrowing "
+                "that server to restore it",
+                member_session_key,
+                MEMBER_PANEL_SERVER,
+                where,
+            )
+            return mcp_servers, False
+        entry = await asyncio.to_thread(member_panel_session_server, member_session_key, stub_token)
+        if entry is None:
+            logger.warning(
+                "member session %s: panel server unresolved%s -- the member runs "
+                "without a panel this session",
+                member_session_key,
+                where,
+            )
+            return mcp_servers, False
+        # Session-level entries outrank same-named spec entries, so drop any stub
+        # for the same server rather than registering it twice.
+        return [e for e in mcp_servers if e.get("name") != entry["name"]] + [entry], True
 
     async def _session_start_budget(self) -> float:
         """The session/new + session/load budget, resolved per session start.
@@ -5767,6 +5949,7 @@ class AcpRuntime:
         memory_mode: str = "persistent",
         on_gate_acquired: Callable[[float], None] | None = None,
         late_adopter: "Callable[[AcpSessionHandle], Awaitable[bool]] | None" = None,
+        on_gate_queued: Callable[[], None] | None = None,
     ) -> AcpSessionHandle:
         """Create a new ACP session on this runtime. Returns a session handle.
 
@@ -5792,9 +5975,11 @@ class AcpRuntime:
         element. Empty — and unread — for a host with no mirror.
 
         ``session/new`` runs under the loop's :class:`SessionStartGate`
-        (``agent.session_start_concurrency``). ``on_gate_acquired(queue_wait_ms)``
-        fires at gate EXIT so the caller can start its own clocks there: the
-        queue wait is not start time. On a ``session/new`` timeout the request
+        (``agent.session_start_concurrency``). ``on_gate_queued()`` fires
+        immediately before the wait for a permit begins and
+        ``on_gate_acquired(queue_wait_ms)`` at gate EXIT, so the caller can
+        stop its own clocks for exactly the span spent queued and restart them
+        at acquisition: the queue wait is not start time. On a ``session/new`` timeout the request
         is NOT abandoned: a :class:`StartCollector` keeps it for
         ``agent.start_collect_timeout_secs`` and either hands the late session
         to ``late_adopter`` (which returns True to keep it) or tears it down;
@@ -5864,6 +6049,9 @@ class AcpRuntime:
             # snapshot.
             stub_token = ""
         member_withheld = False
+        # False for every non-member session, set without an awaited call so the
+        # Kiro construction path is untouched by this capability (H13).
+        panel_mounted = False
         if member_session_key:
             # circular import: members' module graph is heavy; resolved at call
             # time like the projection seams below.
@@ -5908,6 +6096,17 @@ class AcpRuntime:
                     "thread runs as plain chat this session",
                     member_session_key,
                 )
+            # INSIDE the member branch, like the mount above it: a session with no
+            # member key reaches no part of this composition, so the Kiro
+            # construction path gains no conditional, no awaited step and no new
+            # failure mode from the panel capability (harness-parity H13).
+            mcp_servers, panel_mounted = await self._mount_member_panel(
+                mcp_servers,
+                member_session_key=member_session_key,
+                agent_name=agent or self._agent,
+                session_work_dir=session_work_dir,
+                stub_token=stub_token,
+            )
         # The agent to run: an explicit request, else the runtime default. KAS
         # has no --agent spawn flag, so its default must be BOTH injected (below)
         # and activated (via set_mode after session/new); the kiro default is
@@ -5924,6 +6123,9 @@ class AcpRuntime:
             # outlived the withhold would leave the switched-off server both named and
             # pre-approved on the very session that is not mounting it.
             member_dispatch=bool(member_session_key) and not member_withheld,
+            # Same rule, its own withhold: see _mount_member_panel, which answers
+            # the mount and the grant together so the two cannot disagree.
+            crew_panel=panel_mounted,
             session_key=session_key,
         )
         kas_agents = kas_extras.custom_agents
@@ -5968,18 +6170,34 @@ class AcpRuntime:
                     )
 
         budget = await self._session_start_budget()
-        # Gate BEFORE the request goes out, released exactly once: on success
-        # right after the answer (the rest of session setup is not what the
-        # gate protects), on a timeout by the collector that now owns the
-        # request, on any other failure here.
-        gate = await session_start_gate()
-        permit = await gate.acquire()
-        if on_gate_acquired is not None:
-            try:
-                on_gate_acquired(permit.queue_wait_ms)
-            except Exception:
-                logger.debug("on_gate_acquired callback raised", exc_info=True)
+        # The init scope opens BEFORE the admission gate, not after: the gate's
+        # queue is unbounded in practice, and ``has_active_or_initializing_
+        # sessions`` is the predicate every recycle and displacement decision
+        # asks -- a runtime whose claim is still queued behind the gate must
+        # already read as busy, or a concurrent spawn-identity displacement
+        # pass sees it idle and kills it under the claim. A gate failure or a
+        # cancellation landing in the wait closes the scope on the way out.
         self._session_inits_in_flight += 1
+        try:
+            # Gate BEFORE the request goes out, released exactly once: on success
+            # right after the answer (the rest of session setup is not what the
+            # gate protects), on a timeout by the collector that now owns the
+            # request, on any other failure here.
+            gate = await session_start_gate()
+            if on_gate_queued is not None:
+                try:
+                    on_gate_queued()
+                except Exception:
+                    logger.debug("on_gate_queued callback raised", exc_info=True)
+            permit = await gate.acquire()
+            if on_gate_acquired is not None:
+                try:
+                    on_gate_acquired(permit.queue_wait_ms)
+                except Exception:
+                    logger.debug("on_gate_acquired callback raised", exc_info=True)
+        except BaseException:
+            self._finish_session_init("")
+            raise
         session_id = ""
         # Start latency is measured from gate EXIT: the queue wait is admission's
         # cost, not the runtime's, and the adaptive controller reads these
@@ -6017,6 +6235,7 @@ class AcpRuntime:
                 payload_snapshot=payload_snapshot,
                 late_adopter=late_adopter,
                 memory_mode=memory_mode,
+                session_key=session_key,
             )
             if collector is None:
                 permit.release()
@@ -6046,6 +6265,7 @@ class AcpRuntime:
             session_work_dir=session_work_dir,
             projected_sources=projected_sources,
             payload_snapshot=payload_snapshot,
+            session_key=session_key,
         )
 
     def _collect_late_start(
@@ -6068,6 +6288,7 @@ class AcpRuntime:
         payload_snapshot: Any,
         late_adopter: "Callable[[AcpSessionHandle], Awaitable[bool]] | None",
         memory_mode: str = "persistent",
+        session_key: str = "",
     ) -> StartCollector | None:
         """Hand a timed-out ``session/new`` to a :class:`StartCollector`.
 
@@ -6149,6 +6370,7 @@ class AcpRuntime:
                     session_work_dir=session_work_dir,
                     projected_sources=projected_sources,
                     payload_snapshot=payload_snapshot,
+                    session_key=session_key,
                 )
                 # A declining (or raising) adopter answers False and the
                 # collector performs the one teardown.
@@ -6243,6 +6465,7 @@ class AcpRuntime:
         projected_sources: dict[str, str],
         payload_snapshot: Any,
         memory_mode: str = "persistent",
+        session_key: str = "",
     ) -> AcpSessionHandle:
         """Everything after a successful ``session/new``: queue, handle, mode, drain.
 
@@ -6270,6 +6493,7 @@ class AcpRuntime:
             runtime=self,
             watchdog=_wd,
             crew_agent=_crew,
+            session_key=session_key,
         )
         handle.memory_mode = memory_mode
         # The token this session's stubs carry, so a later claim (warm-pool
@@ -6348,6 +6572,14 @@ class AcpRuntime:
             if self._activates_agent_by_mode()
             else None
         )
+        # Guard (C): the id may be advertised, yet as the HOST's own agent; a
+        # set_mode would succeed and run that agent under the crewmate's name.
+        # Asked of the harness as a seam (H13): the spawn-time hosts answer None
+        # and the wire-registered one reads the stamp the engine put on the mode.
+        refusal = self._harness.activation_refusal(mode_agent, resp) if mode_agent else None
+        if refusal:
+            await self.terminate_session(session_id)
+            raise AcpRuntimeError(refusal)
         if mode_agent and self._mode_available(mode_agent, resp):
             # Measured BEFORE the request goes out, which is the only moment the
             # answer is unambiguous: everything queued right now initialized
@@ -6451,7 +6683,9 @@ class AcpRuntime:
         logger.info("Created session %s on runtime PID %d", session_id, self._pid or 0)
         return handle
 
-    async def probe_advertised_models(self) -> list[dict[str, str]]:
+    async def probe_advertised_models(
+        self, *, force: bool = False, not_before: float = 0.0
+    ) -> list[dict[str, str]]:
         """Fetch a fresh advertised-model (entitlement) snapshot from this backend.
 
         A session's ``availableModels`` is captured once, from its own
@@ -6463,9 +6697,31 @@ class AcpRuntime:
         process with a throwaway minimal session (no MCP servers, no mode
         activation), terminated before returning.
 
-        Single-flight + short TTL: concurrent callers share one probe, and a
-        fresh non-empty answer is reused for :data:`_ENTITLEMENT_PROBE_TTL_SECS`
-        so a burst of rejections costs one round-trip.
+        Single-flight + short TTL, on TWO clocks. A non-empty SUCCESS is replayed
+        for :data:`_ENTITLEMENT_PROBE_TTL_SECS` (its result clock); an empty or
+        FAILED attempt replays as ``[]`` (no evidence) for the same window (its
+        attempt clock) without re-opening a session, so a burst of failures on
+        the picker read path costs one round-trip. A failure never revives an
+        expired success — the two clocks are independent.
+
+        ``force=True`` skips ONLY the attempt-clock replay: a USER ACTION (an
+        explicit ``set_model`` pick, the spawn-time pin withhold) must earn a
+        fresh probe rather than be refused on a recent no-evidence failure: an
+        explicit action always earns a real answer. It still honours the
+        result-clock replay of a recent non-empty success (fresh evidence —
+        nothing is gained by re-probing) and still serializes on the
+        single-flight lock. The picker read path leaves ``force=False`` so it
+        keeps the burst cap.
+
+        ``not_before`` is a freshness floor on the result-clock replay: a caller
+        passes the monotonic time of the snapshot it already holds, and a replay
+        never answers with a result older than that snapshot. The shared result
+        cache spans every session on this process, so without the floor a broad
+        answer cached before an entitlement downgrade would overwrite a newer
+        session's correctly narrower ``session/new`` snapshot. A cached result
+        older than the floor is not evidence for that caller: the attempt-clock
+        logic below decides between ``[]`` and a fresh probe, whose result is
+        always newer than the floor.
 
         Returns the normalized advertised list, or ``[]`` when the probe fails
         or advertises nothing. An empty return is NOT evidence about
@@ -6473,11 +6729,35 @@ class AcpRuntime:
         """
         async with self._entitlement_probe_lock:
             now = time.monotonic()
+            # Two-clock guard so a failure never extends the life of an old
+            # success. If the last SUCCESSFUL result is still within TTL, replay
+            # it (even under force: a fresh success is fresh evidence). Otherwise,
+            # if the last ATTEMPT of any outcome (incl. a failure that re-stamped
+            # only the attempt clock) is within TTL, return [] — no evidence, fail
+            # open — WITHOUT opening a fresh session/new, UNLESS force=True, which
+            # a user action passes to earn a fresh probe rather than be refused on
+            # a recent no-evidence failure. Only past both windows (or forced past
+            # the attempt window) do we probe again. Both clocks are 0.0 until the
+            # first completed attempt, so neither branch fires before one. Both
+            # replays also require their clock to be at least as new as the
+            # caller's own snapshot (``not_before``): a cached answer never
+            # replaces a newer one, and a failed attempt that predates the
+            # caller's snapshot never stands in for the probe that snapshot has
+            # yet to receive.
             if (
                 self._entitlement_probe_result
-                and now - self._entitlement_probe_at < _ENTITLEMENT_PROBE_TTL_SECS
+                and self._entitlement_probe_result_at > 0.0
+                and self._entitlement_probe_result_at >= not_before
+                and now - self._entitlement_probe_result_at < _ENTITLEMENT_PROBE_TTL_SECS
             ):
                 return list(self._entitlement_probe_result)
+            if (
+                not force
+                and self._entitlement_probe_attempt_at > 0.0
+                and self._entitlement_probe_attempt_at >= not_before
+                and now - self._entitlement_probe_attempt_at < _ENTITLEMENT_PROBE_TTL_SECS
+            ):
+                return []
             if not self._initialized or self._dead or self._process is None:
                 return []
             params = build_session_new_params(await self._session_work_dir(), mcp_servers=[])
@@ -6496,7 +6776,18 @@ class AcpRuntime:
                     self._finish_session_init(session_id)
             except Exception:
                 logger.debug("entitlement probe session/new failed", exc_info=True)
+                # Stamp the ATTEMPT clock only (never the result clock), so a
+                # burst of failing reads costs one session/new within the TTL
+                # while the last SUCCESSFUL result keeps expiring on its own
+                # clock — a failure can never revive a stale success.
+                self._entitlement_probe_attempt_at = time.monotonic()
                 return []
+            # The answer's freshness is the moment it ARRIVED, stamped before the
+            # teardown below. Stamping after the terminate round-trip would date
+            # the answer later than a real session/new that completed during
+            # that await, and the freshness floor would then let this older
+            # answer replay over that session's newer snapshot.
+            completed_at = time.monotonic()
             try:
                 # Reads BOTH shapes, through the same fold the session-init capture
                 # uses. Reading only ``models`` answers [] for a host whose list is a
@@ -6509,9 +6800,16 @@ class AcpRuntime:
                     # Evict the probe session from the shared process; never
                     # raises (best-effort by contract).
                     await self.terminate_session(session_id)
+            # A non-empty answer updates the stored result and its OWN clock, so
+            # it is replayed until that clock expires. An empty answer leaves the
+            # stored result (and its clock) untouched — no evidence, fail open.
             if fresh:
                 self._entitlement_probe_result = list(fresh)
-                self._entitlement_probe_at = time.monotonic()
+                self._entitlement_probe_result_at = completed_at
+            # The attempt clock is stamped on EVERY completed probe, empty
+            # included, so a burst of reads within the TTL costs one session/new
+            # whether or not the backend advertised anything.
+            self._entitlement_probe_attempt_at = completed_at
             return fresh
 
     async def load_session(
@@ -6609,6 +6907,9 @@ class AcpRuntime:
             )
             mcp_servers, stub_token = await self._own_stub_session(mcp_servers, session_key)
         member_withheld = False
+        # False for every non-member session, set without an awaited call so the
+        # Kiro construction path is untouched by this capability (H13).
+        panel_mounted = False
         if member_session_key:
             # circular import: members' module graph is heavy; resolved at call
             # time, same as create_session().
@@ -6649,6 +6950,15 @@ class AcpRuntime:
                     "the DM thread runs as plain chat this session",
                     member_session_key,
                 )
+            # INSIDE the branch, for the reason create_session() states.
+            mcp_servers, panel_mounted = await self._mount_member_panel(
+                mcp_servers,
+                member_session_key=member_session_key,
+                agent_name=active_agent,
+                session_work_dir=session_work_dir,
+                stub_token=stub_token,
+                resuming=True,
+            )
         # Narrowed by the host for the same reason session/new is, and it matters
         # MORE here: session/load re-initializes the session's servers, so a
         # rejected array does not just fail to add tools -- it takes them away from
@@ -6699,6 +7009,7 @@ class AcpRuntime:
                 active_agent,
                 # The grant follows the withhold here too -- see create_session().
                 member_dispatch=bool(member_session_key) and not member_withheld,
+                crew_panel=panel_mounted,
                 session_key=session_key,
             )
             kas_agents = kas_extras.custom_agents
@@ -6762,6 +7073,7 @@ class AcpRuntime:
             runtime=self,
             watchdog=_wd,
             crew_agent=_crew,
+            session_key=session_key,
         )
         # Mirrors create_session: the resumed session's own stub token.
         handle.stub_session_token = stub_token
@@ -6811,6 +7123,11 @@ class AcpRuntime:
         # Same routing-table question as create_session: a host with no agent
         # spec has no mode to resume onto either.
         mode_agent = agent if self._activates_agent_by_mode() else None
+        # Guard (C) -- see create_session: advertised, but as the host's own.
+        refusal = self._harness.activation_refusal(mode_agent, resp) if mode_agent else None
+        if refusal:
+            await self.terminate_session(resume_sid)
+            raise AcpRuntimeError(refusal)
         if mode_agent and self._mode_available(mode_agent, resp):
             # Measured BEFORE the request goes out, which is the only moment the
             # answer is unambiguous: everything queued right now initialized

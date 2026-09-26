@@ -1,6 +1,6 @@
 import { memo, useState, useRef, useEffect, useCallback, type ReactNode } from 'react'
 import { motion } from 'framer-motion'
-import { Pencil, Send, Copy, Check, Link2, Target, Pin, PinOff, X } from 'lucide-react'
+import { Pencil, Send, Copy, Check, Link2, MessageSquare, Target, Pin, PinOff, X } from 'lucide-react'
 import { copyToClipboard } from '../../utils/clipboard'
 import { copySessionLink } from '../../utils/shareUrl'
 import { ICON_ACTION_ROW_CLS } from '../../utils/touchActions'
@@ -36,11 +36,18 @@ interface UserMessageProps {
   messageIndex?: number
   messageTs?: string
   onEditResend?: (index: number, ts: string, newContent: string) => void
+  /** Opt-in: a double-click on the read-only bubble opens the editor. Off by
+   *  default because the gesture replaces native double-click word selection
+   *  on the bubble. The pencil button is the edit path for everyone. Wired
+   *  from Settings → Chat → "Double-click to edit your messages". */
+  doubleClickToEdit?: boolean
   slotKey?: string
   slotTitle?: string
   mode?: string
   pinned?: boolean
   onTogglePin?: () => void
+  /** Open (or start) the reply thread on this message. Only a crewmate's chat offers it. */
+  onReplyInThread?: () => void
   /** Whether the slot currently has a running turn. Gates the pending-steer
    *  indicator: the backend settle is best-effort, so a row can be stranded in
    *  `written` forever, and a perpetual "Steering…" pulse on an idle slot
@@ -57,7 +64,7 @@ interface UserMessageProps {
   hideSteerBadge?: boolean
 }
 
-const UserMessage = memo(function UserMessage({ content, meta, timestamp, timestampTitle, renderContent, canEdit, messageIndex, messageTs, onEditResend, slotKey, slotTitle, mode, pinned, onTogglePin, slotRunning, hideSteerBadge }: UserMessageProps) {
+const UserMessage = memo(function UserMessage({ content, meta, timestamp, timestampTitle, renderContent, canEdit, messageIndex, messageTs, onEditResend, doubleClickToEdit = false, slotKey, slotTitle, mode, pinned, onTogglePin, onReplyInThread, slotRunning, hideSteerBadge }: UserMessageProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [editing, setEditing] = useState(false)
   const ime = useImeGuard()
@@ -214,6 +221,16 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
     const contained = userRef.current && containedSelectionRange(range, userRef.current)
     if (!contained) return
     const frag = contained.cloneContents()
+    // A chip carries its full path as visually-hidden `sr-only` text, so a
+    // screen reader reads the path rather than the short visible label. That
+    // text is a real node in the clone, and the `textContent` serialization
+    // below does not consult CSS — so `user-select: none`, which does keep the
+    // path out of the browser's OWN copy, cannot keep it out of this one, and
+    // the path would land in the clipboard glued to the label beside it. Drop
+    // every visually-hidden node from the clone first, so what is written is
+    // what the bubble shows. Done here rather than per chip shape: any
+    // visually-hidden text inside a bubble belongs to a reader, not a paste.
+    frag.querySelectorAll('.sr-only').forEach(n => n.remove())
     const chips = frag.querySelectorAll('[data-paste-seq]')
     if (!chips.length) return
     const bySeq = new Map(pastes.map(p => [p.seq, p]))
@@ -230,7 +247,9 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
     e.preventDefault()
   }, [meta])
 
-  const canEditResend = !!(canEdit && onEditResend)
+  // The gesture is attached only when the user opted in: it takes the
+  // double-click that would otherwise select a word in the bubble.
+  const dblClickEdits = !!(canEdit && onEditResend && doubleClickToEdit)
 
   // Declared before the editing early-return so hook order stays stable across
   // the read-only and editing renders.
@@ -238,14 +257,19 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
 
   if (editing) {
     return (
-      <div data-role="user" className="group/msg flex flex-col items-end max-w-full">
+      // `data-message-editing`: usePinnedPrompt reads this off the row it is about
+      // to hide and refuses to pin it. The stand-in state hides the whole row and
+      // the card copies only a bubble, so an edit opened before the row reached
+      // the fold would otherwise continue inside an invisible textarea, with its
+      // Send out of reach. The editor stays visible; the banner is simply absent.
+      <div data-role="user" data-message-editing="" className="group/msg flex flex-col items-end max-w-full">
         {/* `edit-grow` is a CSS grid auto-sizer: a hidden ::after mirror (fed by
             data-replicated-value) drives the grid track so the textarea grows
             with its own content — width AND height — exactly like the read-only
-            bubble it replaces, capped at 550px or the column, whichever is
-            smaller. No JS measurement. */}
+            bubble it replaces, capped at the content column (Settings → Chat →
+            Content Width, via the row's --mc-content-width). No JS measurement. */}
         <div
-          className="edit-grow user-bubble px-4 py-2 leading-relaxed rounded-xl bg-card text-card-fg overflow-hidden min-w-0 w-fit max-w-[min(550px,100%)] outline-solid outline-2 -outline-offset-2 outline-accent/60 focus-within:outline-accent"
+          className="edit-grow user-bubble px-4 py-2 leading-relaxed rounded-xl bg-card text-card-fg overflow-hidden min-w-0 w-fit max-w-full outline-solid outline-2 -outline-offset-2 outline-accent/60 focus-within:outline-accent"
           data-replicated-value={draft}
           style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}
         >
@@ -285,10 +309,14 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
 
   const bubble = (
     // 'message-bubble' is a stable theming hook — see website/docs/theming-contract.md
+    // `max-w-full`, not a pixel cap: the bubble's maximum is the content column
+    // the transcript row clamps to --mc-content-width, so Settings → Chat →
+    // Content Width governs it exactly as it governs agent output (#8398), while
+    // `w-fit` keeps a short message hugging its text.
     // Disable is safe: the keyboard-accessible edit path is the aria-labelled
     // pencil button in the action row below, not this bubble.
     // eslint-disable-next-line jsx-a11y/no-static-element-interactions
-    <div ref={userRef} onCopy={handleCopy} onDoubleClick={canEditResend ? handleDoubleClick : undefined} className={`message-bubble mc-message-font-scope msg-content px-4 py-2 leading-relaxed rounded-xl overflow-hidden min-w-0 w-fit max-w-[min(550px,100%)] ${isSteer ? 'bg-accent-subtle text-text' : 'user-bubble bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}>
+    <div ref={userRef} onCopy={handleCopy} onDoubleClick={dblClickEdits ? handleDoubleClick : undefined} className={`message-bubble mc-message-font-scope msg-content px-4 py-2 leading-relaxed rounded-xl overflow-hidden min-w-0 w-fit max-w-full ${isSteer ? 'bg-accent-subtle text-text' : 'user-bubble bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}>
       {/* `messageTs` FIRST, `clientTs` only as a fallback. The opposite order is
           correct for the audio key above, which wants the optimistic bubble's own
           identity, but this value is COMPARED against server-clock slot mint
@@ -325,14 +353,15 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
               decision behind it. */}
           {steerDecision && <SteerDecisionLine record={steerDecision} />}
           <motion.div
-            /* Same width cap as the bubble, not just max-w-full: this wrapper
-               sits between the content column and the bubble, and a percentage
-               cap only bites once EVERY box in that chain carries one (see the
-               root's comment). With only max-w-full, intrinsic sizing treats
-               the bubble's percentage max-width as none, the wrapper inflates
-               to the full column, and the capped bubble inside lands at its
-               LEFT edge while the badge stays right. */
-            className="relative w-fit max-w-[min(550px,100%)]"
+            /* Same width cap as the bubble (the column, `max-w-full`): this
+               wrapper sits between the content column and the bubble, and a
+               percentage cap only bites once EVERY box in that chain carries
+               one (see the root's comment). During intrinsic sizing a
+               percentage max-width is treated as none, so a wrapper whose cap
+               differed from the bubble's would inflate to the full column and
+               the capped bubble inside would land at its LEFT edge while the
+               badge stays right; one shared cap resolves both to one width. */
+            className="relative w-fit max-w-full"
             initial={playSteer ? { opacity: 0, x: 16 } : false}
             animate={{ opacity: 1, x: 0 }}
             transition={{ duration: 0.32, ease: 'easeOut' }}
@@ -398,8 +427,24 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
       {/* Where the pointer cannot hover the footer is always visible and its
           descendant overrides grow every action to a 40px touch target (20px
           icon + 10px padding); hover-capable pointers keep the reveal-on-hover
-          behavior and the compact 14px icons untouched. */}
-      <div className={`flex items-center gap-y-1 mt-1 opacity-0 transition-opacity duration-300 delay-100 group-hover/msg:opacity-100 group-hover/msg:delay-300 group-focus-within/msg:opacity-100 group-focus-within/msg:delay-300 ${ICON_ACTION_ROW_CLS}`}>
+          behavior and the compact 14px icons untouched.
+          `data-message-actions` is the hook index.css uses while this row is
+          the pinned banner's stand-in (`[data-pinned-standin]`): the row is
+          `visibility: hidden` and the card copies only the bubble, so the strip
+          is re-shown in place — visible outright, because the card lives in an
+          overlay outside this row and its hover can never be `group-hover/msg`. */}
+      <div data-message-actions="" className={`flex items-center gap-y-1 mt-1 opacity-0 transition-opacity duration-300 delay-100 group-hover/msg:opacity-100 group-hover/msg:delay-300 group-focus-within/msg:opacity-100 group-focus-within/msg:delay-300 ${ICON_ACTION_ROW_CLS}`}>
+        {onReplyInThread && (
+          <button
+            onClick={onReplyInThread}
+            className="text-muted hover:text-text p-0.5 rounded transition-colors"
+            data-testid="reply-in-thread"
+            title={i18nT('pages.chat.thread.reply_in_thread')}
+            aria-label={i18nT('pages.chat.thread.reply_in_thread')}
+          >
+            <MessageSquare size={14} />
+          </button>
+        )}
         <button
           onClick={() => {
             const pastes = (meta?.pastes as PasteBlock[] | undefined) || []
@@ -449,6 +494,13 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
         {canEdit && onEditResend && (
           <button
             onClick={startEdit}
+            // `data-message-edit`: index.css drops this control while the row is
+            // the pinned banner's stand-in. Editing replaces the bubble with the
+            // textarea + Cancel/Send tree above, which is not part of the strip
+            // and so would open inside the row's `visibility: hidden` — an editor
+            // no one can see, focus or leave. Edit is offered again once the row
+            // scrolls back below the fold.
+            data-message-edit=""
             className="text-muted hover:text-text p-0.5 rounded transition-colors"
             title={i18nT('pages.chat.userMessage.edit_resend')}
             aria-label={i18nT('pages.chat.userMessage.edit_resend')}

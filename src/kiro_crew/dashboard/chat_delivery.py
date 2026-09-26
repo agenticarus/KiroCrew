@@ -811,15 +811,17 @@ def queue_for_next_turn(
         size_bytes=len(message.encode("utf-8", "replace")),
         queued_seq=str(qid),
     )
-    state.broadcast_ws(
-        "queue_push",
-        {
-            "slot": slot.key,
-            "content": _redact_for_display(sanitize_outbound(message)),
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "queue_id": qid,
-        },
-    )
+    push: dict[str, Any] = {
+        "slot": slot.key,
+        "content": _redact_for_display(sanitize_outbound(message)),
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "queue_id": qid,
+    }
+    if attachments:
+        # The card this frame draws is what a cancel later restores from, on a
+        # tab that never held the send's own composer state.
+        push["meta"] = attachments
+    state.broadcast_ws("queue_push", push)
     # Accepted, and possibly not persisted: the write ceilings refuse an entry
     # past the count cap or the byte budget and the send is still accepted, so
     # that case is reported at WARNING rather than left silent. It is not a field
@@ -980,3 +982,41 @@ def attachment_meta(user_meta: dict | None) -> dict[str, list[str]]:
         return out
     redacted = _redact_meta(out)
     return {k: v for k, v in redacted.items() if isinstance(v, list)}
+
+
+def queue_entry_view(item: dict[str, Any]) -> dict[str, Any]:
+    """The wire form of one queue entry: ``id``, display-redacted ``content``, and
+    ``meta`` holding its attachment lists when it carries any.
+
+    One serializer for the three slot-detail ``queue[]`` sites (the
+    ``queue_edit`` frame reads the same lists off its entry directly, having
+    already redacted the text), so the lists cannot be echoed on one and
+    dropped on another. Without them the client rebuilds the entry from ``content`` alone
+    and a cancel falls back to a whitespace-bounded marker parse, which
+    truncates a spaced path or leaves the marker in the composer verbatim. The
+    ``meta`` key is the same one the ``queue_push`` and ``queue_pop`` frames
+    use for these lists, so the client reads one shape however the entry
+    reaches it; it is omitted, not emptied, for an entry without attachments
+    so that entry's shape is unchanged. The lists pass
+    :func:`attachment_meta`, which redacts each path like the content beside
+    it.
+    """
+    view: dict[str, Any] = {"id": item["id"], "content": _redact_for_display(item["content"])}
+    attachments = attachment_meta(item.get("meta"))
+    if attachments:
+        view["meta"] = attachments
+    # The structural kind tag rides in ``meta`` so the queue card can classify
+    # a system entry (an MCP-App message, for one) without parsing its text —
+    # the same enqueue-time source the server's own drain reads, and the same
+    # ``meta.kind`` spelling transcript rows use (e.g. compaction). Omitted for
+    # a plain user prompt so its shape is unchanged.
+    kind = item.get("kind")
+    if isinstance(kind, str) and kind:
+        view.setdefault("meta", {})["kind"] = kind
+    # The display label the producer stamped beside the containment snapshot
+    # rides with the kind — without it a reloaded queue card renders the
+    # generic "app" attribution instead of the app's own name.
+    label = (item.get("meta") or {}).get("appLabel")
+    if isinstance(label, str) and label:
+        view.setdefault("meta", {})["appLabel"] = label
+    return view

@@ -25,6 +25,7 @@ import logging
 import os
 import stat
 import threading
+import time
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
@@ -32,12 +33,13 @@ from typing import TextIO
 
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import fsync_dir
+from kiro_crew.crew_log.checkpoint import PrefixWitness, witness_mapping
 from kiro_crew.crew_log.schema import KIND_MEMBER
 from kiro_crew.eventlog import members_projections, types
-from kiro_crew.eventlog.log import MemberLog
+from kiro_crew.eventlog.log import APPEND_CONTENTION_SECONDS, MemberLog
 from kiro_crew.eventlog.members_projections import all_units
 from kiro_crew.eventlog.types import Event
-from kiro_crew.projection import DirectoryCheckpointStore, ProjectionRegistry
+from kiro_crew.projection import EMPTY_WATERMARK, DirectoryCheckpointStore, ProjectionRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,30 @@ Broadcast = Callable[[str, object], None]
 #: and a short-lived member would leave files behind that folding from the start
 #: already handles for free. Matches the crew log's own ``MIN_ADVANCE_ENTRIES``.
 _SAVEPOINT_MIN_ADVANCE = 256
+
+#: How many times a closer re-folds and re-asks its predicate after losing the tail
+#: to another process. Each attempt costs one fold, and a closer that keeps losing is
+#: a member under sustained foreign writes -- where declining is right anyway, since
+#: the next read decides again against a state that has settled. Small for that
+#: reason: the retry exists for the one-commit collision, not to win a write war.
+_CLOSER_TAIL_ATTEMPTS = 3
+
+
+class CloserTailContention(Exception):
+    """Every attempt to place a closer lost the tail to another process.
+
+    Distinct from a closer that does not apply, which is an ordinary ``None``: this
+    says the decision was never given a window, so nothing was learned about whether
+    it holds. A caller invoked repeatedly can ignore it, because its next run decides
+    again. A caller that runs ONCE -- the startup sweep -- must not, or the state it
+    was closing stays open until the next restart, and that is the whole reason the
+    two outcomes are told apart instead of sharing ``None``.
+    """
+
+    def __init__(self, slug: str, type: str) -> None:
+        super().__init__(f"closer {type!r} for slug {slug!r} lost the tail on every attempt")
+        self.slug = slug
+        self.type = type
 
 
 def _redact_projection_value(value: object) -> object:
@@ -137,8 +163,40 @@ def _legacy_fold_completed(slug: str) -> bool:
         return False
 
 
+def _legacy_binding_present(slug: str) -> bool:
+    """Whether a legacy DM-binding file EXISTS for *slug*.
+
+    Asked because :func:`members.read_dm_binding` is TOTAL by contract: a missing
+    file, an unreadable one and a malformed payload all read as "not bound". That
+    is the right answer for a caller that only wants to re-create the binding, and
+    the wrong one for the fold, which has to know whether it READ the source -- a
+    source it did not read is one a later pass still can. Its sibling for rules
+    raises instead, so only the binding needs this second question asked.
+
+    Fails CLOSED on an unanswerable path, meaning it reports PRESENT. The wrong
+    answer is asymmetric the same way :func:`_legacy_fold_completed`'s is: present
+    costs a re-read the counted dedupe makes safe, absent drops a binding this
+    process could have migrated.
+
+    ``stat`` carries that, where ``Path.exists`` cannot: it answers False for every
+    error it meets, so a file this process may not reach reads exactly like one that
+    is not there -- the one confusion this function exists to prevent. Only a missing
+    file is absent here, and every other error reports present.
+    """
+    from kiro_crew import members
+
+    try:
+        members.dm_binding_path(slug).stat()
+    except FileNotFoundError:
+        return False
+    except Exception:
+        logger.debug("legacy binding path unanswerable for %r", slug, exc_info=True)
+        return True
+    return True
+
+
 #: How much of a legacy activity file the fold will read. The file is
-#: agent-writable and the fold runs on every ``ensure``, which the roster
+#: agent-writable and the fold runs from ``ensure``, which the roster
 #: projection calls, so an unbounded read sits on a request path.
 MAX_LEGACY_ACTIVITY_BYTES = 8 * 1024 * 1024
 
@@ -336,8 +394,8 @@ def _read_legacy_activity_files(slug: str) -> tuple[list[dict], bool]:
     return rows, complete
 
 
-def _retire_legacy_activity(slug: str) -> None:
-    """Mark the fold complete so a later write cannot enter the ledger.
+def _retire_legacy_activity(slug: str) -> bool:
+    """Return whether the fenced fold-complete marker is durably recorded.
 
     Renames rather than deletes: the rows are the member's own history and this is a
     one-way migration, so the file is kept readable under its retired name. The
@@ -350,7 +408,7 @@ def _retire_legacy_activity(slug: str) -> None:
         base = members.member_dir(slug) / members.ACTIVITY_FILE_NAME
     except Exception:
         logger.debug("legacy activity path unavailable for %r", slug, exc_info=True)
-        return
+        return False
     # The fenced marker is written and made DURABLE BEFORE the legacy name is
     # freed. In the other order a crash between the rename and the marker leaves the
     # live name available with no marker recorded, and the next ensure folds whatever
@@ -365,7 +423,7 @@ def _retire_legacy_activity(slug: str) -> None:
     # the only ones whose legacy name stayed open for whoever wrote it next.
     fenced = _legacy_folded_marker_path(slug)
     if fenced is None:
-        return
+        return False
     try:
         fenced.parent.mkdir(parents=True, exist_ok=True)
         fenced.touch(exist_ok=True)
@@ -374,11 +432,16 @@ def _retire_legacy_activity(slug: str) -> None:
         # landed, which is the one combination the ordering above rules out.
         fsync_dir(fenced.parent)
     except OSError:
-        # Unwritten, so nothing is renamed either: the next ensure folds again rather
-        # than trusting a source it cannot prove it has finished with. Idempotent by
-        # the counted dedupe.
+        # The entry is LEFT in place. A later pass runs this again for every member
+        # whose fold completes -- a member already retired reads as a complete fold
+        # with no rows -- so ``touch`` here can meet a marker an earlier pass made
+        # durable, and removing it on a sync failure would free the live legacy name
+        # again with no marker recorded, which is the forgery this marker closes.
+        # Reporting the failure is enough: the caller withholds the memo, the retry
+        # syncs the same entry, and an entry that survives without its sync is a
+        # closed fence in every process that can see it.
         logger.debug("could not mark legacy activity folded for %r", slug, exc_info=True)
-        return
+        return False
     marker = base.with_name(base.name + LEGACY_MIGRATED_SUFFIX)
     for path in (base, base.with_name(base.name + ".1")):
         try:
@@ -390,7 +453,8 @@ def _retire_legacy_activity(slug: str) -> None:
             # loss: the fenced marker is already recorded, so the source is never
             # read again, and the rows it held were appended before this ran.
             logger.debug("could not retire legacy activity at %s", path, exc_info=True)
-            return
+            return True
+    return True
 
 
 class MemberEventLogService:
@@ -406,6 +470,9 @@ class MemberEventLogService:
         self._registry.set_on_change(self._on_change)
         # Names carried by each slug's header, overlaid onto the roster view.
         self._names: dict[str, str] = {}
+        # Slugs whose legacy fold has completed under this process. See
+        # :meth:`_migrate_legacy` for why the memo is per process and not a file.
+        self._legacy_folded: set[str] = set()
 
     # ---- wiring -----------------------------------------------------------
     def attach_broadcast(self, broadcast: Broadcast) -> None:
@@ -545,6 +612,16 @@ class MemberEventLogService:
         identity to compare, or no usable savepoint -- because a cold fold reaches the
         same value at more cost, and that is the whole posture of a savepoint.
 
+        TWO conditions decide that, not one. The identity block covers what is fixed
+        once a fold is done and is compared by equality. The prefix digest covers what
+        equality cannot reach: that the bytes the state was folded from are still the
+        bytes in the file. This log needs the second one on its own terms -- a damaged
+        committed line is skipped on load, so a cold fold omits what it contributed
+        while a savepoint written before the damage keeps it, and a resumed fold never
+        revisits the region below its watermark. Without the digest those two reads
+        disagree for the life of the member, which is the one thing a savepoint may
+        not do.
+
         WHAT THIS SAVES, stated honestly: the FOLD, not the read. ``MemberLog``
         materialises its event list on load, so the file is parsed either way; what
         the watermark removes is one ``apply`` per definition per skipped event, which
@@ -553,17 +630,58 @@ class MemberEventLogService:
         seq, which is a separate change to the log rather than to the fold.
         """
         identity = log.checkpoint_identity()
-        if identity is None:
+        admit = log.checkpoint_admit(identity["first_seq"]) if identity is not None else None
+        if identity is None or admit is None:
             self._registry.prime(slug, log.iter_events())
             return
 
+        # The witness for the prefix this pass trusts, read in ``tail_from`` below and
+        # held here for the post-fold recheck and the write.
+        witness: list = []
+
         def tail_from(watermark: int):
+            # ``prime_checkpointed`` calls this ONCE with the floor and then consumes
+            # what it returns, so this is the only moment that knows the floor and is
+            # still ahead of the pass -- and a witness is evidence only when it was
+            # read before the bytes were folded.
+            #
+            # A resume needs one whatever it intends to write: the restored state
+            # stands on a prefix this pass never revisits, so without a digest read
+            # here nothing afterwards can say that prefix is still in the file. A pass
+            # that resumed nothing asks only whether a write is owed, which keeps the
+            # boundary walk off the reads that could not spend it either way.
+            if watermark != EMPTY_WATERMARK or self._write_may_be_owed(log, watermark):
+                prefix = log.checkpoint_witness(log.last_seq())
+                if prefix is not None:
+                    witness.append(prefix)
             return (ev for ev in log.iter_events() if ev["seq"] > watermark)
 
         floor = self._registry.prime_checkpointed(
-            slug, self._checkpoints(slug), identity, tail_from
+            slug, self._checkpoints(slug), identity, tail_from, admit=admit
         )
-        self._maybe_save_savepoints(slug, log, identity, floor)
+        prefix = witness[0] if witness else None
+        if floor != EMPTY_WATERMARK and not self._resumed_prefix_still_holds(log, prefix):
+            # The bytes below the watermark moved while the tail was folding, so the
+            # restored state carries an entry the file does not yield any more -- and a
+            # resumed fold never returns to that region to notice. Refusing the write
+            # is not enough here: the state is already in the registry and would be
+            # served for the life of this instance while disagreeing with every cold
+            # fold. Fold from the start instead, which is what the file now says.
+            self._registry.prime(slug, log.iter_events())
+            return
+        self._maybe_save_savepoints(slug, log, identity, floor, prefix)
+
+    @staticmethod
+    def _resumed_prefix_still_holds(log: MemberLog, prefix: PrefixWitness | None) -> bool:
+        """Whether a resumed pass can still vouch for the prefix it stood on.
+
+        No witness is not a pass: a boundary the file does not resolve leaves nothing
+        to compare, and a resume that cannot be checked is the one case that must fall
+        back rather than be trusted.
+        """
+        if prefix is None:
+            return False
+        return log.checkpoint_prefix_unchanged(prefix)
 
     def _checkpoints(self, slug: str) -> DirectoryCheckpointStore:
         """This member's savepoint store, inside the directory its own log lives in.
@@ -578,7 +696,25 @@ class MemberEventLogService:
 
         return DirectoryCheckpointStore(crew_log_dir(KIND_MEMBER, slug) / "projections")
 
-    def _maybe_save_savepoints(self, slug: str, log: MemberLog, identity: dict, floor: int) -> None:
+    @staticmethod
+    def _write_may_be_owed(log: MemberLog, floor: int) -> bool:
+        """Whether a fold reaching this log's end from *floor* could owe a write.
+
+        The same threshold :meth:`_maybe_save_savepoints` enforces, asked BEFORE the
+        pass so the witness read can be skipped on a load that cannot write anything.
+        It is an upper bound on that decision and not a second copy of it: the fold
+        can end below the log's current end, and the write is refused there.
+        """
+        return log.last_seq() - max(floor, 0) >= _SAVEPOINT_MIN_ADVANCE
+
+    def _maybe_save_savepoints(
+        self,
+        slug: str,
+        log: MemberLog,
+        identity: dict,
+        floor: int,
+        prefix: PrefixWitness | None,
+    ) -> None:
         """Write savepoints when the tail just folded was long enough to be worth it.
 
         A savepoint is allowed to LAG, so a write is spent only when it saves a
@@ -586,35 +722,71 @@ class MemberEventLogService:
         every load of every member, which is the cost savepoints exist to remove
         rather than relocate -- and a short-lived member would leave files behind that
         folding from the start already handles for free.
+
+        *prefix* is the digest read before the pass. Nothing is written without one,
+        and nothing is written if the bytes it covers moved while the pass ran: either
+        way nothing here could say which bytes produced this state, and a savepoint
+        that cannot say so is the one thing worse than none. It certifies ONE
+        boundary, so a unit standing at another seq waits for a pass whose witness
+        covers it.
         """
         reached = log.last_seq()
         if reached - max(floor, 0) < _SAVEPOINT_MIN_ADVANCE:
             return
+        if prefix is None:
+            return
+        if not log.checkpoint_prefix_unchanged(prefix):
+            return
         store = self._checkpoints(slug)
-        for savepoint in self._registry.savepoints(slug, identity):
+        witness = witness_mapping(prefix)
+        for savepoint in self._registry.savepoints(slug, identity, witness=witness):
+            if savepoint.watermark != prefix.seq:
+                continue
             store.save(slug, savepoint)
 
     # ---- units ------------------------------------------------------------
     def ensure(self, slug: str, name: str, config=None) -> None:
+        """Make sure *slug* has a log, and fold its legacy files in once.
+
+        Reads through :meth:`_get_log`, so a slug this process has already ensured
+        costs one ``stat``: the held instance is kept, its events are parsed again
+        only when the file moved, and the fold resumes from this member's savepoints
+        instead of from the first event. That repeat is the common case -- ``ensure``
+        is called once per member on every roster read and once per message -- and
+        the creation below is the rare one.
+
+        Reusing that read is also what keeps ONE answer in this class to whether the
+        file moved. A second copy here would be a second thing to keep correct, and
+        what a wrong answer serves is the member's own drawer.
+        """
         from kiro_crew.members import validate_slug
 
         validate_slug(slug)
         lock = self._slug_lock(slug)
         with lock:
-            log = MemberLog(slug)
-            fresh = not log.exists()
-            if fresh:
-                # The header is written ONCE, so this call decides what the log says
-                # it belongs to for life. A writer with no name in hand reaches here
-                # with the slug (``emit`` passes ``name or slug``), and the slug names
-                # nobody: the roster has to treat it as unnamed, which costs this log
-                # its collision check for good. Resolve the exact name from the roster
-                # instead, and use it for the migration below too, whose rules and
-                # binding reads are name-scoped. Only on the fresh path, so a member's
-                # config is read once ever rather than on every message.
+            log = self._get_log(slug)
+            if log is None:
+                # Nothing on disk for this slug, and publishing it is what this call
+                # is for. The header is written ONCE, so this call decides what the
+                # log says it belongs to for life. A writer with no name in hand
+                # reaches here with the slug (``emit`` passes ``name or slug``), and
+                # the slug names nobody: the roster has to treat it as unnamed, which
+                # costs this log its collision check for good. Resolve the exact name
+                # from the roster instead, and use it for the migration below too,
+                # whose rules and binding reads are name-scoped. Only on this path,
+                # so a member's config is read once ever rather than on every
+                # message.
                 name = self._resolved_name(slug, name, config)
+                log = MemberLog(slug)
                 log.create(name)
-            log.load()
+                log.load()
+                with self._map_lock:
+                    self._logs[slug] = log
+                # Folded from the start: a log this call publishes carries its header
+                # and no events, so a savepoint resume has nothing to skip. ``prime``
+                # runs no change callbacks, so the name below is in place before any
+                # projection of this member is published.
+                self._registry.prime(slug, log.iter_events())
 
             # The HEADER decides who this log belongs to, not this call's argument.
             # It is written once, so on an EXISTING log the argument is only whatever
@@ -632,15 +804,11 @@ class MemberEventLogService:
                 name = header_name
 
             self._names[slug] = name
-            with self._map_lock:
-                self._logs[slug] = log
-            self._registry.prime(slug, log.iter_events())
 
-            # Run the migration on EVERY ensure, not only at create: returning
-            # early whenever the log existed meant a process that died between
-            # `create` and the end of the migration left that member's bindings,
-            # rules and activity unmigrated for good. Each item is skipped once the
-            # log carries its event, so the pass is idempotent and cheap.
+            # Each item of the migration asks whether the log already carries its
+            # event, so a pass is idempotent and an interrupted one resumes on a
+            # later call -- in this process or in the next. One completed pass per
+            # process settles it, which :meth:`_migrate_legacy` keeps track of.
             self._migrate_legacy(slug, name, log)
 
     def _resolved_name(self, slug: str, name: str, config=None) -> str:
@@ -675,10 +843,26 @@ class MemberEventLogService:
     def _migrate_legacy(self, slug: str, name: str, log: MemberLog) -> None:
         """Fold this member's legacy files into events, once per item.
 
-        Called on every ``ensure``, so each item asks whether the log already
-        carries its event and skips the legacy read when it does. That is what lets
-        an interrupted migration resume: whatever the dead run got through stays
-        done, and whatever it did not is picked up on the next call.
+        Each item asks whether the log already carries its event and skips the legacy
+        read when it does, which is what lets an interrupted migration resume:
+        whatever a dead run got through stays done, and whatever it did not is picked
+        up by a later call.
+
+        ONE completed pass per process settles the member, and every call after it
+        returns here -- without the lease, which is the point. ``ensure`` is called
+        once per member on every roster read and once per message, and by then every
+        item skips itself, so a call that cannot do any work would still be spending
+        a cross-process lease acquire and a set of legacy path reads to find that
+        out. The memo is per PROCESS and deliberately not a file: a run that dies
+        mid-fold leaves no memo behind, so the next process folds the member again.
+
+        Nothing is recorded unless the pass read every legacy source to its END. A
+        refused lease, an exception out of the fold, and a read that came back short
+        of what the file holds all leave the memo unwritten, and the member is folded
+        again on a later call. The last of those is the one worth naming: a file over
+        the byte budget, and a read an ``OSError`` interrupted, RETURN rather than
+        raise, so "the pass did not throw" is not the question -- which is why the
+        fold answers it instead.
 
         A completion marker event would answer the same question in one check, and
         is deliberately not used: it would sit in every member's log forever and
@@ -699,6 +883,8 @@ class MemberEventLogService:
         ensure -- which the counted dedupe makes safe whether or not the other
         process finished.
         """
+        if slug in self._legacy_folded:
+            return
         lease = self._hold_unit(slug)
         if lease is None:
             logger.debug("legacy fold for %r skipped: another process holds the log", slug)
@@ -706,9 +892,11 @@ class MemberEventLogService:
         from kiro_crew.crew_log.lease import release as release_lease
 
         try:
-            self._migrate_legacy_locked(slug, name, log)
+            settled = self._migrate_legacy_locked(slug, name, log)
         finally:
             release_lease(lease)
+        if settled:
+            self._legacy_folded.add(slug)
 
     @staticmethod
     def _hold_unit(slug: str) -> str | None:
@@ -737,9 +925,26 @@ class MemberEventLogService:
             logger.debug("legacy fold lease refused for %r", slug, exc_info=True)
             return None
 
-    def _migrate_legacy_locked(self, slug: str, name: str, log: MemberLog) -> None:
-        """The fold itself. Runs only with this member's unit lease held."""
+    def _migrate_legacy_locked(self, slug: str, name: str, log: MemberLog) -> bool:
+        """The fold itself. Runs only with this member's unit lease held.
+
+        Answers whether every legacy source was read to its END, which is what says
+        the member is settled. A read that returned less than the file holds -- an
+        unreachable path, a file over the byte budget, an ``OSError`` part-way --
+        leaves rows this pass never saw, and it does so by RETURNING rather than
+        raising. So the answer cannot be "it did not throw": the caller memoises on
+        it, and a pass recorded as settled is a pass nothing repeats.
+
+        The binding read needs one extra question for the same reason. It is total by
+        contract, so it reports an unreadable file exactly as it reports an absent
+        one; :func:`_legacy_binding_present` is what tells those apart here. The
+        rules read raises on an existing file it cannot use, so it needs nothing.
+        """
         from kiro_crew import members
+
+        # Every legacy source this pass could read, read whole. Set false by a read
+        # that came back short, never by an item that had nothing to migrate.
+        settled = True
 
         # Streamed, not the retained tail: the tail is a bounded WINDOW, so a
         # membership test against it would report an item unmigrated because its
@@ -752,7 +957,28 @@ class MemberEventLogService:
                 binding = members.read_dm_binding(slug)
             except Exception:
                 binding = None
+                settled = False
                 logger.debug("legacy binding read failed for %r", slug, exc_info=True)
+            else:
+                if binding is None and _legacy_binding_present(slug):
+                    # "Not bound" from a total reader, with a file sitting there, does
+                    # not say there is nothing to migrate -- it says this pass did not
+                    # read what is there. EVERY such answer holds the member open, and
+                    # that is wider than "the file is unreadable": the same None comes
+                    # back for a file whose `slot_key` is not canonical and for one
+                    # naming a member that slugifies elsewhere. A total reader cannot
+                    # report which of the three happened, and the one that must not be
+                    # mistaken for "nothing to migrate" is indistinguishable from the
+                    # other two here.
+                    #
+                    # The cost of being wide falls on that member alone: it keeps
+                    # paying the lease and the legacy reads on every ensure until the
+                    # file is repaired, which is what every member pays without this
+                    # memo. Reading the file a second time here to classify it is the
+                    # alternative, and it spends that read on every pass for every
+                    # member to serve the rare one. The source is never retired, so
+                    # the next pass finds it again.
+                    settled = False
             if binding is not None and binding.get("member") == name:
                 slot_key = binding.get("slot_key")
                 if isinstance(slot_key, str) and slot_key:
@@ -764,6 +990,7 @@ class MemberEventLogService:
                 text = members.read_member_rules(slug, name)
             except Exception:
                 text = ""
+                settled = False
                 logger.debug("legacy rules read failed for %r", slug, exc_info=True)
             if text:
                 self._append_locked(slug, log, types.MEMBER_RULES, {"text": text})
@@ -808,8 +1035,9 @@ class MemberEventLogService:
         # source is re-read on the next ensure, which the counted dedupe above makes
         # safe; an over-budget file stays unretired and is reported every pass, which
         # is the correct outcome for a file too large to migrate.
-        if legacy_complete:
-            _retire_legacy_activity(slug)
+        if legacy_complete and not _retire_legacy_activity(slug):
+            settled = False
+        return settled and legacy_complete
 
     def logged_name(self, slug: str) -> str | None:
         """The EXACT member name this slug's log was created for, or None.
@@ -902,19 +1130,78 @@ class MemberEventLogService:
         This exists rather than a predicate on :meth:`append` because the predicate
         must not re-enter the service to read state -- ``snapshot`` takes this same
         non-reentrant lock, so a caller that reached for it would deadlock.
+
+        The predicate is asked against a state no foreign commit can have moved,
+        and that guarantee comes from the store rather than from the per-slug lock
+        above. The per-slug lock orders this process's writers, and for them it is
+        enough: a concurrent in-process append queues behind this hold and lands
+        after, which is the winning order. It says nothing about another PROCESS,
+        and the member log has more than one writer -- an entry another process
+        commits between our fold and our write lands FIRST, and a last-wins
+        projection then takes ours as the newer word for a state that had already
+        moved.
+
+        What the store is given is the seq this fold reached, and what runs inside
+        its hold is ONE comparison against the tail. The fold itself parses the log,
+        and a parse under a cross-process lock is a hold nothing bounds -- a peer
+        append gives up after a bounded wait and its event is then lost for good, so
+        the expensive half stays outside, and passing a seq rather than a callback is
+        what keeps it there. A foreign commit makes the tail exceed what we folded,
+        the append declines without writing, and the loop folds that entry and asks
+        the predicate again. Seqs only increase, so the comparison cannot be fooled
+        by a tail that moved and came back.
         """
         lock = self._slug_lock(slug)
         with lock:
-            log = self._get_log(slug)
-            if log is None:
-                return None
-            values = self._registry.snapshot(slug).get("values", {})
-            if not still_applies(
-                values if isinstance(values, dict) else {},
-                observed if isinstance(observed, dict) else {},
-            ):
-                return None
-            return self._append_locked(slug, log, type, data)
+            # ONE contention budget for the whole loop, not one per attempt. Each
+            # attempt's append waits out a lease collision, and the per-slug lock is
+            # held across all of them, so a per-attempt budget would multiply the
+            # worst-case hold by the attempt count and stall every other in-process
+            # writer for this member that much longer.
+            deadline = time.monotonic() + APPEND_CONTENTION_SECONDS
+            for _ in range(_CLOSER_TAIL_ATTEMPTS):
+                log = self._get_log(slug)
+                if log is None:
+                    return None
+                self._fold_gap_locked(slug, log)
+                # The newest seq every cell has folded, which is the state the
+                # predicate is about to read. An empty log reports -1 (no cell has
+                # been driven), and the store reports 0 for a file with a header and
+                # no events, so the two agree only once the floor is clamped up.
+                folded_to = max(self._registry.observed_floor(slug), 0)
+                values = self._registry.snapshot(slug).get("values", {})
+                if not still_applies(
+                    values if isinstance(values, dict) else {},
+                    observed if isinstance(observed, dict) else {},
+                ):
+                    return None
+                event = log.append_if(type, data, max_tail_seq=folded_to, deadline=deadline)
+                if event is not None:
+                    # No gap fold here, unlike the plain append path. The write only
+                    # happened because the tail was still at or below what the fold
+                    # above reached, and this event takes the seq straight after it,
+                    # so the range a gap fold would cover is empty by construction --
+                    # and it is not free: it streams the whole file to discover that.
+                    # ``drive`` folds this event, which is the only new one.
+                    self._registry.drive(slug, event)
+                    return event
+            # Every attempt lost the same race. Declining is the safe direction --
+            # a closer not written is a normal outcome the next read re-decides,
+            # while one written against a state that moved is permanent.
+            # Warned rather than debugged, and raised rather than reported as a plain
+            # decline: the projection is left stale, which is the same silent
+            # wrongness the recheck exists to prevent, and a caller that runs ONCE
+            # cannot tell "does not apply" from "never got a clean window" without
+            # this. A floor that never reaches the tail would exhaust every closer
+            # for this member, and these two are where that becomes visible.
+            logger.warning(
+                "closer for slug=%r type=%r lost the tail race on every attempt; "
+                "the projection stays stale until a caller re-decides",
+                slug,
+                type,
+            )
+            raise CloserTailContention(slug, type)
+            return None
 
     def _fold_gap_locked(self, slug: str, log: MemberLog, *, below: int | None = None) -> None:
         """Fold events on disk that this process has not folded; caller holds the lock.
@@ -932,8 +1219,21 @@ class MemberEventLogService:
         """
         floor = self._registry.observed_floor(slug)
         if floor < 0:
-            # No cell yet: such a cell folds from init() over whatever it is first
-            # driven with, so it must be primed rather than driven at a range.
+            # Nothing is folded yet -- either no cell, or a cell a prime over an empty
+            # stream left at the empty watermark, which is the state a log with no
+            # events is in. Such a cell folds from init() over whatever it is first
+            # driven with, so a range cannot be driven at it. Prime over the same
+            # events instead: that is the form it accepts, and it reaches the state a
+            # cold fold reaches. Returning here is the one thing that does not work --
+            # the entries another process committed would stay unfolded, and the next
+            # append drives every cell past them, after which drive drops them.
+            #
+            # ``below`` still bounds it, so the append path's own ``drive`` remains the
+            # call that fires the change callbacks ``prime`` withholds.
+            self._registry.prime(
+                slug,
+                (ev for ev in log.iter_events() if below is None or ev["seq"] < below),
+            )
             return
         for earlier in log.iter_events():
             if earlier["seq"] <= floor:

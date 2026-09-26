@@ -1175,8 +1175,24 @@ def _open_contained_nofollow(base: Path, target: Path) -> int:
     )
 
 
+def _pinned_ancestors(path: Path) -> Path:
+    """Return *path* with its ancestors canonical and its own name literal.
+
+    The form :func:`kiro_crew.pinned_fs.pin_parent` asks its callers for: its
+    O_NOFOLLOW walk refuses an ancestor that has always been a link - a home
+    reached through one - exactly like one swapped mid-transaction. The final
+    name is left alone, or the walk follows a link planted AT the directory it
+    is pinning. ``realpath``, not ``Path.resolve``, which raises RuntimeError
+    on a cycle and escapes the OSError callers refuse with.
+    """
+    return Path(os.path.realpath(path.parent)) / path.name
+
+
 class _PinnedDir:
     """Pin the app data dir against link swaps for one provision transaction.
+
+    The path is pinned exactly as handed in, so the CALLER owns
+    :func:`_pinned_ancestors`: splitting it here would guess this one's depth.
 
     A path-based check-then-use is a TOCTOU window: a RUNNING app can swap
     ``data/`` for a symlink after the validation and have every later rename
@@ -1401,6 +1417,9 @@ def provision_app_deps(app_name: str, root: Path) -> str:
     descriptor), and the stamp check runs inside the lock, so a waiter that
     blocked behind a successful install skips pip on the stamp it left.
     """
+    # Every pinned call below derives its path from root, so one canonical
+    # base reaches all of them: requirements, staging snapshot, tree removals.
+    root = _pinned_ancestors(root)
     _req = root / "requirements.txt"
     if not _req.is_file():
         # is_file() follows a symlink, so it answers False for a DANGLING
@@ -2698,7 +2717,16 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
         logger.debug("SEL audit failed for app %s backend spawn: %s", app_name, exc)
 
     try:
-        log_fh = open(log_path, "w")
+        # UTF-8 with replacement, not the locale codec. A text handle opened
+        # without ``encoding=`` takes the platform default, which on Windows is
+        # the ANSI code page (cp1252), and the provision-error line below can
+        # carry non-ASCII text -- a Unicode traceback glyph, an accented
+        # install path. Under cp1252 that write raises UnicodeEncodeError and
+        # the spawn aborts on the one branch whose whole point is to record
+        # why provisioning failed. ``errors="replace"`` keeps the write total
+        # for any codepoint; the child's own output is appended as raw bytes
+        # through the inherited fd and is not affected by this wrapper.
+        log_fh = open(log_path, "w", encoding="utf-8", errors="replace")
         if provision_error:
             # Put the real cause at the top of the backend's own (user-visible)
             # log: the import error missing deps produce reads as an app bug,
@@ -2747,7 +2775,10 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
     if not _survived_spawn(proc, port):
         tail = ""
         try:
-            with open(log_path, "r") as _lf:
+            # Same codec as the write above; the child's stdout bytes follow
+            # the header and may be any encoding, so decode with replacement
+            # rather than letting one stray byte turn the tail into "(no output)".
+            with open(log_path, "r", encoding="utf-8", errors="replace") as _lf:
                 tail = "".join(_lf.readlines()[-8:]).strip()[-600:]
         except Exception:  # noqa: BLE001
             pass

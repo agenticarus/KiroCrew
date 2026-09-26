@@ -132,6 +132,10 @@ def _request(
     else:
         raw = b""
     headers = {"Content-Length": str(len(raw))} if (raw and with_content_length) else {}
+    # A body must DECLARE JSON or ``read_bounded_json`` refuses it 415 before the
+    # shape guard these tests are about ever runs. Every real client sets this.
+    if raw:
+        headers["Content-Type"] = "application/json"
     if session:
         headers["X-Session-Key"] = session
     req = make_mocked_request(
@@ -143,6 +147,11 @@ def _request(
         payload=BodyStreamPayload(raw),
     )
     req["app"] = request_app
+    if request_app == "":
+        # The dashboard-user class carries a subject; the mutating routes are
+        # owner-gated, and with no ``owner_id`` configured the signed local
+        # bootstrap subject is the owner.
+        req["user"] = "local-app"
     # Kept alive: the uncapped handlers (``max_bytes=None`` -- start, plan,
     # update_plan, update_task, from_chat, refine) consume ``request.json()``;
     # the capped ones drain the payload stream instead.

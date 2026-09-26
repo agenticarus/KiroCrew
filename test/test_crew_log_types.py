@@ -234,6 +234,13 @@ CANONICAL: dict[str, dict] = {
         "event": "progress: scoped tests green",
         "event_kind": "report",
     },
+    "panel/published": {
+        "template": "default",
+        "data": {"cycle": 47, "waiting_on_you": 1, "holding": 6},
+        "title": "fleet — cycle 47",
+        "crew": "Fleet Conductor",
+        "crew_key": "9f2c" + "0" * 60,
+    },
 }
 
 
@@ -270,7 +277,11 @@ def test_every_type_written_today_is_declared_and_nothing_else_is():
     # from this registry, so an undeclared type in a log stops every later fold of it --
     # and not because any fold of ONE log branches on them: the session tree is folded
     # across logs.
-    assert len(SESSION_ENTRY_TYPES) == 33
+    #
+    # The one past those is the crew webview's ``panel/published``, which joins its
+    # siblings for the same reason they did: a panel is a record whose history matters,
+    # and one overwritable document per crew could hold none of it.
+    assert len(SESSION_ENTRY_TYPES) == 34
     # Nine types the vocabulary owns that nothing writes. Declaring one would state
     # a shape no writer produces, and the first emitter to land would have to
     # satisfy a contract written without it. They pass through undeclared instead.
@@ -778,11 +789,18 @@ def test_a_group_refuses_a_citing_entry_the_registry_rejects():
     assert crew_log_path("session", SESSION).read_bytes() == before
 
 
-def test_a_crew_append_is_untouched_by_the_registry():
+def test_an_undeclared_crew_append_is_untouched_by_the_registry():
+    """A crew type outside the two declared contracts still passes through.
+
+    The crew kind owns eight domains and two of them carry a declaration, so the
+    registry has to answer per TYPE rather than per kind: a family with no writer
+    stays writable, which is what keeps a guest app and a future family from
+    needing a registry entry before they can record anything.
+    """
     crew = CrewLog.create("crew", "qa")
     joined = crew.append("member/joined", {}, src="gateway")
     crew.append(
-        "crew/report",
+        "crew/finding",
         {"anything": 1},
         src="crew:qa",
         ref={"unit": "crew", "id": "qa", "from": joined.seq},
@@ -993,7 +1011,10 @@ def test_the_markdown_dump_marks_the_sampled_types():
 
 
 def test_the_markdown_dump_is_empty_for_a_kind_with_no_declarations():
-    assert render_markdown("crew").strip() == "# Declared `crew` crew log entry types"
+    # The MEMBER kind is that kind: its vocabulary, writers and projections are
+    # owned by the member event log, so nothing is declared here for it and the
+    # renderer answers with a heading and no sections.
+    assert render_markdown("member").strip() == "# Declared `member` crew log entry types"
 
 
 def test_the_cli_prints_the_tables_and_refuses_anything_else(capsys):

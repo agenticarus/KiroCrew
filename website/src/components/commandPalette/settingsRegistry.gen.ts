@@ -802,6 +802,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
+    "params": {
+      "sub": "advanced"
+    },
     "configKey": "session.autocompact_pct"
   },
   {
@@ -811,7 +814,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Expand the side panel to the Git tab each time you start a chat in a git project. The Git tab is created either way.",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "sidepanel"
+    }
   },
   {
     "id": "chat.background-effort",
@@ -819,7 +825,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "labelKey": "pages.settings.chatPanel.background_effort",
     "tab": "chat",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "models"
+    }
   },
   {
     "id": "chat.background-model",
@@ -827,7 +836,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "labelKey": "pages.settings.chatPanel.background_model",
     "tab": "chat",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "models"
+    }
   },
   {
     "id": "chat.compact-empty-folders",
@@ -836,7 +848,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "A folder with no chats takes one row instead of two, and its New chat button moves onto the folder's own row",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "sessions"
+    }
   },
   {
     "id": "chat.completion-event-characters",
@@ -844,7 +859,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "labelKey": "pages.settings.chatPanel.completion_event_characters",
     "tab": "chat",
     "type": "input",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "advanced"
+    }
   },
   {
     "id": "chat.completion-event-truncation",
@@ -853,7 +871,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Which part of a subagent's stream to keep when injecting its completion event into the parent session. Head preserves the start (default, matches legacy behavior). Tail preserves the final summary. Both keeps a slice from each end with a marker between them.",
     "tab": "chat",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "advanced"
+    }
   },
   {
     "id": "chat.confirm-before-closing-session",
@@ -862,7 +883,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Show a confirmation dialog when closing a session",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "sessions"
+    }
   },
   {
     "id": "chat.content-width",
@@ -871,7 +895,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Compact is the original view. Comfortable and Full use more screen space.",
     "tab": "chat",
     "type": "buttonGroup",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "transcript"
+    }
   },
   {
     "id": "chat.content-filter-fallback-model",
@@ -880,6 +907,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
+    "params": {
+      "sub": "models"
+    },
     "configKey": "agent.refusal_fallback_model"
   },
   {
@@ -890,6 +920,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
+    "params": {
+      "sub": "sessions"
+    },
     "configKey": "dashboard.default_memory_mode"
   },
   {
@@ -899,7 +932,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Which model new sessions start with when their agent pins none. Set a model per agent under Capabilities → Agents, or pick one inside a session to override it there.",
     "tab": "chat",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "models"
+    }
   },
   {
     "id": "chat.default-reasoning-effort",
@@ -908,7 +944,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "How long models think before answering by default. Higher is slower and costs more. Only available on reasoning-capable models (Opus, Sonnet, Fable, GPT-5.x).",
     "tab": "chat",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "models"
+    }
   },
   {
     "id": "chat.default-to-autopilot-mode",
@@ -917,7 +956,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "New sessions start in autopilot mode (plan → approve → execute). You can still toggle individual sessions.",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "sessions"
+    }
   },
   {
     "id": "chat.describe-your-role",
@@ -926,6 +968,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Kiro uses this description to adapt vocabulary and examples to your role.",
     "tab": "chat",
     "type": "input",
+    "occurrence": 1,
+    "params": {
+      "sub": "aboutyou"
+    }
+  },
+  {
+    "id": "chat.double-click-to-edit-your-messages",
+    "label": "Double-click to edit your messages",
+    "labelKey": "pages.settings.chatPanel.double_click_to_edit",
+    "description": "When off, a double-click on your message selects a word as in any text.",
+    "tab": "chat",
+    "type": "toggle",
     "occurrence": 1
   },
   {
@@ -935,6 +989,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
+    "params": {
+      "sub": "models"
+    },
     "configKey": "agent.fallback_model"
   },
   {
@@ -943,7 +1000,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "labelKey": "pages.settings.chatPanel.feature_tips",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "discovery"
+    }
   },
   {
     "id": "chat.file-change-chips",
@@ -952,7 +1012,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "How file diff chips appear below assistant messages",
     "tab": "chat",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "transcript"
+    }
   },
   {
     "id": "chat.folder-suggestions",
@@ -961,7 +1024,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Offer to file a new session into a matching folder once it has a title.",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "sessions"
+    }
   },
   {
     "id": "chat.follow-up-bar-layout",
@@ -970,7 +1036,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Multiline wraps suggestions onto multiple rows. Single line keeps them on one horizontally-scrollable row.",
     "tab": "chat",
     "type": "buttonGroup",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "composer"
+    }
   },
   {
     "id": "chat.history-expanded",
@@ -979,7 +1048,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Expand history sidebar by default",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "sessions"
+    }
   },
   {
     "id": "chat.link-previews",
@@ -988,7 +1060,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Show a favicon and page title instead of the raw URL. This machine then fetches every link the model outputs, so each linked site sees a request from your IP address.",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "transcript"
+    }
   },
   {
     "id": "chat.mcp-apps-in-side-panel",
@@ -997,7 +1072,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Render interactive MCP Apps (such as Excalidraw diagrams) in the right side panel instead of inline in the chat. The panel opens automatically.",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "sidepanel"
+    }
   },
   {
     "id": "chat.merge-queued-messages",
@@ -1006,7 +1084,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Combine follow-up messages into a single labeled prompt while the agent is busy",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "composer"
+    }
   },
   {
     "id": "chat.message-font-size",
@@ -1015,7 +1096,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Font size for the conversation, in every session: message text, code, tables, suggested replies and the message input. The Compact content width grows to match. Sidebar, session list and the rest of the interface are unaffected.",
     "tab": "chat",
     "type": "stepper",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "transcript"
+    }
   },
   {
     "id": "chat.minimap-location",
@@ -1024,7 +1108,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "When located on the right edge, the minimap replaces the scroll bar.",
     "tab": "chat",
     "type": "buttonGroup",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "transcript"
+    }
   },
   {
     "id": "chat.pin-the-latest-turn",
@@ -1033,7 +1120,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Keep the most recent turn visible as a sticky banner once it scrolls above the fold.",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "transcript"
+    }
   },
   {
     "id": "chat.plain-diffs",
@@ -1042,7 +1132,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Render diffs as plain unified-diff text instead of syntax-highlighted colour. Uses less memory on large diffs.",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "transcript"
+    }
   },
   {
     "id": "chat.pr-and-issue-chips-on-session-cards",
@@ -1051,7 +1144,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Show a chip on each session's sidebar card for every pull request, merge request and issue mentioned in that session. Turning it off also stops the periodic provider calls that keep those chips up to date.",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "sessions"
+    }
   },
   {
     "id": "chat.prevent-sleep-while-running",
@@ -1061,6 +1157,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
+    "params": {
+      "sub": "advanced"
+    },
     "configKey": "dashboard.prevent_sleep"
   },
   {
@@ -1069,7 +1168,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "labelKey": "pages.settings.chatPanel.quick_send",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "composer"
+    }
   },
   {
     "id": "chat.response-verbosity",
@@ -1078,7 +1180,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "How terse the agent's prose is. Ultra-concise keeps the whole reply short: answer first, bullets over paragraphs, no filler. Code, commands, and error strings stay verbatim at every level; security warnings always appear but stay brief, and multi-step instructions stay complete. Answer-only goes further and drops explanation entirely: one sentence at most, and detail only when you ask for it — or when a decision is consequential enough (security, exposure, data loss, spend, anything hard to undo) that you need the reasoning to choose correctly.",
     "tab": "chat",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "transcript"
+    }
   },
   {
     "id": "chat.restore-sessions",
@@ -1087,7 +1192,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Re-open recently active sessions on startup",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "sessions"
+    }
   },
   {
     "id": "chat.restore-window",
@@ -1096,7 +1204,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Time window for session restoration",
     "tab": "chat",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "sessions"
+    }
   },
   {
     "id": "chat.selectable-models",
@@ -1106,6 +1217,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
+    "params": {
+      "sub": "models"
+    },
     "configKey": "dashboard.model_picker_hidden_models",
     "settingId": "chat.selectable-models"
   },
@@ -1115,7 +1229,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "labelKey": "pages.settings.chatPanel.send_shortcut",
     "tab": "chat",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "composer"
+    }
   },
   {
     "id": "chat.session-summaries",
@@ -1124,7 +1241,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Summarize each session by intent. Uses tokens on turns that change the session.",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "sessions"
+    }
   },
   {
     "id": "chat.show-context-percentage",
@@ -1133,7 +1253,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Display usage percentage next to the context progress bar",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "transcript"
+    }
   },
   {
     "id": "chat.show-context-tokens",
@@ -1142,7 +1265,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Display used and total tokens next to the context progress bar",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "transcript"
+    }
   },
   {
     "id": "chat.show-pasted-text-in-full",
@@ -1150,7 +1276,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "labelKey": "pages.settings.chatPanel.show_pasted_text_in_full",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "composer"
+    }
   },
   {
     "id": "chat.show-thinking-inline",
@@ -1159,7 +1288,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Show intermediate reasoning text between tool calls instead of collapsing everything",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "transcript"
+    }
   },
   {
     "id": "chat.show-timestamps",
@@ -1168,7 +1300,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Display time on each message",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "transcript"
+    }
   },
   {
     "id": "chat.simplified-tool-call-names",
@@ -1177,7 +1312,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "When enabled, inline tool pills show simplified tool use purpose instead of the exact command being run",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "transcript"
+    }
   },
   {
     "id": "chat.soft-stop-budget-seconds",
@@ -1185,7 +1323,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "labelKey": "pages.settings.chatPanel.soft_stop_budget_seconds",
     "tab": "chat",
     "type": "input",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "composer"
+    }
   },
   {
     "id": "chat.spell-check-message-input",
@@ -1194,7 +1335,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Underline misspelled words in the message input with a red squiggle. Turn it off to stop the red underlines while you type.",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "composer"
+    }
   },
   {
     "id": "chat.split-side-by-side-diffs",
@@ -1203,7 +1347,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Show old and new code in two columns; off shows one unified column. Changing it here or on any diff sets it everywhere.",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "transcript"
+    }
   },
   {
     "id": "chat.split-view-session-grid",
@@ -1211,7 +1358,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "labelKey": "pages.settings.chatPanel.split_view_session_grid",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "sessions"
+    }
   },
   {
     "id": "chat.subagent-effort",
@@ -1219,7 +1369,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "labelKey": "pages.settings.chatPanel.subagent_effort",
     "tab": "chat",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "models"
+    }
   },
   {
     "id": "chat.subagent-model",
@@ -1227,7 +1380,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "labelKey": "pages.settings.chatPanel.subagent_model",
     "tab": "chat",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "models"
+    }
   },
   {
     "id": "chat.tail-only-fork",
@@ -1236,7 +1392,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Fork keeps only the messages after the chosen point instead of those up to it.",
     "tab": "chat",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "sessions"
+    }
   },
   {
     "id": "chat.technical-comfort",
@@ -1245,7 +1404,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Sets how deep explanations go — plain language vs. full technical detail",
     "tab": "chat",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "aboutyou"
+    }
   },
   {
     "id": "chat.text-link-patterns",
@@ -1254,6 +1416,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "chat",
     "type": "input",
     "occurrence": 1,
+    "params": {
+      "sub": "transcript"
+    },
     "configKey": "dashboard.link_patterns"
   },
   {
@@ -1263,7 +1428,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Immediate mode shows raw chunks as they arrive. Smooth mode buffers and fades text in at a steady pace.",
     "tab": "chat",
     "type": "buttonGroup",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "transcript"
+    }
   },
   {
     "id": "chat.what-enter-does-while-the-agent-is-working",
@@ -1271,7 +1439,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "labelKey": "pages.settings.chatPanel.what_enter_does_while_the_agent_is_working",
     "tab": "chat",
     "type": "buttonGroup",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "composer"
+    }
   },
   {
     "id": "chat.widget-density",
@@ -1280,7 +1451,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "How aggressively the agent uses inline widgets for visual content",
     "tab": "chat",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "transcript"
+    }
   },
   {
     "id": "chat.your-role",
@@ -1289,7 +1463,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Kiro matches vocabulary and examples to your professional background",
     "tab": "chat",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "aboutyou"
+    }
   },
   {
     "id": "computer-use.attach-screenshots",
@@ -1491,6 +1668,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "developer.reply-threads-on-crewmate-chat-messages",
+    "label": "Reply threads on crewmate chat messages",
+    "labelKey": "pages.settings.crewmatesSection.reply_threads",
+    "description": "Let any message in a crewmate's chat carry its own reply thread, opened in the side panel while the chat stays visible. Off, the Reply in thread control is not offered and existing threads are hidden, not deleted.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "developer.run-a-local-gateway",
     "label": "Run a local gateway",
     "labelKey": "pages.settings.developerPanel.run_a_local_gateway",
@@ -1527,6 +1713,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "configKey": "dashboard.terminal.completion.enabled"
   },
   {
+    "id": "display.custom-font",
+    "label": "Custom font",
+    "labelKey": "pages.settings.displayPanel.custom_font_family",
+    "description": "The font the whole dashboard uses, including chat, the composer, and sidebar session and folder names. Pick one installed on the machine you view the dashboard from, or type any font name — a Nerd Font renders its glyphs and a programming font shows its ligatures.",
+    "tab": "display",
+    "type": "select",
+    "occurrence": 1
+  },
+  {
     "id": "display.default-for-new-sessions",
     "labelKey": "pages.settings.displayPanel.default_for_new_sessions",
     "tab": "display",
@@ -1552,6 +1747,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "How the session color is applied to the row.",
     "tab": "display",
     "type": "buttonGroup",
+    "occurrence": 1
+  },
+  {
+    "id": "display.enable-ligatures",
+    "label": "Enable ligatures",
+    "labelKey": "pages.settings.displayPanel.custom_font_ligatures",
+    "description": "Render programming ligatures (=>, !=, ->) when the custom font has them. Code and diffs in messages are unaffected.",
+    "tab": "display",
+    "type": "toggle",
     "occurrence": 1
   },
   {
@@ -1634,16 +1838,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "display",
     "type": "buttonGroup",
     "occurrence": 1
-  },
-  {
-    "id": "display.spend-a-few-credits-to-check-your-balance",
-    "label": "Spend a few credits to check your balance",
-    "labelKey": "pages.settings.displayPanel.credit_usage_scrape",
-    "description": "When your usage data is not available for free, your balance can still be checked by sending one billed message, about every 10 minutes while a dashboard tab is open. Each check spends a small number of credits.",
-    "tab": "display",
-    "type": "toggle",
-    "occurrence": 1,
-    "configKey": "dashboard.usage_text_scrape_enabled"
   },
   {
     "id": "display.theme",
@@ -1894,6 +2088,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
       "section": "posture"
     },
     "label": "Live Security Posture"
+  },
+  {
+    "id": "security.redact-credentials-in-files-the-dashboard-opens-for-you",
+    "labelKey": "pages.settings.securityPanel.credential_redaction_toggle",
+    "tab": "security",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "section": "redaction"
+    },
+    "label": "Redact credentials in files the dashboard opens for you",
+    "description": "Off shows files the dashboard opens for you — the chat side panel's Files tab, and the Library and Artifacts previews — as written, in your own dashboard only. On by default. Conversations in this dashboard, Slack, and messaging channels stay redacted. Changing it reloads the files you have open (unsaved edits are kept) and closes file-comparison (diff) views."
   },
   {
     "id": "security.trust-every-third-party-app",

@@ -880,7 +880,7 @@ export default [
               // per-channel settings panels. Enumerated and whole-value-anchored,
               // so a sentence merely mentioning a channel is still reported —
               // only the bare name is exempt.
-              '^(Slack|Discord|Telegram|Teams|Webex|WeCom|WeChat|WhatsApp)$',
+              '^(Slack|Discord|Telegram|Teams|Webex|WeCom|WeChat|WhatsApp|iMessage|Feishu)$',
               // The code-forge product brands, in the do-not-translate glossary for
               // the same reason and enforced there by `glossary.test.ts`: "GitLab" is
               // "GitLab" in every language, and a localized spelling would name a
@@ -1454,6 +1454,17 @@ export default [
     },
   },
 
+  // HOOK EVENT NAMES ONLY: matched BY VALUE against the backend's event
+  // allowlist, and rendered verbatim on the hook's own row, so a translated one is
+  // rejected on save and disagrees with its row. Extracted so the page keeps its
+  // gate. See the module's own header.
+  {
+    files: ['src/pages/hookEventWireValues.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
   // SEARCH-KEYWORD SYNONYMS ONLY: a manual overlay of extra query terms merged
   // into the Settings search corpus so a query like "dark mode" finds a setting
   // whose label does not contain those words. Every value is a term matched
@@ -1504,6 +1515,19 @@ export default [
   // tight.
   {
     files: ['src/utils/fontFamilyOptions.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // CUSTOM FONT PICKER CANDIDATES: the sibling of monoFontCandidates.ts for the
+  // "Custom" Font Family option's picker. Same names-only rationale — every
+  // literal is a font family name matched by value against the machine's font
+  // book, so a translated name resolves to nothing. Kept in its own module so the
+  // exemption stays tight; the picker's own copy (label, description, free-text
+  // row) lives in the catalog.
+  {
+    files: ['src/utils/customFontCandidates.ts'],
     rules: {
       'i18next/no-literal-string': 'off',
     },

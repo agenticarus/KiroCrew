@@ -76,11 +76,13 @@ from kiro_crew.acp.kas_permissions import (
 from kiro_crew.agent_discovery import (
     AgentsDirMemo,
     AmbiguousAgentSpecError,
+    plain_markdown_document,
     read_agent_spec_strict,
     spec_by_declared_name,
     spec_welcome_message,
 )
-from kiro_crew.agent_spec_format import agent_spec_candidates
+from kiro_crew.agent_files import KAS_RESERVED_AGENT_IDS
+from kiro_crew.agent_spec_format import agent_spec_candidates, is_markdown_spec
 from kiro_crew.mcp_cleanup import (
     KIROCREW_BIN_MCP_SERVERS,
     MCP_REGISTRY_TYPE,
@@ -161,7 +163,9 @@ _PSEUDO_FS_ROOTS = ("/proc", "/sys", "/dev")
 #: is what kept ``hooks`` written off as unsupported. KAS runs pre/post-tool-use
 #: hooks natively and loads them from an agent profile ON DISK (it even accepts
 #: Crew's object form), so what is lost here is a delivery path, not a feature:
-#: an agent injected over the wire cannot carry them.
+#: an agent injected over the wire cannot carry them. Crew's turn loop fires the
+#: spec's ``hooks`` for such a session instead (:mod:`kiro_crew.agent_sdk.spec_hooks`), so of
+#: these keys only :data:`SPEC_KEYS_WITHOUT_CARRIER` is actually lost.
 #:
 #: ``allowedTools`` is deliberately NOT in this set. It has no slot either, but
 #: :mod:`kiro_crew.acp.kas_permissions` translates it into ``permissions``, so
@@ -175,8 +179,30 @@ UNSUPPORTED_SPEC_KEYS = frozenset(
 )
 
 
+#: The keys in :data:`UNSUPPORTED_SPEC_KEYS` that nothing carries to a KAS session,
+#: so an agent that sets one runs without it. The user is told once per session.
+SPEC_KEYS_WITHOUT_CARRIER = UNSUPPORTED_SPEC_KEYS - {"hooks"}
+
+
+def spec_keys_without_carrier(spec: dict[str, Any]) -> list[str]:
+    """The keys of :data:`SPEC_KEYS_WITHOUT_CARRIER` that *spec* sets, sorted."""
+    return sorted(k for k in SPEC_KEYS_WITHOUT_CARRIER if spec.get(k))
+
+
 class KasAgentTranslationError(ValueError):
     """A spec cannot be projected onto KAS's schema at all."""
+
+
+class KasReservedAgentIdError(KasAgentTranslationError):
+    """The agent's id is one the KAS engine keeps for itself.
+
+    A translation error like its parent -- every caller that handles that
+    handles this -- but its message is already the user's whole instruction
+    (action first, in the dashboard's own labels), so the harness raises it as
+    is rather than behind the ``cannot project agent ... onto KAS`` prefix the
+    other translation failures get, which a blind reader rated as noise before
+    the remedy.
+    """
 
 
 #: System prompt fed to a prompt-less agent when projecting onto KAS. KAS
@@ -689,6 +715,7 @@ def to_client_custom_agent(
     *,
     stub_server_names: frozenset[str] = frozenset(),
     member_dispatch: bool = False,
+    crew_panel: bool = False,
     session_key: str = "",
 ) -> dict[str, Any]:
     """Project one Crew agent spec onto a KAS ``ClientCustomAgent`` descriptor.
@@ -707,19 +734,42 @@ def to_client_custom_agent(
     BEFORE the governance ceiling filter — the conductor grant set plus the
     write verbs the server-side ``created_by`` ownership fence bounds, passed
     through the same ceiling every other grant crosses.
+
+    *crew_panel* widens it the same way for the member's own webview:
+    ``@kirocrew-panel`` joins ``tools`` and ``agent._MEMBER_PANEL_GRANTS`` joins
+    the same ``allowedTools`` input. Two flags rather than one, because the two
+    capabilities are assigned per server and withdrawn by separate operator
+    switches: a member may hold session control without a panel, or a panel
+    without session control.
     """
     if not agent_id:
         raise KasAgentTranslationError("agent id must be non-empty")
+    if agent_id in KAS_RESERVED_AGENT_IDS:
+        # Refused HERE, before the wire, because the engine does not refuse it:
+        # it accepts the batch and either drops this entry (``default``) or
+        # keeps its own built-in agent under the id (``vibe``, ``spec``, ...).
+        # The first would surface one step later as "mode not advertised" with
+        # a remedy (regenerate the spec) that cannot help -- the spec exists;
+        # the second would not surface at all, and the session would run the
+        # engine's agent with the crewmate's name on it.
+        raise KasReservedAgentIdError(
+            f"Rename this crewmate's template: “{agent_id}” is reserved for a built-in "
+            "agent, so the crewmate's own prompt and tools would not run under it. "
+            "Both fixes are on the crewmate's Agent Template tab: for the crewmate's own "
+            "copy, 'Save as new template…' under another name (it keeps its "
+            "customizations) or 'Reset my changes'; for a shared template, the template "
+            "picker at the top of the tab."
+        )
     if not prompt.strip():
         raise KasAgentTranslationError(f"agent {agent_id!r} prompt is empty")
 
     dropped = sorted(k for k in UNSUPPORTED_SPEC_KEYS if spec.get(k))
     if dropped:
-        # Says WHY the key is dropped, because the previous wording ("no KAS
-        # equivalent") reads as "KAS cannot do this" and sent readers looking for
-        # a missing feature instead of a missing wire field. Debug, not warning:
-        # this fires on every session/new with a constant payload, so at WARNING
-        # it drowns the log without ever telling anyone something new.
+        # Says WHY the key is dropped: a missing wire field, not a missing KAS
+        # feature. Debug, not warning: this fires on every session/new with a
+        # constant payload. The user learns of it from the session-start notice
+        # the turn loop posts for SPEC_KEYS_WITHOUT_CARRIER, and ``hooks`` still
+        # runs, fired by that loop.
         logger.debug(
             "agent %r: spec keys the customAgents wire schema cannot carry, "
             "so an injected agent runs without them: %s",
@@ -747,6 +797,23 @@ def to_client_custom_agent(
         base_allowed = allowed_tools_input if isinstance(allowed_tools_input, list) else []
         merged = list(base_allowed)
         merged.extend(g for g in _MEMBER_DASHBOARD_GRANTS if g not in merged)
+        allowed_tools_input = merged
+
+    if crew_panel:
+        # Same two moves as the block above, and for the same reason: the panel
+        # server arrives as a session-level entry, and naming it in ``tools`` is
+        # what grants its tools. Kept as its own block rather than folded into
+        # the one above so a member that holds one capability and not the other
+        # is projected with exactly the server it holds.
+        tools = out["tools"]
+        if isinstance(tools, list) and "@kirocrew-panel" not in tools:
+            out["tools"] = [*tools, "@kirocrew-panel"]
+        # circular import: same seam as the dashboard grants above.
+        from kiro_crew.agent import _MEMBER_PANEL_GRANTS
+
+        base_allowed = allowed_tools_input if isinstance(allowed_tools_input, list) else []
+        merged = list(base_allowed)
+        merged.extend(g for g in _MEMBER_PANEL_GRANTS if g not in merged)
         allowed_tools_input = merged
 
     # Two inputs, one of them governed twice. The derivation is `allowedTools`
@@ -917,9 +984,19 @@ def load_agent_spec(agents_dir: Path, agent_id: str) -> dict[str, Any]:
         # user-writable, so a symlink here must not be followed to a sensitive
         # target or an oversized file slurped into the projection.
         raw = read_agent_spec_strict(path, operation="kas_agent_projection", source="unknown")
-    except OSError as exc:
-        raise KasAgentTranslationError(f"agent spec {path} is unreadable: {exc}") from exc
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
+        if is_markdown_spec(path) and plain_markdown_document(path):
+            # ``<agent_id>.md`` with no opening fence and no JSON twin is a
+            # prose document sharing the name, not this agent's spec: it is
+            # skipped, which leaves the agent with no spec at all -- the same
+            # answer as no candidate file. A FENCED document that fails to
+            # parse falls through and raises as a broken spec.
+            raise KasAgentTranslationError(
+                f"agent {agent_id!r} has no spec: {path} has no frontmatter fence, "
+                "so it is a plain markdown document, not an agent spec"
+            ) from None
+        if isinstance(exc, OSError):
+            raise KasAgentTranslationError(f"agent spec {path} is unreadable: {exc}") from exc
         raise KasAgentTranslationError(f"agent spec {path} is not a valid spec: {exc}") from exc
     if not isinstance(raw, dict):
         raise KasAgentTranslationError(f"agent spec {path} is not an object")
@@ -933,6 +1010,7 @@ def build_kas_custom_agents(
     *,
     stub_server_names: frozenset[str] = frozenset(),
     member_dispatch: bool = False,
+    crew_panel: bool = False,
     session_key: str = "",
 ) -> list[dict[str, Any]]:
     """Build the ``_meta.kiro.customAgents`` batch that binds *agent_id* on KAS.
@@ -968,6 +1046,7 @@ def build_kas_custom_agents(
             prompt,
             stub_server_names=stub_server_names,
             member_dispatch=member_dispatch,
+            crew_panel=crew_panel,
             session_key=session_key,
         )
     ]

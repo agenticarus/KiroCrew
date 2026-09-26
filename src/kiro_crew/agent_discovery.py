@@ -20,7 +20,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Generic, Iterator, TypeVar
+from typing import Any, Callable, Generic, Iterator, Sequence, TypeVar
 
 from kiro_crew import agent_state, hooks
 from kiro_crew.agent_files import (
@@ -31,7 +31,9 @@ from kiro_crew.agent_files import (
 from kiro_crew.agent_spec_format import (
     is_agent_spec_name,
     is_markdown_spec,
+    is_native_skill_alias_name,
     iter_agent_spec_files,
+    markdown_head_is_fenceless,
     parse_agent_spec_bytes,
     shadowed_markdown_specs,
     spec_stem,
@@ -262,11 +264,13 @@ AGENT_SPEC_SUFFIX = ".agent-spec.json"
 def _audit_denied(*, operation: str, source: str, resources: str, error: str) -> None:
     """Emit a denial audit row for a refused path, never raising.
 
-    BOTH denial paths in this module promise not to raise -- ``_read_agent_spec``
+    EVERY denial path in this module promises not to raise -- ``_read_agent_spec``
     by the contract :func:`_warn_on_systematic_scan_failure` documents and its
-    callers read bare, and :func:`project_agent_names` in its own docstring
-    ("Never raises; an unreadable checkout yields an empty set"). Auditing the
-    denial must not become the one way to break either promise: for some
+    callers read bare, :func:`project_agent_names` in its own docstring
+    ("Never raises; an unreadable checkout yields an empty set"), and
+    :func:`project_agent_files` by the contract its own callers read it on, since
+    each treats an empty list as "this checkout declares no agents". Auditing the
+    denial must not become the one way to break any of those promises: for some
     surfaces this is the process's FIRST SEL use, and constructing the singleton
     mkdirs its home (``sel.py``), so an unwritable or hostile SEL directory
     would abort whichever surface asked -- on exactly the hostile path the
@@ -276,8 +280,10 @@ def _audit_denied(*, operation: str, source: str, resources: str, error: str) ->
     what is lost is the audit ROW. That is best-effort by the SEL API's own
     design: ``log_api_access`` reserves fail-closed behaviour for its explicit
     ``critical=True`` callers (``apps/admission.py``, the auto-improvement
-    server) and neither of these sites has ever been one. WARNING, not debug, so
-    an operator sees that the trail has a hole rather than finding out later.
+    server) and no denial site in this module is one -- the denial-side rule in
+    ``docs/architecture/security-deep-dive.md`` says why a refusal must not be
+    coupled to SEL health. WARNING, not debug, so an operator sees that the trail
+    has a hole rather than finding out later.
 
     The fallback names only the ``operation`` -- a fixed internal label. The
     REFUSED PATH is deliberately not logged here: on this branch its resolved
@@ -493,6 +499,94 @@ def read_agent_spec_strict(path: Path, *, operation: str, source: str) -> Any:
     return parse_agent_spec_bytes(raw, path)
 
 
+# The fence probe's head: a UTF-8 BOM (3 bytes) plus the longest opening fence
+# line (``---\r\n``, 5 bytes) is 8, so 64 leaves the probe nothing to judge but
+# the fence -- which is the point. Never the file's length.
+_FENCE_PROBE_BYTES = 64
+
+
+def _read_head(fd: int, limit: int) -> tuple[bytes, bool]:
+    """At most *limit* bytes from *fd*, and whether the file continues past them.
+
+    Reads ``limit + 1`` bytes (looping over short reads) so the caller can tell
+    a file that ends exactly at the bound from one that runs past it: a
+    multibyte sequence broken at the cut is incomplete, one broken at
+    end-of-file is the parser's own decode failure.
+    """
+    data = b""
+    while len(data) <= limit:
+        chunk = os.read(fd, limit + 1 - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data[:limit], len(data) > limit
+
+
+def plain_markdown_document(path: Path) -> bool:
+    """Whether the markdown file at *path* has no OPENING frontmatter fence.
+
+    The one answer to "is this ``.md`` in an agents directory a spec at all":
+    a plain markdown file dropped there -- a README, a shared prompt fragment
+    -- declares nothing and hides nothing, so it is not a spec. Callers ask it
+    only AFTER :func:`read_agent_spec_strict` refused the file, to decide
+    whether to skip the file rather than raise. A FENCED document that fails
+    to parse is not plain: it announced itself as a spec and may be a
+    truncated real one, so the caller keeps raising. The byte test is
+    :func:`kiro_crew.agent_spec_format.markdown_head_is_fenceless`, the same
+    opening-fence rule :func:`~kiro_crew.agent_spec_format.split_markdown_spec`
+    applies; this function only reads the head it judges.
+
+    The read path is the strict reader's own gates, never
+    :func:`kiro_crew.hooks.validate_file_path`: that gate re-resolves on the
+    two-worker ``mc-pathres`` pool and fails closed when the pool misses its
+    budget, and a policy request probes here on every call after the strict
+    reader refused -- the saturation the strict reader was moved off the pool
+    to survive. Refused, exactly as the strict reader refuses: a spelling or a
+    resolved target that is a UNC path outside the trusted roots on Windows
+    (:func:`_unc_refused`, before and after the resolve); a spelling
+    ``Path.resolve(strict=True)`` cannot canonicalise (absent, broken or
+    looping link, permission) -- a link is otherwise FOLLOWED and its target
+    judged; a resolved target :func:`_fence_refuses` fences; and whatever
+    :func:`kiro_crew.pinned_fs.open_fenced_for_read` refuses at the open. No
+    SEL row is written: the strict reader already audited any denial.
+
+    The read is BOUNDED at ``_FENCE_PROBE_BYTES`` through :func:`_read_head`.
+    The strict reader refuses an oversize file AT the cap precisely so it is
+    never slurped into memory, and an unbounded re-read here would hand the
+    caller an attacker-sized allocation whose ``MemoryError`` escapes every
+    fail-closed arm. An over-cap plain document is still skipped: the probe
+    judges its opening, not its length.
+
+    Every failure is ``False``: a file that cannot even be probed is unknown,
+    not ignorable, so the caller keeps raising.
+    """
+    if _unc_refused(str(path)):
+        return False
+    try:
+        real = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        # RuntimeError: pathlib's signal for a symlink loop on the Pythons
+        # that raise it as such.
+        return False
+    if _unc_refused(str(real)) or _fence_refuses(real):
+        return False
+    try:
+        fd = open_fenced_for_read(
+            real,
+            fence=lambda fd_real: _fence_refuses(Path(fd_real)),
+            refusal=_SpecReadRefused,
+        )
+    except OSError:
+        return False
+    try:
+        head, truncated = _read_head(fd, _FENCE_PROBE_BYTES)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return markdown_head_is_fenceless(head, complete=not truncated)
+
+
 class AmbiguousAgentSpecError(ValueError):
     """More than one spec in one directory declares the same ``name``.
 
@@ -500,7 +594,17 @@ class AmbiguousAgentSpecError(ValueError):
     hand the caller an agent the operator did not name, with that agent's tools
     and prompt. Every declared-name resolver refuses instead; the message names
     each file so the operator can remove or rename one.
+
+    ``paths`` carries the same files as data, for a caller that must name them
+    WITHOUT their directory -- the tool-policy endpoint's 409 ``reason``
+    crosses the wire into a model-visible refusal, and the message's full
+    paths disclose the account name and on-disk layout there. Empty when the
+    raiser did not supply them; the message is then the only record.
     """
+
+    def __init__(self, message: str, *, paths: Sequence[Path] = ()) -> None:
+        super().__init__(message)
+        self.paths: tuple[Path, ...] = tuple(paths)
 
 
 def spec_by_declared_name(
@@ -570,7 +674,8 @@ def spec_by_declared_name(
         raise AmbiguousAgentSpecError(
             f"{len(match_paths)} specs declare the name {agent_id!r}: "
             f"{', '.join(repr(str(path)) for path in match_paths)}. Which one is live is "
-            f"undefined -- remove or rename one."
+            f"undefined -- remove or rename one.",
+            paths=match_paths,
         )
     return match
 
@@ -621,6 +726,9 @@ def _warn_on_systematic_scan_failure(directory: Path, candidates: int, parsed: i
 def project_agent_files(
     project_dir: str | Path | None,
     include_legacy: bool = False,
+    *,
+    operation: str = "project_agent_files",
+    source: str = "project_agent_files",
 ) -> list[Path]:
     """Agent config files declared by a project checkout, sorted by stem.
 
@@ -648,11 +756,33 @@ def project_agent_files(
     The sensitive-path check is on the project root because that value arrives from
     a caller-supplied session field; the per-file resolved-target check that
     catches a planted symlink stays with the reader (:func:`_read_agent_spec`).
+
+    *operation*/*source* label the SEL denial event emitted on a sensitive
+    project directory, exactly as on :func:`_read_agent_spec` and
+    :func:`project_agent_names`: the calling surface names itself so the security
+    trail attributes the refusal to the request that triggered it. ``source`` is
+    the interface channel (``SecurityEvent.source`` vocabulary: dashboard, cli,
+    slack, cron, ...; ``"unknown"`` when the caller serves multiple channels) --
+    every call site passes it explicitly, enforced by the call-site ratchet test.
+    Both defaults exist ONLY so a bare call still records the refusal under a
+    label that names this function; they are not for new call sites.
     """
     if not project_dir:
         return []
     if is_sensitive_path(str(project_dir)):
         logger.debug("Skipping sensitive project dir for agent discovery: %s", project_dir)
+        # Audited like every other deny in this module: the path arrives from a
+        # caller-supplied session, spawn or channel field, so a scan of a
+        # protected tree is a probe an operator must be able to see. Best-effort
+        # by :func:`_audit_denied` -- the refusal below already stands, so a lost
+        # row costs the trail, never the guard (see the denial-audit rule in
+        # ``docs/architecture/security-deep-dive.md``).
+        _audit_denied(
+            operation=operation,
+            source=source,
+            resources=str(project_dir),
+            error="sensitive project dir rejected",
+        )
         return []
     specs: list[Path] = []
     try:
@@ -768,7 +898,7 @@ def project_agent_names(
         return cached[1]
     candidates = 0
     declared: list[str] = []
-    for f in project_agent_files(project_dir):
+    for f in project_agent_files(project_dir, operation=operation, source=source):
         # AppleDouble sidecars are rejected by design, not by failure — a
         # directory holding only sidecars is empty of specs, not broken.
         if not f.name.startswith("._"):
@@ -1189,11 +1319,12 @@ def agent_skill_globs(
             if strict and agent != "kirocrew":
                 raise SkillScopeResolutionError(f"Cannot resolve skill scope for agent {agent!r}")
             return []
-        directory = (
-            project_agents_dir(str(project_dir))
-            if winner.scope == SCOPE_PROJECT
-            else (agents_dir if agents_dir is not None else _kiro_agents_dir())
-        )
+        if winner.scope == SCOPE_PROJECT:
+            directory = project_agents_dir(str(project_dir))
+        elif agents_dir is not None:
+            directory = agents_dir
+        else:
+            directory = _kiro_agents_dir()
         path = directory / winner.filename
         data = _read_agent_spec(path, operation="agent_skill_globs", source="unknown")
         if strict and data is None:
@@ -1309,8 +1440,10 @@ def agent_welcome_message(
         if not project_dir:
             return ""
         directory = project_agents_dir(project_dir)
+    elif agents_dir is not None:
+        directory = agents_dir
     else:
-        directory = agents_dir if agents_dir is not None else _kiro_agents_dir()
+        directory = _kiro_agents_dir()
     data = _read_agent_spec(
         directory / winner.filename,
         operation="agent_welcome_message",
@@ -1324,16 +1457,25 @@ def agent_welcome_message(
 def _iter_spec_entries(d: Path) -> Iterator[os.DirEntry[str]]:
     """The one ``scandir`` walk behind the stat-only fingerprints of an agents dir.
 
-    Yields every entry with a recognised spec suffix and nothing else; the
-    caller decides what to ``stat`` and how. Case-insensitive: a
-    case-insensitive filesystem serves ``Foo.JSON`` to ``glob("*.json")``
-    consumers, so a case-sensitive suffix here would omit from a fingerprint a
-    file the scans include -- its edits would never invalidate. A directory that
+    Yields every entry with a recognised spec suffix that is not a managed
+    skill-view alias, and nothing else; the caller decides what to ``stat`` and
+    how. Both rules are the roster's own (:func:`iter_agent_spec_files`); the one
+    entry a fingerprint built here keeps and the roster drops is a Markdown spec
+    shadowed by its JSON twin, so the fingerprint is a superset of the roster,
+    never less.
+    Case-insensitive on the suffix: a case-insensitive filesystem serves
+    ``Foo.JSON`` to ``glob("*.json")`` consumers, so a case-sensitive suffix here
+    would omit from a fingerprint a file the scans include -- its edits would
+    never invalidate. Alias-free by name, before any ``stat``: the roster drops
+    the aliases, so a fingerprint that counted them would move on writes the
+    roster cannot see -- invalidating every cache it guards on each alias write
+    -- and would cost one ``stat`` per alias per call on the event loop, which
+    with thousands of aliases is the walk that stalls the loop. A directory that
     cannot be listed raises the ``OSError``; each caller decides what that means.
     """
     with os.scandir(d) as it:
         for entry in it:
-            if is_agent_spec_name(entry.name):
+            if is_agent_spec_name(entry.name) and not is_native_skill_alias_name(entry.name):
                 yield entry
 
 
@@ -1343,7 +1485,9 @@ def _dir_signature(d: Path) -> _ListAgentsSig:
     Captures each spec entry's name and mtime (both forms; a markdown edit
     that went unfingerprinted would serve a stale roster forever) — enough to detect adds,
     removals, renames, and any edit that changes a file's mtime, without
-    reading or parsing any file. An edit landing inside the same mtime tick
+    reading or parsing any file. A skill-view alias is not a spec entry here
+    (:func:`_iter_spec_entries`), so an alias write leaves the signature, and
+    the caches it guards, untouched. An edit landing inside the same mtime tick
     is invisible here; :func:`clear_list_agents_cache` is the escape hatch
     the write paths use for exactly that case. Naming the files matters: a
     rename changes neither the file count nor any file's mtime, but does
@@ -1407,15 +1551,17 @@ def agents_dir_revision(agents_dir: Path) -> AgentsDirRevision | None:
     not happen. A directory past :data:`_AGENTS_DIR_REVISION_MAX_ENTRIES` gives
     ``None`` and logs one warning per directory.
 
-    Only entries with a recognised spec suffix (``is_agent_spec_name``) are
-    fingerprinted; that is a superset of what the spec scans parse (a Markdown
-    spec shadowed by its JSON twin is still fingerprinted), so the revision can
-    only be more sensitive than the scan, never less. Adding or removing a stray
-    file still invalidates through the directory mtime, but the stray file itself
-    is omitted from the entry tuples. A ``stat`` that fails records zeros: the
-    entry is still named, so its appearance and disappearance are revisions. An
-    entry whose kind cannot be determined gives ``None``, and so does a
-    directory that cannot be listed: an unlistable directory is not an empty one.
+    Only the entries :func:`_iter_spec_entries` yields -- a recognised spec
+    suffix, not a skill-view alias -- are fingerprinted; that is a superset of
+    what the spec scans parse (a Markdown spec shadowed by its JSON twin is still
+    fingerprinted; an alias is left out by scan and fingerprint alike), so the
+    revision can only be more sensitive than the scan, never less. Adding or
+    removing a stray file -- an alias included -- still invalidates through the
+    directory mtime, but the stray file itself is omitted from the entry tuples
+    and from the entry cap. A ``stat`` that fails records zeros: the entry is
+    still named, so its appearance and disappearance are revisions. An entry
+    whose kind cannot be determined gives ``None``, and so does a directory that
+    cannot be listed: an unlistable directory is not an empty one.
     """
     if not AGENTS_DIR_MEMO_ENABLED:
         return None
@@ -1697,7 +1843,7 @@ def list_agents(
     JSON on the event loop.
     """
     d = agents_dir or _kiro_agents_dir()
-    project_files = project_agent_files(project_dir)
+    project_files = project_agent_files(project_dir, operation="list_agents", source="unknown")
     cache_key = (str(d), str(project_dir or ""))
     signature: tuple[_ListAgentsSig, ...] = (
         _dir_signature(d),

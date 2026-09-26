@@ -142,14 +142,10 @@ export function ChatHeaderMenu({ activeSlot, agent, onReveal, onRename, mode }: 
  *  suffix is as reload-stable as the key it disambiguates. Rows without a
  *  `mid` (locally-minted streaming/optimistic bubbles) fall back to `msgKey`
  *  alone, which is exactly the uniqueness they had before. */
-/** Client-generated one-shot correlation id for an optimistic user bubble.
- *  The server preserves meta fields on the user row it appends, so an echo or
- *  transcript page carries this id back and the bubble is matchable without
- *  relying on content equality (#2845). Shared by the plain send path and the
- *  mid-turn steer path (#6075) so the two cannot drift in id shape. */
-export function mintSendId(): string {
-  return `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
-}
+/** Client-generated one-shot correlation id for an optimistic user bubble; see
+ *  `mintSendId` in `utils/sendDelivery`. Re-exported so the page and the tests
+ *  keep their import path. */
+export { mintSendId } from '../../utils/sendDelivery'
 
 /** Row-identity builders live in chat-core (P5-e); re-exported here so the
  *  page, the store, and the tests keep their import path. */
@@ -389,8 +385,22 @@ function DirChip({ label, fullPath, onOpen }: { label: string; fullPath: string;
   )
   if (!onOpen) {
     return (
+      // `title` reaches a pointer only, and the visible text is just the short
+      // label, so the full path is also carried as visually-hidden text. A
+      // screen reader reads it wherever it reads the chip, including browse
+      // mode. It is text rather than a name on the span, because naming needs a
+      // role and a named non-interactive role is announced reliably only once
+      // something moves focus into it -- which nothing here ever does, since an
+      // inert chip has no action to reach and the transcript must not grow a tab
+      // stop per chip. FileHeaderBreadcrumb names a FOCUSABLE region instead.
+      // The visible label is aria-hidden so the path is spoken ONCE and whole,
+      // rather than the basename twice; the path already contains it.
+      // `select-none` keeps the hidden path out of a copied selection: `sr-only`
+      // hides text visually but leaves it in the DOM, so selecting the bubble
+      // would otherwise paste the path alongside the label a reader sees.
       <span className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5 rounded border border-accent/25 bg-accent/10 text-accent text-[12px] font-mono" title={fullPath}>
-        {body}
+        <span aria-hidden="true" className="inline-flex items-center gap-1">{body}</span>
+        <span className="sr-only select-none">{fullPath}</span>
       </span>
     )
   }
@@ -475,7 +485,11 @@ function renderInlineSegment(content: string, meta: Record<string, unknown> | un
 function FileMentionChip({ label, fullPath, onOpen }: { label: string; fullPath: string; onOpen?: (path: string) => void }) {
   const base = 'inline-flex items-center px-1.5 py-0.5 mx-0.5 rounded bg-accent/15 text-accent text-[12px] font-mono'
   if (!onOpen) {
-    return <span className={base} title={fullPath}>@{label}</span>
+    // Same reason as DirChip's inert branch: `title` is pointer-only, so the
+    // full path rides along as visually-hidden text, the visible label is
+    // aria-hidden so the basename is not spoken twice, and `select-none` keeps
+    // the path out of a copied selection.
+    return <span className={base} title={fullPath}><span aria-hidden="true">@{label}</span><span className="sr-only select-none">{fullPath}</span></span>
   }
   return (
     <Clickable className={`${base} cursor-pointer hover:bg-accent/25 transition-colors`} title={fullPath} onClick={() => onOpen(fullPath)} aria-label={i18nT('pages.chatPage.open_file', { path: fullPath })}>@{label}</Clickable>
@@ -498,7 +512,17 @@ function FileAttachmentCard({ fullPath, label, onFileOpen }: { fullPath: string;
   if (!onFileOpen) {
     // The tooltip says WHERE the file opens, because the card looks exactly
     // like the main chat's clickable one and a click here answers nothing.
-    return <span className={base} title={i18nT('pages.chatPage.attached_file_inert', { path: fullPath })}>{body}</span>
+    // The same sentence rides along as visually-hidden text, since `title`
+    // opens on pointer hover only. The visible body is aria-hidden: the
+    // sentence already contains the path, so reading both would say the
+    // filename twice per card. `select-none` keeps it out of a copied selection.
+    const inert = i18nT('pages.chatPage.attached_file_inert', { path: fullPath })
+    return (
+      <span className={base} title={inert}>
+        <span aria-hidden="true" className="flex items-center gap-2.5 min-w-0">{body}</span>
+        <span className="sr-only select-none">{inert}</span>
+      </span>
+    )
   }
   return (
     <Clickable

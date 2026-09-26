@@ -491,6 +491,16 @@ class TerminalCoordinator(ManagerComponent):
         # woken by our own session reset skip its error synthesis and report a
         # false SUCCESS before we own the record. See `_reap_started`.
         info._reap_started = True
+        # Written next to the marker, for the run loop: the session teardown
+        # below poisons the run's stream, which raises ``AcpProcessDied`` inside
+        # ``_run`` before this method's own record is written. ``_run`` reads
+        # these to record the reap that caused the death rather than the death
+        # itself. ``_stop_origin`` is left alone when a cancel already named
+        # one ("stopped by user", a parent-end verb).
+        if not info._reap_reason:
+            info._reap_reason = reason or "reaped"
+        if not info._stop_origin:
+            info._stop_origin = f"reaped after {int(elapsed)}s ({reason or 'deadline'})"
         # A pending cancel-recovery respawn is moot — this agent is being killed.
         # Cancel it rather than letting it sit in its bounded handshake wait
         # (_RESET_TIMEOUT + 60s) only to discover `reaped` and bare-return.
@@ -536,6 +546,12 @@ class TerminalCoordinator(ManagerComponent):
                 )
         else:
             # Kill the process FIRST so the pipe unblocks, then cancel the task.
+            # This order is load-bearing for ``_run``'s reap-echo arm: the run's
+            # stream observes this teardown as ``AcpProcessDied`` before the
+            # cancel lands, and the arm reads ``_reap_started`` to record the
+            # stop instead of that death. Reordering these would not make the
+            # arm wrong, only unreachable -- the cancel's own path already
+            # records a stop -- so the arm and this order stand or fall together.
             try:
                 await asyncio.wait_for(
                     self._manager._sessions.reset(session_key), timeout=_RESET_TIMEOUT
@@ -556,6 +572,9 @@ class TerminalCoordinator(ManagerComponent):
         # prompts, where `_exec_started` is already set, so `_exec_started is
         # None` is what distinguishes "never started" from "was running".
         approval_parked = info._awaiting_approval and info._exec_started is None
+        # Same capture for the state right after: approved, and waiting for the
+        # pump to meter the start into startup (``_admit_released_start``).
+        release_parked = info._start_release is not None and info._exec_started is None
 
         task = self._manager._tasks.pop(agent_id, None)
         if task and not task.done():
@@ -577,6 +596,11 @@ class TerminalCoordinator(ManagerComponent):
         # first-arrival-wins on `info.done`, so it is never written twice.
         if not info.done:
             info.done = True
+            # Neutrality follows the FIRST stopper (``stop_is_neutral`` reads
+            # ``_reap_reason``): a Stop that arrived while this deadline reap was
+            # already tearing the run down does not turn its failure neutral.
+            if not info.stop_is_neutral:
+                info.user_stopped = False
             if not info.error and not info.user_stopped:
                 # A user stop is neutral — never synthesize a reap error for it.
                 if approval_parked:
@@ -586,6 +610,8 @@ class TerminalCoordinator(ManagerComponent):
                     # closed. It reached no execution deadline, so DO NOT frame it
                     # as one. Predicate captured above the cancel; see there.
                     info.error = f"Reaped after {int(elapsed)}s while still awaiting an unanswered spawn approval (never started) [{_timeout_context(info, include_elapsed=False, turn_limit=self._manager._effective_turn_limit(info))}]"
+                elif release_parked:
+                    info.error = f"Reaped after {int(elapsed)}s while still waiting to be admitted into startup after spawn approval (never started) [{_timeout_context(info, include_elapsed=False, turn_limit=self._manager._effective_turn_limit(info))}]"
                 elif reason == "startup_timeout":
                     info.error = f"Failed to start within {self._manager._startup_deadline}s (no runtime launched, no turn produced) [{_timeout_context(info, include_elapsed=False, turn_limit=self._manager._effective_turn_limit(info))}]"
                 else:

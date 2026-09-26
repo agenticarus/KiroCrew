@@ -493,7 +493,7 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
               // occludes the visual viewport.
               style={keyboardInset > 0 ? { transform: `translateY(-${keyboardInset}px)` } : undefined}
             >
-              <div className="pointer-events-auto mx-auto max-w-sm rounded-full border border-border shadow-lg backdrop-blur-xl bg-[color-mix(in_srgb,var(--bg-elevated)_92%,transparent)]">
+              <div className="pointer-events-auto mx-auto max-w-sm rounded-full border border-border focus-within:border-accent shadow-lg backdrop-blur-xl bg-[color-mix(in_srgb,var(--bg-elevated)_92%,transparent)]">
                 <SidePanelDockContext.Provider value="bottom-float">
                   {headerRight}
                 </SidePanelDockContext.Provider>
@@ -512,7 +512,7 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
   return (
     <div className="flex-1 min-h-0 flex overflow-hidden">
       {!isMobile && <nav className="w-[200px] shrink-0 border-r border-border bg-bg pt-1 pb-3 px-3 flex flex-col">
-          <div className="text-lg font-bold text-text-strong px-2.5 py-2 mb-1 shrink-0">{title}</div>
+          <div data-testid="side-panel-nav-title" className="text-sm font-semibold text-muted px-2.5 py-2 mb-1 shrink-0">{title}</div>
           {/* Pinned sidebar-top slot: stays put while the tab list scrolls. The
             * dropdown it may open renders full-rail-width and downward (dock
             * 'nav'), so it never spills past the rail and gets clipped. */}
@@ -523,7 +523,7 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
           )}
           {/* Only the tab list scrolls — the title and navTop above and the
             * footer below stay fixed. */}
-          <div className="flex-1 min-h-0 overflow-y-auto flex flex-col gap-0.5">
+          <div className="flex-1 min-h-0 overflow-y-auto scrollbar-overlay scrollbar-overlay-thin flex flex-col gap-0.5">
           {tabs.map((t, i) => (
             <React.Fragment key={t.key}>
               {t.dividerBefore && <div className="h-px bg-border mx-2.5 my-2" role="separator" />}

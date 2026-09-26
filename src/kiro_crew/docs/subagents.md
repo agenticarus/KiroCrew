@@ -90,7 +90,7 @@ The other spawn tools:
 - `spawn_steer` — inject a message into a RUNNING subagent's in-flight turn (`agent_id`, `message`, `mode`: `interrupt` default or `follow_up`)
 - `spawn_release` — end a continuable conversation (`conversation`) so it can no longer be continued
 - `spawn_list` — list running and completed subagents
-- `spawn_status` — read a completed run's retained transcript (see below)
+- `spawn_status` — read a run's transcript: the live partial view while it runs, the retained full transcript once complete (see below)
 - `resource_status` — advisory host headroom (available memory, CPU load, posture, and the current concurrent sub-agent cap)
 
 ## How It Works
@@ -105,7 +105,7 @@ The other spawn tools:
 - **Max concurrent**: auto-sized at startup by default (`agent.max_subagents = 0`; floor 3, ceiling `agent.subagent_auto_max` = 32); set a positive integer to pin a fixed cap
 - **Timeout**: 3 hours per subagent task (`agent.subagent_timeout_secs`, clamped to 60s..86400s at load; 0 means "use the default"), 20 minutes delivery (semaphore wait + injection), 15 minutes per injection attempt (`KIROCREW_INJECTION_TIMEOUT`, clamped to the delivery cap). A **blocking** `spawn_sub_agents` call collects for at most 2 hours regardless of that setting (`KIROCREW_SPAWN_SUB_AGENTS_MAX_WAIT`, itself capped at 7200s), so use `spawn_run` for work longer than 2 hours and read the results from its completion events
 - **Turn limit**: 1000 tool calls per subagent by default (configurable via `agent.subagent_max_turns`, maximum 1000). A stored value, including 100, is preserved on upgrade; an unset key automatically uses the current default. Run `kirocrew config defaults` to inspect an older stored default, then use `kirocrew config defaults --adopt agent.subagent_max_turns` only if you want to replace that pin with the current default.
-- **Memory guard**: admission preserves a 4 GB available-memory floor plus estimated startup memory for the next worker and dedicated workers still warming up. Observed RSS replaces the startup reservation; confirmed shared sessions add no dedicated-process cost. Work waits in the durable queue when headroom is insufficient (legacy spawns are refused). Configure the floor with `agent.spawn_min_memory_gb`; set it to 0 to disable this guard.
+- **Memory guard**: admission preserves a 4 GB available-memory floor plus estimated startup memory for the next worker and dedicated workers still warming up. A start is priced at the learned per-run cost (never below `agent.subagent_cost_gb`) until two reaper sweeps have measured it; after that only the gap between its own peak, floored at `agent.subagent_cost_gb`, and its observed RSS stays reserved. Confirmed shared sessions add no dedicated-process cost. Work waits in the durable queue when headroom is insufficient (legacy spawns are refused). Configure the floor with `agent.spawn_min_memory_gb`; set it to 0 to disable this guard.
 - **Nesting**: a subagent can spawn its own subagents. A nested spawn is tracked apart from the parent's wave, so its children are not counted against that wave's completion total
 - **Redaction**: task strings in SubagentInfo are redacted (credentials + exfiltration URLs) before surfacing to Slack/dashboard
 
@@ -167,7 +167,7 @@ Set via `kirocrew config set agent.completion_keep tail` or by editing
 
 ### Reading the full transcript on demand
 
-`spawn_status` reads the retained transcript by agent ID and supports
+`spawn_status` reads a run's transcript by agent ID and supports
 line-oriented paging (like reading code) for large results:
 
 - `spawn_status(agent_id, limit=200)` — first 200 lines
@@ -176,5 +176,16 @@ line-oriented paging (like reading code) for large results:
 
 A paged/filtered response is prefixed with a continuation header
 (`showing lines X-Y of N | more available — call again with offset=Y`). With no
-paging args it returns the full transcript. You can also point the generic
-`read` / `grep` tools straight at the `result_path` from the completion event.
+paging args it returns the full transcript of a completed run. You can also
+point the generic `read` / `grep` tools straight at the `result_path` from the
+completion event.
+
+While the run is still going, the same call returns its live status and the
+redacted partial transcript streamed so far, under a
+`[RUNNING · <elapsed>s · <N> turns · last tool: <X>]` header. A run still
+parked on the spawn-approval prompt has launched no process, so its header
+leads with `AWAITING-APPROVAL` instead of `RUNNING` and the body says to
+approve it in the dashboard (Approvals) to start it. The partial view grows
+as the run streams and, past the manager's bound, is truncated from the
+front, so line offsets can shift between polls: `offset`/`limit` paging is
+best-effort until completion. Completed-run output is unchanged.

@@ -52,6 +52,7 @@ from kiro_crew.config.loader import (
     tailnet_effective_allowed_logins,
     tailnet_identity_unknown,
 )
+from kiro_crew.crewmate_prune_migration import prune_synced_crewmates
 from kiro_crew.dashboard import (
     cautious_boot,
     channel_slots,
@@ -143,6 +144,7 @@ from kiro_crew.dashboard.origin import (
     check_origin,
     dashboard_socket_path,
     frame_ancestors_value,
+    is_proxied_request,
     mark_audit_claimed,
     resolve_dashboard_host,
     should_canonicalize_host,
@@ -543,6 +545,7 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         # and the handler's own internal_auth re-assert then refuses it -- the
         # tool is unreachable in production while handler-level tests still pass.
         "/api/session-control/create",
+        "/api/session-control/fork",
         "/api/session-control/stop",
         "/api/session-control/close",
         "/api/session-control/send",
@@ -563,6 +566,54 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
 #: RETURNS its 401/403 and audits each itself), but a barrier that raises one is
 #: the same class of event as a raised 403, so it is covered by position too.
 _PRE_AUDIT_DENY_STATUSES = frozenset({401, 403})
+
+
+#: Suffix appended to an audited identity that reached the gateway THROUGH a
+#: proxy rather than from the client itself. ``<name>_via_proxy`` means a
+#: forwarder presented it.
+#:
+#: The converse does NOT read across the whole SEL. A plain name means "made
+#: directly" only on the records :func:`audit_actor` reaches: the ok/error rows
+#: of both servers' ``sel_audit_middleware``, and the raised-refusal rows that
+#: go through :func:`_audit_denied`. ``token_auth`` writes its own returned
+#: 401/403 records with its own ``caller`` (``user_id``, ``app_name``,
+#: ``"unattributable"``, ``peer.login``, ...) and never calls this helper, so a
+#: forwarded request refused there is filed under a plain name. Routing those
+#: sites through here would edit a module this change does not touch.
+_VIA_PROXY_SUFFIX = "_via_proxy"
+
+
+def audit_actor(request: web.Request, caller: str) -> str:
+    """The identity to file this request's audit record under.
+
+    ``caller`` is the label the middleware was built with (``dashboard_user``
+    for the full dashboard, ``mcp_tool`` for the headless API server), or an
+    identity a deny site already derived from the request.
+
+    A FORWARDED request is filed under a DIFFERENT name. The gateway binds
+    loopback, so remote access arrives through a same-host forwarder (a tunnel,
+    a sidecar, a reverse proxy) which presents the credential it was given: with
+    the owner's cookie that is indistinguishable from the owner sitting at the
+    machine, and every such request was recorded as plain ``dashboard_user``.
+    That is the one fact an operator reading the log afterwards most needs and
+    could not get -- whether an action was taken by the person or arrived over a
+    forwarding path on their behalf.
+
+    The signal is :func:`origin.is_proxied_request`: any ``Forwarded`` /
+    ``X-Forwarded-*`` / ``X-Real-IP`` header. It is the predicate the rest of
+    this module already trusts for "``request.remote`` is not the client", and
+    it over-warns rather than under-warns (a client that sends a forwarding
+    header with no proxy in the path is reported as forwarded). For an audit
+    label, over-warning is the safe direction: it never files a forwarded action
+    as the person's own.
+
+    Its known limit is the same one :func:`origin.is_direct_local_request`
+    documents: a forwarder that strips every forwarding header is invisible
+    here. This makes the ordinary product paths distinguishable, which is what
+    the log could not do at all before; it is not a boundary against a forwarder
+    that is deliberately hiding.
+    """
+    return f"{caller}{_VIA_PROXY_SUFFIX}" if is_proxied_request(request) else caller
 
 
 async def _audit_denied(caller: str, request: web.Request, error: str) -> None:
@@ -596,12 +647,18 @@ async def _audit_denied(caller: str, request: web.Request, error: str) -> None:
     a second time. The claim is set unconditionally, before the write: a write
     that failed here fails identically in the boundary, so retrying in the
     boundary buys nothing.
+
+    ``caller`` goes through :func:`audit_actor`, so a refusal that arrived
+    through a forwarder is filed under ``<caller>_via_proxy``. Applied here, in
+    the one helper every barrier's deny path already calls, rather than at each
+    of the three call sites -- a new barrier gets it by using the helper.
     """
     mark_audit_claimed(request)
+    actor = audit_actor(request, caller)
 
     def _write() -> None:
         sel().log_api_access(
-            caller=caller,
+            caller=actor,
             operation=f"{request.method} {request.path}",
             outcome="denied",
             resources=request.path,
@@ -1686,13 +1743,15 @@ def _deferred(module_name: str, handler_name: str) -> Callable:
     for a feature-flagged subsystem the import precedes its own gate. Route
     registration at boot is fine -- only the import moves to first request.
 
-    Both current callers wanted exactly this and differed only in which module they
+    Both original callers wanted exactly this and differed only in which module they
     named, so the module is a parameter rather than a second copy of the closure:
 
     * ``session_control`` -- feature-flagged (``agent.session_control``), with the
       enabled check inside the handler.
     * ``agent_panel`` -- the crew webview store, whose MCP server ships gated off
       (``opt_in``) and which most installs never publish to.
+    * ``mcp_apps`` -- feature-flagged (``mcp_gateway.apps_enabled``); its module
+      scope imports the gateway backend, which must never load on dashboard boot.
 
     ``module_name`` is a submodule of ``kiro_crew.dashboard.handlers``, not a
     dotted path, so this cannot be pointed at an arbitrary module.
@@ -1733,7 +1792,8 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/spawn/lost", handlers.api_spawn_lost)
     app.router.add_post("/api/spawn/mark-collected", handlers.api_spawn_mark_collected)
     # MCP Apps (SEP-1865): embedded app iframe -> gateway tool callback.
-    app.router.add_post("/api/mcp-apps/call", handlers.api_mcp_apps_call)
+    app.router.add_post("/api/mcp-apps/call", _deferred("mcp_apps", "api_mcp_apps_call"))
+    app.router.add_post("/api/mcp-apps/message", _deferred("mcp_apps", "api_mcp_apps_message"))
     app.router.add_get("/api/spawn", handlers.api_spawn_list)
     app.router.add_post("/api/spawn/stop-all", handlers.api_spawn_stop_all)
     # Fairness: the resume-hold, lanes and adaptive routes
@@ -1816,6 +1876,9 @@ def _register_mcp_routes(app: web.Application) -> None:
         "/api/session-control/create", _deferred("session_control", "api_session_control_create")
     )
     app.router.add_post(
+        "/api/session-control/fork", _deferred("session_control", "api_session_control_fork")
+    )
+    app.router.add_post(
         "/api/session-control/stop", _deferred("session_control", "api_session_control_stop")
     )
     app.router.add_post(
@@ -1840,6 +1903,16 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/browser/engine", handlers.api_browser_engine_install)
     app.router.add_get("/api/browser/view", handlers.api_browser_view_get)
     app.router.add_post("/api/browser/view/start", handlers.api_browser_view_start)
+    # Same-origin relay for the CLI browser view: the panel frames this path
+    # instead of the raw loopback URL, so the live view is reachable wherever
+    # the dashboard is (SSH forward, tunnel) with no second forwarded port.
+    # HTTP and WebSocket both. Authenticated by the per-instance capability
+    # token embedded in the path (NOT the session cookie: the panel frames it
+    # in an opaque-origin sandbox that sends none) — the prefix is on
+    # token_auth's bypass list and the handler enforces the token itself. See
+    # handlers/browser_view_relay.py for the rewrites and the full posture.
+    app.router.add_get("/browser-view", handlers.api_browser_view_relay)
+    app.router.add_get("/browser-view/{tail:.*}", handlers.api_browser_view_relay)
     # The Browser panel's address bar on the non-native transport: opens an
     # owner-typed URL in the gateway host's Playwright CLI browser and shows it
     # through the view above. Owner-only (cookie/token) and deliberately NOT on
@@ -3271,6 +3344,210 @@ def _register_workflow_lifecycle(app: web.Application, state: DashboardState) ->
     app.on_cleanup.append(_workflow_shutdown)
 
 
+# How long a mutating request waits for the startup crewmate prune before it is
+# answered 503. The pass is marker-gated and runs immediately after the bind, so
+# on every boot but the first after the upgrade the wait is the few milliseconds
+# the pass takes to find the marker; on that first boot it is one config read
+# and one scan of the session metadata lines.
+_CREWMATE_PRUNE_GATE_TIMEOUT_S = 60.0
+_CREWMATE_PRUNE_GATE_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+#: Held whatever the method. A read of the member roster is not a pure read:
+#: ``GET /api/members`` calls ``MemberEventLogService.ensure`` for every row,
+#: which folds a member's pre-log ``activity.jsonl`` into the event log and
+#: RETIRES the file under another name, and ``reconcile_member_config`` appends
+#: to the same log. The prune reads both places (``_activity_names_member``);
+#: a fold running beside it can move a crewmate's only activity record out of
+#: the file after the prune read the log and before it read the file, and the
+#: crewmate reads as never chatted. Every ``/api/members`` route reaches the
+#: same logs, so the whole prefix waits.
+_CREWMATE_PRUNE_GATE_HELD_PREFIXES = ("/api/members",)
+
+
+def _register_crewmate_prune_gate(app: web.Application, state: DashboardState) -> None:
+    """Arm the crewmate-prune barrier before bind; the pass itself runs after.
+
+    The startup prune (``crewmate_prune_migration``) decides from chat history
+    and the DM bindings which sync-generated crewmates were never used, then
+    deletes their rows. Every writer that can bind an agent to a session while
+    the gateway is up reaches it through a mutating request -- the chat send,
+    slot create, slot agent switch, member thread, channel and import routes
+    under ``/api/``, and the OpenAI-compatible ``POST /v1/chat/completions`` --
+    so ONE middleware holds every non-safe-method request until the pass
+    settles, with no path list to keep in step with the route table. The
+    member roster is the one READ that writes evidence -- its ``ensure`` folds
+    and retires a member's legacy activity file and its reconcile appends to
+    the member log, both of which the prune reads -- so every request under
+    ``/api/members`` is held whatever its method
+    (``_CREWMATE_PRUNE_GATE_HELD_PREFIXES``). The writers that do not come
+    through HTTP wait in ``await_crewmate_prune_settled`` instead.
+
+    Armed HERE, before ``_start_site`` binds the listener, so no request can
+    pass between the bind and the pass. The pass itself is kicked as a tracked
+    background task right after the bind (``_kick_crewmate_prune``) and sets
+    ``crewmate_prune_settled`` in its ``finally``, so the hold is the pass
+    alone and readiness is not gated by it. Other reads are never held, and
+    the fast path is one ``is_set()`` read, which is what every request pays
+    once the pass has settled. A held request that outlives the budget is
+    answered 503 and writes nothing; it does not abandon the pass.
+    """
+    state.crewmate_prune_settled.clear()
+
+    @web.middleware
+    async def _crewmate_prune_gate(request: web.Request, handler: Any) -> web.StreamResponse:
+        if not state.crewmate_prune_settled.is_set() and (
+            request.method not in _CREWMATE_PRUNE_GATE_SAFE_METHODS
+            or _crewmate_prune_gate_holds_path(request.path)
+        ):
+            try:
+                await asyncio.wait_for(
+                    state.crewmate_prune_settled.wait(), timeout=_CREWMATE_PRUNE_GATE_TIMEOUT_S
+                )
+            except asyncio.TimeoutError:
+                return web.json_response(
+                    {
+                        "error": "Crewmates are being tidied; retry shortly.",
+                        "code": "prune_in_progress",
+                    },
+                    status=503,
+                )
+        return await handler(request)
+
+    app.middlewares.append(_crewmate_prune_gate)
+
+
+def _crewmate_prune_gate_holds_path(path: str) -> bool:
+    """Whether *path* is one the gate holds whatever the request's method."""
+    return any(
+        path == prefix or path.startswith(prefix + "/")
+        for prefix in _CREWMATE_PRUNE_GATE_HELD_PREFIXES
+    )
+
+
+def _kick_crewmate_prune(state: DashboardState) -> None:
+    """Run the one-time crewmate prune as a tracked background task, post-bind.
+
+    ``prune_synced_crewmates`` scans the first line of every session file, so
+    its cost scales with the user's history and it must not sit between the
+    bind and ``KIROCREW_READY`` (``no-new-work-on-gateway-boot-path``, item 3).
+    Same shape as ``_kick_knowledge_orphan_reclaim``: kicked after ``_start_site``
+    returns, run on a worker thread (config lock and file reads are IO). The
+    gate armed before the bind holds every mutating request until the event is
+    set, which happens in ``finally`` whatever the pass does. Nothing on the
+    readiness path waits for it -- not even the slot restores: a row the pass
+    removes has, by its own evidence rule, no DM binding and no session whose
+    metadata names it, so no restore can rebuild a slot for it. The writers
+    that do NOT come through HTTP -- channel agent resume, cron dispatch, the
+    subagent pump -- start only after ``await_crewmate_prune_settled`` returns
+    (``GatewayOrchestrator.run`` after the memory barrier, past
+    ``KIROCREW_READY``; the standalone dashboard before its inline channel
+    resume), so none of them can bind a crewmate while the pass is judging it.
+    The one startup step that DELETES a transcript, the channel transcript
+    migration, merges but keeps its copies while the event is clear and
+    removes them from ``_kick_deferred_transcript_removal`` once it is set, so
+    the pass reads every first line the boot started with; a transcript that
+    still vanishes under the pass voids it (nothing removed).
+    The pass reads ``crewmate_prune_abandon`` before each candidate and again
+    inside the config lock before each delete; that helper sets it when the
+    pass outlives its budget, and the pass then finishes without deleting.
+    The pass itself takes a cross-process lock beside its marker for its whole
+    length, so a second gateway on the same data home cannot run its own pass
+    beside this one -- its pass waits on that lock (its writers held by its
+    own barrier meanwhile) and then finds the marker. On every boot but the
+    first after the upgrade the pass is that lock and one marker stat.
+    """
+
+    async def _run() -> None:
+        try:
+            prune = await asyncio.to_thread(
+                prune_synced_crewmates,
+                state.conversation_log,
+                abandoned=state.crewmate_prune_abandon.is_set,
+            )
+            if prune.removed:
+                logger.info(
+                    "removed %d unused auto-generated crewmates: %s",
+                    len(prune.removed),
+                    ", ".join(prune.removed),
+                )
+        except Exception:  # noqa: BLE001 -- the pass never raises for unreadable history
+            logger.warning("crewmate prune migration failed", exc_info=True)
+        finally:
+            state.crewmate_prune_settled.set()
+
+    task = asyncio.create_task(_run())
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+
+
+async def await_crewmate_prune_settled(state: DashboardState, *, before: str) -> None:
+    """Wait for the startup crewmate prune before starting a session writer.
+
+    Every writer that binds an agent to a session without an HTTP request --
+    the channel agent resume, cron dispatch, the subagent pump -- calls this
+    first, so the pass's history snapshot cannot be overtaken by a binding it
+    never saw. Returns only once ``crewmate_prune_settled`` is set, which the
+    pass does in ``finally`` after it has RETURNED -- so no writer ever runs
+    beside a pass that can still delete. The budget bounds how long the pass
+    may keep deleting, not how long the writer waits: when the pass outlives
+    it, this sets ``crewmate_prune_abandon`` -- the pass reads it before each
+    candidate and inside the config lock before each delete, keeps whatever it
+    has not judged, writes its marker and returns -- and then waits for the
+    event. The pass always returns: its file opens are non-blocking and its
+    lock acquires are bounded (``platform_compat.file_lock`` raises rather
+    than waits on a stuck holder), and either outcome ends in ``finally``.
+    ``before`` names the writer for the log line.
+    """
+    try:
+        await asyncio.wait_for(
+            state.crewmate_prune_settled.wait(), timeout=_CREWMATE_PRUNE_GATE_TIMEOUT_S
+        )
+        return
+    except asyncio.TimeoutError:
+        state.crewmate_prune_abandon.set()
+        logger.warning(
+            "crewmate prune has not settled in %.0fs; it will keep its unjudged "
+            "crewmates, and %s starts once it has returned",
+            _CREWMATE_PRUNE_GATE_TIMEOUT_S,
+            before,
+        )
+    await state.crewmate_prune_settled.wait()
+
+
+def _kick_deferred_transcript_removal(state: DashboardState, claimed: frozenset[str]) -> None:
+    """Remove the channel transcript copies the startup merge left for the prune.
+
+    ``start_dashboard`` merges every orphaned dashboard copy into its channel
+    transcript before the session restores read it, but while the crewmate
+    prune has not settled it passes ``remove=False``: the copy's first line is
+    the only record of the agent that dashboard surface ran as, and the pass
+    reads exactly that line to decide which crewmates were used. Deleting the
+    copy under the pass would leave a used crewmate with no evidence and get
+    its row removed. So the delete waits here, off the readiness path, for
+    the pass to RETURN (``crewmate_prune_settled`` is set in its ``finally``),
+    then re-runs the migration with removal on; the re-merge is byte-identical
+    and only the deletes are new. Best-effort like the startup call: a failure
+    leaves the copies for the next start, which merges and removes them again.
+    """
+
+    async def _run() -> None:
+        await state.crewmate_prune_settled.wait()
+        try:
+            removed = await asyncio.to_thread(
+                migrate_channel_transcripts, dashboard_slots=claimed, remove=True
+            )
+            if removed:
+                logger.info(
+                    "Removed %d leftover channel transcript copies after the crewmate prune",
+                    removed,
+                )
+        except Exception:  # noqa: BLE001 -- the copies stay for the next start
+            logger.warning("deferred channel transcript removal failed", exc_info=True)
+
+    task = asyncio.create_task(_run())
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+
+
 def _kick_workflow_initialization(state: DashboardState) -> None:
     """Called only after listener bind and successful credential publication."""
     if state.workflow_startup_task is not None or state.workflow_startup_stopping:
@@ -3548,6 +3825,10 @@ def _register_browser_view_cleanup(app: web.Application, state: DashboardState) 
         task.add_done_callback(state._background_tasks.discard)
 
     async def _browser_view_shutdown(app_: web.Application) -> None:
+        try:
+            await handlers.close_relay_client(app_)
+        except Exception:  # noqa: BLE001 - shutdown must not raise
+            logger.debug("browser view relay client close failed during shutdown", exc_info=True)
         try:
             await asyncio.to_thread(browser_cli_launcher.close_all)
         except Exception:  # noqa: BLE001 - shutdown must not raise
@@ -4040,12 +4321,15 @@ async def _stt_startup_prewarm() -> None:
         # a real session) report it against a user who is actually asking.
         logger.debug("Boot prewarm of the speech model did not complete: %s", result.detail)
         return
+    # Off the loop: `capabilities` reads the build (a native call) behind its
+    # preflight gate, which can spawn the probe child if the wheel changed.
+    backend = (await asyncio.to_thread(engine.WhisperEngine.capabilities)).backend
     logger.info(
         "Speech model %s warmed in the background %.1fs after boot (backend=%s); "
         "the first dictation skips the cold start",
         model.name,
         time.monotonic() - started,
-        engine.WhisperEngine.capabilities().backend,
+        backend,
     )
 
 
@@ -4183,6 +4467,99 @@ def _register_config_watch(
         except Exception:
             logger.warning("background-model rebuild failed", exc_info=True)
 
+    default_model_failure_notified = False
+
+    async def _apply_default_model(change: ConfigChange) -> None:
+        # The default (chat) model is baked into the main ``kirocrew`` spec at
+        # agent-build time via ``_refresh_dynamic_fields`` (which reads
+        # config.json ``agent.model``). A dashboard/CLI change to that key only
+        # rewrites config.json, so without this rebuild the installed
+        # ``~/.kiro/agents/kirocrew.json`` keeps its previous ``model`` and
+        # kiro-cli's ``--agent`` startup loads the STALE pin — a newly created
+        # session then runs the old model even though the picker shows the new
+        # default (and "auto" can never clear a prior concrete pin). Mirrors
+        # ``_apply_background_model``: same authoritative rebuild, keyed on the
+        # chat-model config key instead of the background role key.
+        if not change.touched("agent.model"):
+            return
+        nonlocal default_model_failure_notified
+        try:
+            from kiro_crew.agent import rebuild_agent_config_reporting
+
+            # ``rebuild_agent_config_reporting`` returns ``wrote=False`` — WITHOUT
+            # writing — exactly when the shared-home guard refuses to rewrite this
+            # instance's spec. That is a no-op, not a success: the installed
+            # ``kirocrew.json`` keeps its old ``model`` pin, so treating it as
+            # applied would clear the failure state, broadcast a refresh, and log
+            # "rebuilt" while new sessions still run the previous model. Route a
+            # refusal into the failure branch below so it notifies once and defers
+            # for the watcher's retry, the same as any other unwritten spec.
+            _spec_path, wrote = await asyncio.to_thread(rebuild_agent_config_reporting)
+            if not wrote:
+                raise RuntimeError(
+                    "agent spec rebuild was refused (shared agent home); "
+                    "config saved but kirocrew.json still pins the previous model"
+                )
+            # Close the ordering window against SessionManager's own applier.
+            # It subscribes to ``agent.model`` FIRST (its subscription predates
+            # this one), so on the same change it runs ``refresh_defaults``
+            # before this rebuild — draining the warm pool and re-filling it
+            # via ``start_pool(blocking=False)`` from the spec as it stood
+            # BEFORE the rebuild. A warm provider spawned in that window still
+            # pins the previous model until consumed or TTL-evicted. Now that
+            # the spec on disk is correct, re-run the same idempotent refresh so
+            # any provider minted in the race is discarded and re-spawned from
+            # the rebuilt spec. Best-effort and re-entrant: it never touches a
+            # live session, and a manager that is absent (tests) simply has no
+            # pool to reconcile.
+            sessions = getattr(state, "sessions", None)
+            if sessions is not None:
+                try:
+                    await sessions.refresh_defaults(cfg=change.new)
+                except Exception:
+                    logger.warning(
+                        "default-model warm-pool reconcile after rebuild failed",
+                        exc_info=True,
+                    )
+            # The config value and generated agent spec now agree. Tell every
+            # dashboard window to refetch both the config-backed picker and the
+            # effective-model endpoints only after that rebuild has completed;
+            # otherwise an eager refetch can cache the old spec indefinitely.
+            recovered = default_model_failure_notified
+            default_model_failure_notified = False
+            state.push_refresh("agents")
+            if recovered:
+                try:
+                    state.notify(
+                        "agent",
+                        "Default model applied",
+                        "The saved default model is now active. New sessions will use it.",
+                    )
+                except Exception:
+                    logger.debug("default-model recovery notification failed", exc_info=True)
+            logger.info("agent.model changed -- kirocrew agent spec rebuilt")
+        except Exception:
+            logger.warning("default-model rebuild failed", exc_info=True)
+            # The config write is already durable, but the generated spec is
+            # still the one new sessions actually consume. Surface that split
+            # to the operator instead of silently reporting the saved setting
+            # as active. Re-raise so ConfigWatch records this subscriber as
+            # stale and retries it on later ticks; a successful retry emits the
+            # refresh above and brings every open dashboard back into sync.
+            if not default_model_failure_notified:
+                default_model_failure_notified = True
+                try:
+                    state.notify(
+                        "agent",
+                        "Default model could not be applied",
+                        "The setting was saved but new sessions will keep using the "
+                        "previous model. Kiro Crew retries automatically; "
+                        "check the gateway logs if this persists.",
+                    )
+                except Exception:
+                    logger.debug("default-model failure notification failed", exc_info=True)
+            raise
+
     # The workflow-run ceiling and the channel caps are not registered here:
     # WorkflowService and ChannelManager bind their own setters in their
     # constructors (``live.bind``), the rule for an applier a long-lived object owns.
@@ -4193,6 +4570,7 @@ def _register_config_watch(
             callback=_apply_background_model,
             name="agent.role_models.background",
         ),
+        live.subscribe("agent.model", callback=_apply_default_model, name="agent.model"),
         live.subscribe(
             "agent.log_level", callback=apply_log_level_from_config, name="agent.log_level"
         ),
@@ -4630,6 +5008,21 @@ async def start_dashboard(
         assume_ready=assume_kiro_ready,
     )
     state.kiro_prerequisite_service = app["kiro_prerequisite_service"]
+    # Seed the retirement baseline with the account on disk RIGHT NOW, before
+    # anything can spawn a kiro-backed child. Every child postdates this read,
+    # so the once-per-lifetime unset-baseline boot sweep -- which on a live
+    # gateway can never satisfy its completion precondition and degenerates
+    # into a retire/respawn loop -- is unnecessary: a real account change after
+    # this still compares unequal and sweeps. A store that cannot be
+    # fingerprinted refuses the seed and keeps the fail-safe sweep.
+    await app["kiro_prerequisite_service"].seed_sessions_baseline()
+    # Stamp every kiro-backed spawn with the account the store holds at that
+    # moment: the turn gate compares those stamps against its fresh read, so a
+    # child from an account round trip NO read ever observed -- the one case
+    # the seeded baseline and the interim latch are both blind to -- is still
+    # retired before reuse (see flag_identity_stamp_mismatches). Unwired (the
+    # CLI, tests), spawns stay unstamped and keep the pre-stamping behavior.
+    state.sessions.spawn_identity_reader = app["kiro_prerequisite_service"].read_spawn_identity
     # Probe Kiro readiness during boot rather than on the dashboard's first
     # status request: the cold probe spawns sandboxed CLI subprocesses and can
     # take seconds, which is what made the first-run setup chrome visible to
@@ -5009,10 +5402,14 @@ async def start_dashboard(
                 mark_audit_claimed(request)
                 from kiro_crew.sel import sel
 
+                # Every mutating /api/ call was filed under the flat
+                # ``dashboard_user``, so an action a forwarder relayed on the
+                # owner's behalf read exactly like the owner performing it.
+                actor = audit_actor(request, "dashboard_user")
                 try:
                     resp = await handler(request)  # type: ignore[operator]
                     sel().log_api_access(
-                        caller="dashboard_user",
+                        caller=actor,
                         operation=f"{request.method} {request.path}",
                         outcome="ok" if resp.status < 400 else "error",
                         resources=request.path,
@@ -5020,7 +5417,7 @@ async def start_dashboard(
                     return resp  # type: ignore[return-value]
                 except Exception as exc:
                     sel().log_api_access(
-                        caller="dashboard_user",
+                        caller=actor,
                         operation=f"{request.method} {request.path}",
                         outcome="error",
                         resources=request.path,
@@ -5269,6 +5666,7 @@ async def start_dashboard(
         _register_browser_view_cleanup(app, state)
         _register_connections_warm_lifecycle(app, state)
         _register_workflow_lifecycle(app, state)
+        _register_crewmate_prune_gate(app, state)
 
         # Unix-socket cleanup hook — registered before runner.setup freezes the
         # signal lists; the path itself only becomes known after the site starts
@@ -5304,6 +5702,13 @@ async def start_dashboard(
     # The listener is up -- keep it up. One failed accept() on Windows would
     # otherwise close it for the life of the process (see listener_guard).
     _arm_listener_guard(state, runner, site)
+    # One-time prune of the crewmates an enrol-on-mount agent sync generated
+    # from the user's own specs (see crewmate_prune_migration). Kicked here,
+    # right after the bind, as a tracked background task -- its cost scales
+    # with the session count, so it stays off the boot path and nothing here
+    # awaits it -- while the gate armed before the bind holds every mutating
+    # request until it settles.
+    _kick_crewmate_prune(state)
     # (No _export_bound_port republish here: the reservation above already
     # exported this same socket's name before the spawn pass — the one
     # authoritative write on this path. The headless entrypoint, which binds
@@ -5792,9 +6197,20 @@ async def start_dashboard(
         # dashboard session that merely happens to be named like a channel
         # stem is never mistaken for an orphan of it.
         _claimed = await asyncio.to_thread(_claimed_dashboard_slots, state)
-        merged = await asyncio.to_thread(migrate_channel_transcripts, dashboard_slots=_claimed)
+        # The crewmate prune reads the first line of every transcript, and an
+        # orphan is the only file that recorded the agent of the dashboard
+        # surface it came from. While the prune has not settled the merge is
+        # written but the copy stays, so the prune still finds that evidence;
+        # a follow-up removes the copies once the pass has returned. Nothing
+        # here waits for the pass: the readiness path stays as it was.
+        _remove = state.crewmate_prune_settled.is_set()
+        merged = await asyncio.to_thread(
+            migrate_channel_transcripts, dashboard_slots=_claimed, remove=_remove
+        )
         if merged:
             logger.info("Merged %d leftover channel transcript copies", merged)
+        if not _remove:
+            _kick_deferred_transcript_removal(state, _claimed)
     except Exception:
         # A failed migration leaves the orphan in place rather than losing
         # messages, so starting up without it is safe.
@@ -5867,8 +6283,13 @@ async def start_dashboard(
             )
 
     if defer_channel_agent_resume:
+        # The gateway resumes them after its memory barrier, behind
+        # ``await_crewmate_prune_settled`` (GatewayOrchestrator.run).
         state.resume_channel_agents = _resume_channel_agents
     else:
+        # A resumed channel agent binds its crewmate to a session; the prune
+        # must have judged every candidate before that binding can appear.
+        await await_crewmate_prune_settled(state, before="channel agent resume")
         _resume_channel_agents()
 
     # ── AEA Tunnel ───────────────────────────────────────────────────────────
@@ -6010,6 +6431,21 @@ async def start_api_server(
         assume_ready=assume_kiro_ready,
     )
     state.kiro_prerequisite_service = app["kiro_prerequisite_service"]
+    # Seed the retirement baseline with the account on disk RIGHT NOW, before
+    # anything can spawn a kiro-backed child. Every child postdates this read,
+    # so the once-per-lifetime unset-baseline boot sweep -- which on a live
+    # gateway can never satisfy its completion precondition and degenerates
+    # into a retire/respawn loop -- is unnecessary: a real account change after
+    # this still compares unequal and sweeps. A store that cannot be
+    # fingerprinted refuses the seed and keeps the fail-safe sweep.
+    await app["kiro_prerequisite_service"].seed_sessions_baseline()
+    # Stamp every kiro-backed spawn with the account the store holds at that
+    # moment: the turn gate compares those stamps against its fresh read, so a
+    # child from an account round trip NO read ever observed -- the one case
+    # the seeded baseline and the interim latch are both blind to -- is still
+    # retired before reuse (see flag_identity_stamp_mismatches). Unwired (the
+    # CLI, tests), spawns stay unstamped and keep the pre-stamping behavior.
+    state.sessions.spawn_identity_reader = app["kiro_prerequisite_service"].read_spawn_identity
     # Probe Kiro readiness during boot rather than on the dashboard's first
     # status request: the cold probe spawns sandboxed CLI subprocesses and can
     # take seconds, which is what made the first-run setup chrome visible to
@@ -6099,10 +6535,13 @@ async def start_api_server(
             mark_audit_claimed(request)
             # ``sel`` is imported at module scope (top of file); no in-function
             # import needed (host/csrf middleware below call it unqualified too).
+            # Same forwarder distinction as the dashboard chain's: this server is
+            # reached the same way, so its records must be readable the same way.
+            actor = audit_actor(request, "mcp_tool")
             try:
                 resp = await handler(request)  # type: ignore[operator]
                 sel().log_api_access(
-                    caller="mcp_tool",
+                    caller=actor,
                     operation=f"{request.method} {request.path}",
                     outcome="ok" if resp.status < 400 else "error",
                     resources=request.path,
@@ -6110,7 +6549,7 @@ async def start_api_server(
                 return resp  # type: ignore[return-value]
             except Exception as exc:
                 sel().log_api_access(
-                    caller="mcp_tool",
+                    caller=actor,
                     operation=f"{request.method} {request.path}",
                     outcome="error",
                     resources=request.path,

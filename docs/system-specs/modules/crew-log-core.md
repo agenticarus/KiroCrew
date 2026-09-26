@@ -98,7 +98,7 @@ The families, from the RFC:
 | knowledge | `crew/finding`, `crew/summary`, `crew/note-*`, `crew/link` | the segment covered |
 | memory | `memory/bound\|copied\|forgotten\|restored` | -- |
 
-Two of these families carry a contract with REQUIRED fields. **Required here is a contract on the writer, and what enforces it is a declaration rather than a branch:** a per-type `data` requirement belongs to the type registry, next to that type's own `data` shape, not to `check_ownership`, which answers who may write a type rather than what the type must contain. `kiro_crew.crew_log.entry_types` now declares and enforces the session kind only; these two crew-kind contracts remain held by review against this section until that module's `ENTRY_TYPES` registry gains crew declarations.
+Two of these families carry a contract with REQUIRED fields. **Required here is a contract on the writer, and what enforces it is a declaration rather than a branch:** a per-type `data` requirement belongs to the type registry, next to that type's own `data` shape, not to `check_ownership`, which answers who may write a type rather than what the type must contain. `kiro_crew.crew_log.entry_types` declares both kinds: `SESSION_ENTRY_TYPES` for the session families and `CREW_ENTRY_TYPES` for these two contracts, keyed into `ENTRY_TYPES` by kind, so `validate_data` answers for the unit the entry is being written into and a crew's `data` is checked on the same append path a session's is. What the registry cannot state stays a writer's obligation: a CONDITIONAL requirement has no spelling in a declaration, so `target`'s exclusive `slot`-or-`name` pairing and `crew/report`'s required `ref` are enforced where the entry is built, and a field one legitimate form omits is declared optional rather than refusing a valid entry.
 
 **`crew/dispatch`** -- a parent asking for an item to be worked.
 
@@ -126,15 +126,21 @@ Two of these families carry a contract with REQUIRED fields. **Required here is 
 | Field | Required | Meaning |
 |---|---|---|
 | `data.item` | yes | The item being reported on. |
-| `data.status` | yes | One of `done`, `blocked`, `failed`, `progress`. |
+| `data.status` | yes | One of `done`, `blocked`, `failed`, `progress`, `question`. The last is the work board's, and the enum is derived from that writer's own tuple so a status it gains cannot become a refused entry; [crew-types.md](../../reference/crew-log/crew-types.md#crewreport) states why `question` is not folded into `blocked`. |
 | `data.credits` | no | Credits the child spent. Absent is not zero. |
 | `data.summary` | no | One sentence. |
 | `ref` | yes | A segment of the child's crew log: the evidence. |
-| `thread` | when replying | The dispatch's `seq`. |
+| `thread` | when the anchor resolves | The dispatch's `seq`. |
 
 `ref` is required for the same reason `target` is. A report is a CLAIM about work that happened somewhere else, and `board` and `budget` fold status and credits straight off it without opening the child's crew log; the `ref` is what makes that fold checkable rather than trusted. A report with no `ref` is an unfalsifiable claim, permanently, since nothing later can attach the evidence to a line that is already written.
 
 `thread` is the dispatch's `seq` when the report answers one, which is what makes a dispatch and its replies one conversation inside the parent's file. A report volunteered with no dispatch behind it carries no `thread`.
+
+Those two are different facts wearing one shape, and the writer resolves the anchor rather than being told which case it is. A report whose anchor does not resolve is written **unthreaded**, not dropped. The reason is that the dispatch append is best effort, so the anchor can be missing two ways that are not equally recoverable: a transient read failure leaves the dispatch on disk and the item's next report threads normally, while a dispatch whose own append failed leaves no dispatch entry at all -- and refusing the reply then refuses every later report for that item too, so the log reads for good as though the item was never dispatched. An absent history is the worse record: it is unbounded in time and invisible, while an unthreaded report states that the work happened and is only missing its link.
+
+That choice has a real cost and this is where it is written down: an unthreaded report is indistinguishable from a volunteered one, so the ambiguity is one field rather than one item's whole history. The writer logs a warning when it happens, which is what lets a reader tell the two apart.
+
+The refusal that remains is the evidence one: a report with no citable unit is not written at all, because a claim nothing can check is not a record.
 
 Both of these are one type each, not one per writer. The child's identity is `src`, so two children reporting on one item write the same `type` into one file and are told apart by who signed them.
 
@@ -338,14 +344,42 @@ same slot was writing before. Same citation shape as `parent`, written once at c
 rewritten, absent rather than empty when there is nothing to name -- the slot's first crew log, a
 predecessor the gateway could not name, and one whose own header does not name this slot are all
 "nothing to follow". No `slot` is repeated inside it,
-because it is the slot in `data.slot`. The id comes from the persisted slot-to-session mapping, read
-without pruning before allocation publishes the successor over it. One limit is recorded rather than
-handled: an allocation whose replay is still pending does not publish its fresh id over the mapping,
-so for that window a mapping read can
-name the crew log BEFORE the newest one -- two successive crew logs then cite one predecessor
-and the crew log between them is cited by nobody, which is a chain gap tracked with the rest of the
-supersede work in #12148. A successful resume answers the same id and the emitter writes no edge,
+because it is the slot in `data.slot`. The id is resolved in three tiers. The store this slot
+last handed to a `session/opened`, recorded on the slot as that entry's edge is spent, is
+first: the create is queued to a writer thread, so it is the only source that can name a crew
+log whose unit is not on disk yet. The slot's own newest unit IN THE STORE -- the unit no other
+unit of that slot cites as `previous` -- is next, and it is the durable one: the record above
+dies with its process, and this does not. It answers UNDECIDED when the units cannot be listed
+or read, or do not say which is newest, and no edge is written then -- but the entry does record
+`previous_undecided`, and an entry the read proves is the slot's first records `previous_none`,
+because neither meaning may rest on a key being ABSENT. A log that merely omits every
+predecessor key is one written before these keys existed, and its silence is equally "I am
+first" and "I could not tell": without the two fields the state a later fold must refuse on is
+byte-identical to the state it may pass over, and passing over it elects the log before it.
+The persisted
+slot-to-session mapping,
+read without pruning, is last, for a slot the store says has no unit at all -- which includes a
+store that is not at the name, the ordinary launch of a crew log switched off, and a slot whose
+units all predate this edge and so record no succession to read. It cannot be
+higher, and inside the replay-pending window it is not cited at all: an allocation whose
+replay is still
+pending holds the prior resumable id in the mapping on purpose, so that a restart can still
+resume it, and the mapping is then a generation
+behind -- two successive crew logs would cite one predecessor
+and the crew log between them would be cited by nobody, the one chain gap a reader cannot see.
+Whether that window is open is asked where a SESSION EXISTS to answer, as the edge is handed to
+an entry, and not where the id is read: the marker belongs to a live session, the read runs
+before this turn's session is allocated, and asked from there it answers "no replay owed" both
+when none is owed and when there is nobody to ask -- the second being a cold start, which is the
+restart this whole tier exists to survive. So a mapped id is carried provisional and becomes a
+recorded break at that point instead; what this process itself recorded is never provisional.
+A successful resume answers the same id and the emitter writes no edge,
 since a crew log cannot be its own predecessor.
+
+An empty answer from that mapping is a FINDING only when the store holds no unit of the slot at
+all. When it holds units this read could not rank, the mapping having nothing to give says nothing
+about the slot, so the entry records no predecessor key rather than stating it has none -- which
+would let a later fold pass over a log whose siblings sit uncited beside it.
 
 The edge is a citation and nothing else. Recording it opens no store for writing but this session's
 own, and no writer here appends to the crew log it names. It does READ that crew log's header, because
@@ -442,6 +476,10 @@ This layer claims no authorization, so it has none to deny: a check defaulting t
 A resume's belief that the previous writer is gone is not verifiable from the file, so it is not the only check. **Writes to a unit are owned, and the arbiter is the kernel.** The owner holds a non-blocking advisory lock on a `.lease` file beside the log, and a process that cannot take it is REFUSED with `already_owned` rather than made to wait: it appends nothing and repairs nothing, so the file keeps one writer's account of a turn instead of two interleaved ones. This is what stands between a resume in a second gateway and a turn that reads as completed-as-interrupted and then, further down, completed for real, with one tool call closed both `unknown` and `completed` -- a shape a fold cannot resolve and no later pass can undo.
 
 Ownership is taken LAZILY, on a handle's first write, and never by `open` itself, because `open` also serves readers: `iter_from`, `page` and `resolve` need no ownership, and making a reader contend with the writer would buy nothing. `open(repair=True)` claims it before the closers, and that is the same rule rather than an exception -- the closers are appends. `create` claims nothing: it publishes a header for a unit that has none, and two processes racing it are already settled by `already_exists` under the per-append lock.
+
+`append_if` adds a THIRD append outcome beside written and refused: **declined**, reported as `None`. It takes `max_tail_seq`, the seq the caller's decision was made against, and writes the entry only while the tail read under ownership is still at or below it. The outcome exists because a decision that governs append ORDER cannot be made outside the hold that assigns the order: another process's entry committed between a caller's decision and its own write lands first, and for a reader that takes the last word per field that ordering is the whole result. Comparing the caller's seq here is what proves nothing was committed in between. A decline appends nothing; it is NOT byte-identical, because the torn-tail repair above it is unconditional and a decline can leave that repair behind.
+
+A seq rather than a callback, and that choice is load-bearing. The comparison runs while the lease and the per-append lock are both held, so anything done there is a window in which every other process's append to the unit is refused `already_owned` -- and a peer that exhausts its own retry budget loses its entry for good, since this file has no compaction and nothing replays it. An int cannot parse the file or write to it, so no caller can turn that window into a long one. A caller whose decision needs the log's contents reads it BEFORE calling and passes the tail that read reached.
 
 The lock is REFCOUNTED PER PROCESS, keyed by the lease file's path. That is a correctness requirement rather than an optimization: a POSIX lock belongs to an open file description rather than to a process, so a second `open()` of the lease path inside one process contends exactly as another process would -- and one process legitimately holds several handles for one unit, since the emitter's cached handle and the handle a session claim opens overlap while the cache entry is replaced. So the first writer in a process takes the kernel lock, every later handle shares it, and the last handle to be dropped gives it up. The path is the key rather than `(kind, id)` because the data home is repointable and the kernel locks a file, not a name. Acquire and release both run under one module lock, for the same reason the count exists: two threads reaching for one unit must share a descriptor rather than race two of them and have one refuse the other.
 
@@ -666,6 +704,10 @@ here and the other is not.
 
 ## 9. Scope
 
-The session-log emitter ([crew-log-emitter.md](crew-log-emitter.md)) writes the ACP turn lifecycle behind the `KIROCREW_CREW_LOG` flag. The member event log ([member-event-log.md](member-event-log.md)) independently writes the member kind through `kiro_crew.eventlog`. No crew-kind writer exists yet, so that ownership registry still describes the domains a future crew emitter may write rather than events produced today; a guest app needs no registry entry because its `app:<name>/` prefix is its permission.
+The session-log emitter ([crew-log-emitter.md](crew-log-emitter.md)) writes the ACP turn lifecycle behind the `KIROCREW_CREW_LOG` flag. The member event log ([member-event-log.md](member-event-log.md)) independently writes the member kind through `kiro_crew.eventlog`. The crew kind has one writer, behind the same flag: `crew_log.emit.on_crew_dispatch` and `on_crew_report` record the dispatch family into a crew's own log, driven by the conductor work board's `bind` action and by a worker's report. It covers that family alone, so the ownership registry still describes what a crew MAY write rather than what is produced -- the other six domains have no writer, and a guest app needs no registry entry because its `app:<name>/` prefix is its permission.
+
+Those two entries are BEST EFFORT, and the asymmetry with the session emitter is deliberate. A work-ledger route refuses its own write when the `work/recorded` entry cannot be appended, because the board is a projection of that entry and a cache holding a mutation the log never saw is a divergence. The crew entry is the crew-side record of a fact the board already holds, so a crew log that cannot be written must not fail a ledger write that succeeded: the caller reads a zero seq as "not recorded" and proceeds. Neither entry is routed through the session emitter's write-behind queue, whose every structure is keyed by an ACP session id -- a crew store name handed to it would be looked up as a session unit and dropped as a policy no-op.
+
+Which unit a crew entry belongs to is the DISPATCHING crew, and it is resolved from the conductor slot's member slug. A board driven from an ordinary chat slot therefore records nothing here, which is a refusal rather than a gap: a slot key is not a crew name, and a unit whose header named one would attribute the work to a crew no reader can resolve.
 
 Read and write paths ship together deliberately: the guarantees this format makes -- contiguous seq under a lock, torn-tail repair, refusal before any byte is written -- are each a claim about what a reader sees after a writer acted, so neither half demonstrates them alone. `test/test_crew_log_core.py` exercises them against real files rather than against a mock.

@@ -284,7 +284,9 @@ def resolve_template_path(template: str, project: str | None = None) -> Path | N
         admitted = validate_file_path(project)
         if admitted is None:
             raise MemberEssentialContextError(f"Essential project {project}: cannot be read safely")
-        for path in project_agent_files(Path(admitted)):
+        for path in project_agent_files(
+            Path(admitted), operation="member_essentials", source="context"
+        ):
             spec = _read_agent_spec(path, operation="member_essentials", source="context")
             if spec is None and path.stem == template:
                 raise MemberEssentialContextError(
@@ -341,7 +343,7 @@ def documents_for_member(
     documents are deliberately left to their native trigger. Generic product
     prompts keep their existing provider/session-start path.
     """
-    from kiro_crew.agent import _prompt_path
+    from kiro_crew.agent import is_managed_prompt
     from kiro_crew.agent_discovery import _read_agent_spec
 
     documents: list[tuple[str, str]] = []
@@ -454,9 +456,10 @@ def documents_for_member(
     prompt = spec.get("prompt", "")
     if not isinstance(prompt, str):
         raise MemberEssentialContextError(f"Essential template {spec_path}: prompt must be text")
-    # Forks inherit the product prompt URI too. Its provider/session-start
-    # injection is independent of the template name and the install directory.
-    if prompt and prompt != f"file://{_prompt_path()}":
+    # A fork inherits the managed contract; essentials omit it because the
+    # session-start injection delivers it once, regardless of template name or
+    # install directory (see is_managed_prompt).
+    if prompt and not is_managed_prompt(prompt):
         if prompt.startswith("file://"):
             path = Path(prompt[7:]).expanduser()
             if path.is_absolute():
@@ -536,8 +539,20 @@ def _resource_pattern(path: Path, root: Path) -> str:
         raise MemberEssentialContextError(f"Essential source {path}: outside {root}")
     try:
         return str(path.relative_to(admitted_root))
-    except ValueError as exc:
-        raise MemberEssentialContextError(f"Essential source {path}: outside {root}") from exc
+    except ValueError:
+        pass
+    # The reverse layout: the declaration carries the link spelling while the
+    # root is already resolved (a project root is stored resolved). Only the
+    # declaration's glob-free ANCESTORS are screened, never its tail, so a link
+    # below the root is still refused: by the walk in :func:`_matches` for a
+    # glob, and by the containment check in :func:`_read` for a literal path.
+    for ancestor in reversed(path.parents):
+        if any(c in ancestor.name for c in "*?["):
+            break
+        admitted = validate_file_path(str(ancestor))
+        if admitted is not None and Path(admitted) == admitted_root:
+            return str(path.relative_to(ancestor))
+    raise MemberEssentialContextError(f"Essential source {path}: outside {root}")
 
 
 def _resource_paths(

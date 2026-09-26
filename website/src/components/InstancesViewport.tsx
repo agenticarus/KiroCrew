@@ -41,6 +41,13 @@ import { useAppDispatch, useAppSelector, useAppStore } from '../store'
 import { clearPaneReady, removeWarm, setActiveId, setPaneReady, setUnread, setWarm } from '../store/instancesSlice'
 import InstanceTabBar, { visibleInstanceTabs, useCrewPins, toggleCrewPin, useCrewSwitcherStableOrder, setStableOrder } from './InstanceTabBar'
 import { parseLoopbackOriginPort, resolveTunnelOrigin } from '../lib/tunnelOrigin'
+import {
+  CURSOR_AWAY_CANCEL_TYPE,
+  CURSOR_AWAY_RESULT_TYPE,
+  CURSOR_AWAY_VERSION,
+  CURSOR_AWAY_WATCH_TYPE,
+  watchCursorAwayNative,
+} from '../lib/cursorAway'
 import { NATIVE_NOTIFY_TYPE, parseNativeNotifyEnvelope, postRelayedNativeNotification } from '../lib/nativeNotify'
 import { frameDocumentState, paneLog, safePaneUrl } from '../lib/paneLog'
 import { clearPaneHttpCache, paneOriginFor } from '../lib/paneCache'
@@ -182,6 +189,19 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
   // a peeked header (the tab bar lives on it), so the traffic lights stayed
   // visible over the new pane until its own next hover cycle re-posted.
   const paneChromeRef = useRef<Record<string, boolean>>({})
+  // The off-window cursor watch this frame is running FOR a pane (see the
+  // mc-cursor-away-watch handler), or null. At most one: the main process polls
+  // once per window, and only the active pane may hold it.
+  const paneCursorWatchRef = useRef<{ paneId: string; watchId: string; stop: () => void } | null>(null)
+  const stopPaneCursorWatch = useCallback(() => {
+    const live = paneCursorWatchRef.current
+    if (!live) return
+    paneCursorWatchRef.current = null
+    live.stop()
+  }, [])
+  // A pane switch (or unmount) orphans the outgoing pane's watch: its reveal is
+  // no longer on screen, and nothing should keep polling for it.
+  useEffect(() => stopPaneCursorWatch, [activeId, stopPaneCursorWatch])
   const refreshingRef = useRef<Set<string>>(new Set())
   const lastRefreshRef = useRef<Map<string, number>>(new Map())
   // Reactive (mc-auth-expired) re-mints answered per pane since its last Retry
@@ -467,6 +487,40 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
           paneChromeRef.current[id] = on
           if (id === activeIdRef.current) setFocusChromeVisible(on)
         }
+      } else if (data.type === CURSOR_AWAY_WATCH_TYPE) {
+        // A pane's focus-mode reveal wants to know how far the cursor travels
+        // off-window. It has no preload to ask the main process itself, so this
+        // frame watches on its behalf. Same rule as mc-focus-chrome: only the
+        // pane the user is looking at may arm it — a background pane gets no
+        // answer. The frame check pins the requester to that pane's own iframe,
+        // which is also where the answer goes. A host with no bridge (a browser)
+        // stays silent the same way.
+        const watchId = (data as { id?: unknown }).id
+        if (typeof watchId !== 'string' || !watchId || watchId.length > 64) return
+        if (data.v !== CURSOR_AWAY_VERSION || id !== activeIdRef.current) return
+        const frame = iframeRefs.current.get(id)?.contentWindow
+        if (!frame || e.source !== frame) return
+        // One watch per window: the main process polls once per window, so a
+        // newer request supersedes whatever was pending.
+        stopPaneCursorWatch()
+        const origin = e.origin
+        const reply = (msg: Record<string, unknown>) => {
+          try {
+            frame.postMessage({ v: CURSOR_AWAY_VERSION, id: watchId, ...msg }, origin)
+          } catch {
+            /* frame mid-navigation — nothing left to answer */
+          }
+        }
+        const stop = watchCursorAwayNative(away => {
+          if (paneCursorWatchRef.current?.watchId === watchId) paneCursorWatchRef.current = null
+          reply({ type: CURSOR_AWAY_RESULT_TYPE, away })
+        })
+        if (!stop) return
+        paneCursorWatchRef.current = { paneId: id, watchId, stop }
+      } else if (data.type === CURSOR_AWAY_CANCEL_TYPE) {
+        const watchId = (data as { id?: unknown }).id
+        const live = paneCursorWatchRef.current
+        if (live && live.paneId === id && live.watchId === watchId) stopPaneCursorWatch()
       } else if (data.type === 'mc-embedded-boot') {
         // The pane's bundle EXECUTED (posted from main.tsx before React renders,
         // see EmbeddedHostBridge for the ready half). This line splits the one
@@ -539,7 +593,7 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
     }
     window.addEventListener('message', onMessage)
     return () => window.removeEventListener('message', onMessage)
-  }, [dispatch, refreshToken, canRefreshNow, currentPortToId])
+  }, [dispatch, refreshToken, canRefreshNow, currentPortToId, stopPaneCursorWatch])
 
   // Proactive refresh: when an embedded token passes REFRESH_AT_ELAPSED_FRAC of
   // its TTL, re-mint and reload that iframe ahead of the cap. Skips the active

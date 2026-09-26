@@ -7,7 +7,7 @@ import functools
 import json
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import aclosing
 from pathlib import Path
 from typing import Any
@@ -387,6 +387,8 @@ class AcpProvider(LLMProvider):
         member_context: bool = False,
         memory_mode: str = "persistent",
         shared_scratch: Path | None = None,
+        on_gate_acquired: Callable[[float], None] | None = None,
+        on_gate_queued: Callable[[], None] | None = None,
     ) -> None:
         # An unrecognized backend would pass every ``_is_<backend>`` check and
         # spawn kiro-cli, so a typo'd config would drive the wrong agent with no
@@ -423,6 +425,16 @@ class AcpProvider(LLMProvider):
         # ``AcpRuntime`` it constructs itself, and a dedicated subagent's
         # inherited work directory has to reach THAT process.
         self._shared_scratch: Path | None = shared_scratch
+        # Forwarded to ``runtime.create_session`` on the fresh-session path only
+        # (``session/load`` takes no gate permit). Fires at ``SessionStartGate``
+        # EXIT with the queue wait in ms, so a dedicated subagent process can
+        # restart its start clock the way a session-shared one does in
+        # ``_create_shared_session``: a wait for a permit is admission's cost,
+        # not this start's. None -- every non-subagent session -- is inert.
+        self._on_gate_acquired: Callable[[float], None] | None = on_gate_acquired
+        # Its companion for gate ENTRY: the manager freezes the start clock for
+        # the span spent waiting for a permit. Same None-is-inert rule.
+        self._on_gate_queued: Callable[[], None] | None = on_gate_queued
         self._client = AcpClient(**kwargs)
         # Consumer opt-in for the low-fidelity child permission downgrade
         # (see child_fidelity_aware property). Set by fidelity-aware
@@ -1271,6 +1283,8 @@ class AcpProvider(LLMProvider):
                         memory_mode=self.memory_mode,
                         session_key=self._owning_session_key(),
                         channel_id=self._owning_channel_id() or "",
+                        on_gate_acquired=self._on_gate_acquired,
+                        on_gate_queued=self._on_gate_queued,
                     )
                 except AcpRuntimeError as exc:
                     sandbox_failure = await sandbox_init_failure_for_runtime(runtime)
@@ -1323,12 +1337,42 @@ class AcpProvider(LLMProvider):
                         _namespace,
                     )
                 elif model_is_unusable(configured_model, _advertised):
-                    # A literal miss can be a stale `<namespace>::` qualifier on
-                    # a model the backend fully serves: resolve to the
-                    # advertised spelling and send THAT — same fold the display
-                    # verdict uses, so chip and wire agree. A pin absent under
-                    # either spelling still takes the withhold.
+                    # A literal miss can be a stale `<namespace>::` qualifier on a
+                    # model the backend fully serves: resolve to the advertised
+                    # spelling and send THAT — same fold the display verdict uses,
+                    # so chip and wire agree. Try the fold FIRST, against the
+                    # snapshot we already have: a qualifier-only miss resolves
+                    # here with no wire traffic and must not pay a throwaway
+                    # session/new on every cold start.
                     _send_model = resolve_pin_spelling(configured_model, _advertised)
+                    if not _send_model:
+                        # The fold found nothing, so this looks like a genuine
+                        # miss — but the snapshot was captured seconds ago at
+                        # session/new, always inside the startup race window where
+                        # an entitlement lookup racing a token refresh answers the
+                        # free-tier default. Withholding an entitled pin on that
+                        # unconfirmed answer drops the user's model for the whole
+                        # session with no retry, so revalidate ONCE against the
+                        # live backend and re-run both checks. A failed probe
+                        # leaves _advertised as it was (fail open: no evidence
+                        # never widens or narrows entitlement).
+                        try:
+                            # force=True: this is a one-shot per cold start
+                            # deciding whether to DROP a configured pin, not a
+                            # burst, so it must earn a fresh probe rather than
+                            # honour a recent no-evidence failure replay.
+                            _advertised = (
+                                advertised_model_ids(
+                                    await handle.refresh_available_models(force=True)
+                                )
+                                or _advertised
+                            )
+                        except Exception:
+                            pass
+                        if model_is_unusable(configured_model, _advertised):
+                            _send_model = resolve_pin_spelling(configured_model, _advertised)
+                        else:
+                            _send_model = configured_model
                 if not _send_model and not _foreign_scope:
                     logger.warning(
                         "Configured model %s is not available to this account; "
@@ -1409,6 +1453,25 @@ class AcpProvider(LLMProvider):
         Claude list) rather than a hardcoded set.
         """
         return self._client.available_models()
+
+    async def maybe_refresh_available_models(self, catalog_ids: list[str]) -> list[dict[str, str]]:
+        """Revalidate the advertised-model snapshot on the picker read path.
+
+        The dashboard model list (`/api/models`) narrows the catalog through this
+        provider's snapshot. `self._client` is a plain `AcpClient` before startup
+        (NOT an `LLMProvider`, no revalidation) and becomes an `AcpSessionProvider`
+        (an `LLMProvider`) on the kiro shared-runtime path, which carries the
+        read-path revalidation. Forward when the inner client is an `LLMProvider`
+        (propagating its contract: the read deadline raises
+        :class:`~kiro_crew.acp.session_handle.EntitlementRevalidating` while the
+        probe keeps running, and a probe FAILURE returns the current snapshot,
+        fail open); otherwise return the current snapshot unchanged, so a
+        pre-startup placeholder client or a non-kiro direct client never worsens
+        the picker.
+        """
+        if isinstance(self._client, LLMProvider):
+            return await self._client.maybe_refresh_available_models(catalog_ids)
+        return self.available_models()
 
     def mcp_session_report(self) -> SessionMcpReport:
         """This session's MCP registration report, kept on the inner client.
@@ -1989,6 +2052,9 @@ class AcpProvider(LLMProvider):
             # half (child_mcp_identity_trusted) for every crossing event.
             raw_params_trusted=e.raw_params_trusted,
             shell_classified=e.shell_classified,
+            # Dropping this would let a KAS spawn reach the prompt unvetted
+            # against the spawn policy on this surface.
+            spawn_target=e.spawn_target,
             tool_identity_trusted=e.tool_identity_trusted,
             mcp_identity_trusted=e.mcp_identity_trusted,
             server_name=e.server_name,

@@ -12,13 +12,14 @@
  * user has turned off highlighted diffs (see `usePlainDiff`), which is why the
  * fallback component is a real surface here rather than a loading state.
  */
-import { Suspense, createContext, forwardRef, lazy, memo, type CSSProperties, useContext, useEffect, useRef, useState } from 'react'
+import { Suspense, createContext, forwardRef, lazy, memo, type CSSProperties, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type { BaseCodeOptions, FileContents } from '@pierre/diffs'
 import type { PierreDiffOptions } from './config'
 import type { EditorMarker, PierreEditorHandle } from './PierreEditorImpl'
-import { PlainCodeFallback, PlainFilePairFallback } from './PlainCodeFallback'
+import { PlainCodeFallback, PlainFilePairFallback, PlainFilePairHeader } from './PlainCodeFallback'
 import { isPierreFilePairWithinBudget } from './renderBudget'
 import { computePairPatch } from './diffOffThread'
+import { countDiffStats } from '../utils/diffLineCounts'
 import { PierreFarmHoldContext } from '../components/pierreStaging'
 import { usePlainDiff } from '../hooks/usePlainDiff'
 
@@ -37,63 +38,6 @@ const EditorImpl = lazy(() => import('./PierreEditorImpl').then(m => ({ default:
 interface PairIdentity {
   oldFile: FileContents | null
   newFile: FileContents | null
-}
-
-/**
- * Paint-hold for the opted-in oversized pair. Same contract as `WarmSwap` —
- * keep the readable fallback on screen until the impl has real painted rows —
- * but with a measurement that cannot be satisfied by anything except the
- * impl's own content: the children mount inside an IN-FLOW `height:0;
- * overflow:hidden` box, whose `clientHeight` is 0, so `scrollHeight` reads the
- * content's height exactly. (`WarmSwap`'s box is `absolute inset-0`, which
- * floors `scrollHeight` at the wrapper height the fallback itself provides —
- * fine for the staged, off-viewport mounts it was built for, wrong for a swap
- * happening under the user's cursor.) The children stay in the same DOM node
- * across the flip, so nothing remounts or re-highlights on reveal.
- */
-function PatchPaintHold({ fallback, children, onVisible }: { fallback: React.ReactNode; children: React.ReactNode; onVisible?: () => void }) {
-  const contentRef = useRef<HTMLDivElement | null>(null)
-  const [painted, setPainted] = useState(false)
-  const farm = useContext(PierreFarmHoldContext)
-  useEffect(() => {
-    if (painted) onVisible?.()
-  }, [onVisible, painted])
-  useEffect(() => {
-    if (farm || painted) return
-    const el = contentRef.current
-    if (!el || typeof ResizeObserver === 'undefined') {
-      setPainted(true)
-      return
-    }
-    if (el.scrollHeight > WARM_PAINT_MIN_PX) {
-      setPainted(true)
-      return
-    }
-    const ro = new ResizeObserver(() => {
-      if (el.scrollHeight > WARM_PAINT_MIN_PX) {
-        setPainted(true)
-        ro.disconnect()
-      }
-    })
-    ro.observe(el)
-    const deadline = setTimeout(() => setPainted(true), WARM_SWAP_DEADLINE_MS)
-    return () => {
-      ro.disconnect()
-      clearTimeout(deadline)
-    }
-  }, [painted, farm])
-  if (farm) return <>{fallback}</>
-  return (
-    <>
-      <div
-        style={painted ? undefined : { height: 0, overflow: 'hidden', visibility: 'hidden' }}
-        aria-hidden={painted ? undefined : true}
-      >
-        <div ref={contentRef}>{children}</div>
-      </div>
-      {!painted && fallback}
-    </>
-  )
 }
 
 export type { EditorMarker, PierreEditorHandle }
@@ -126,8 +70,11 @@ export const PierreEditor = memo(forwardRef<PierreEditorHandle, {
   diffExpandUnchanged?: boolean
   className?: string
 }>(function PierreEditor(props, ref) {
+  // The caller's `className` is the editor's sizing contract (a chat block
+  // caps it at 480px), so it must bound every render path: the plain
+  // fallback shown while the chunk loads as much as the Virtualizer after.
   return (
-    <Suspense fallback={<PlainCodeFallback text={props.file.contents} />}>
+    <Suspense fallback={<PlainCodeFallback text={props.file.contents} className={props.className} />}>
       <EditorImpl ref={ref} {...props} />
     </Suspense>
   )
@@ -197,14 +144,31 @@ function StagedSuspense({ fallback, children }: { fallback: React.ReactNode; chi
  * height, which is a scroll jump when the real height lands. The impl mounts
  * invisibly (absolute, zero footprint) so its chunk load, worker round-trip,
  * and paint all happen while the fallback holds the layout.
+ *
+ * The measurement is taken on an in-flow wrapper INSIDE that invisible box,
+ * never on the box itself. The box is pinned to the wrapper's four edges, so
+ * it is exactly as tall as the fallback beside it, and `scrollHeight` never
+ * reads below an element's own height: measured there, the fallback's own
+ * height would pass for a paint the moment the impl mounts, and the surface
+ * would collapse to Pierre's empty container until the highlight pool answers.
+ * The inner wrapper has no height but the impl's, so it reads 0 until Pierre
+ * has applied rows (or a failed pool has handed the surface plain text), and
+ * the deadline below is what releases a surface that never paints at all.
+ *
+ * `header` is a row the caller wants ABOVE the revealed content — it renders
+ * outside the measured wrapper, and only once the hold has released. Inside
+ * the wrapper its own height would pass for painted content and release the
+ * hold before a single row exists; before release the caller's fallback
+ * already carries the same row, so showing it early would double it.
  */
-function WarmSwap({ fallback, children, warmKey, onVisible }: {
+function WarmSwap({ fallback, header, children, warmKey, onVisible }: {
   fallback: React.ReactNode
+  header?: React.ReactNode
   children: React.ReactNode
   warmKey?: string
   onVisible?: () => void
 }) {
-  const boxRef = useRef<HTMLDivElement | null>(null)
+  const implRef = useRef<HTMLDivElement | null>(null)
   const [painted, setPainted] = useState(false)
   // Measure-farm render: the fallback IS the measured geometry -- mounting the
   // impl invisibly would burn main thread for a surface that is never shown.
@@ -215,9 +179,9 @@ function WarmSwap({ fallback, children, warmKey, onVisible }: {
     if (farm) return
     if (painted) {
       // Record the surface's real painted height for future remounts. The
-      // box is the impl's own wrapper, so scrollHeight is the impl height.
+      // wrapper is the impl's own, so scrollHeight is the impl height.
       if (warmKey !== undefined) {
-        const el = boxRef.current
+        const el = implRef.current
         const h = el ? el.scrollHeight : 0
         if (h > WARM_PAINT_MIN_PX) {
           if (warmSwapHeights.size >= WARM_SWAP_DONE_CAP && !warmSwapHeights.has(warmKey)) warmSwapHeights.clear()
@@ -226,7 +190,8 @@ function WarmSwap({ fallback, children, warmKey, onVisible }: {
       }
       return
     }
-    const el = boxRef.current
+    // The impl's own in-flow height (see the note above): 0 until it paints.
+    const el = implRef.current
     if (!el || typeof ResizeObserver === 'undefined') {
       setPainted(true)
       return
@@ -262,12 +227,17 @@ function WarmSwap({ fallback, children, warmKey, onVisible }: {
       // side-by-side toggle) still settles to the impl's own height.
       style={!painted && knownH !== undefined ? { height: knownH, overflow: 'hidden' } : undefined}
     >
+      {painted && header}
       <div
-        ref={boxRef}
         className={painted ? undefined : 'absolute inset-0 overflow-hidden invisible'}
         aria-hidden={painted ? undefined : true}
       >
-        <WarmSwapRevealedContext.Provider value={painted}>{children}</WarmSwapRevealedContext.Provider>
+        {/* The measured element: in flow, so it is as tall as the impl and
+            nothing else -- the pinned box around it is as tall as the
+            fallback, which is not a paint. */}
+        <div ref={implRef}>
+          <WarmSwapRevealedContext.Provider value={painted}>{children}</WarmSwapRevealedContext.Provider>
+        </div>
       </div>
       {!painted && fallback}
     </div>
@@ -348,7 +318,7 @@ export const PierrePatch = memo(function PierrePatch({ patch, options, className
   )
 })
 
-export const PierreFilePair = memo(function PierreFilePair({ oldFile, newFile, options, className, fallbackText, fallbackClassName, fallbackContentStyle, onVisible, renderHeaderMetadata, renderHeaderPrefix, renderHeaderFilenameSuffix }: {
+export const PierreFilePair = memo(function PierreFilePair({ oldFile, newFile, options, className, fallbackText, fallbackClassName, fallbackContentStyle, onVisible, renderHeaderMetadata, renderHeaderPrefix, renderHeaderFilenameSuffix, titleClickable }: {
   oldFile: FileContents | null
   newFile: FileContents | null
   options?: PierreDiffOptions
@@ -368,6 +338,11 @@ export const PierreFilePair = memo(function PierreFilePair({ oldFile, newFile, o
   renderHeaderPrefix?: () => React.ReactNode
   /** Injected directly after the filename in the header. */
   renderHeaderFilenameSuffix?: () => React.ReactNode
+  /** The caller opens the file when the header's filename is clicked. Pierre's
+   *  own header takes that cue from the caller's `unsafeCSS`; the light-DOM
+   *  header rows this component draws for the oversized pair (its fallback and
+   *  its opted-in state) cannot, so they take it from here. */
+  titleClickable?: boolean
 }) {
   const withinBudget = isPierreFilePairWithinBudget(oldFile, newFile)
   const [plain] = usePlainDiff()
@@ -382,9 +357,16 @@ export const PierreFilePair = memo(function PierreFilePair({ oldFile, newFile, o
     | { pair: PairIdentity; status: 'error' }
     | null
   >(null)
+  // The opted-in patch surface draws the BODY only; this component keeps the
+  // header (see the ready branch below). Memoized on `options`, because Pierre
+  // re-initialises its view when its options change identity.
+  const patchOptions = useMemo<PierreDiffOptions>(() => ({ ...options, disableFileHeader: true }), [options])
   const abortRef = useRef<AbortController | null>(null)
   const pairMatches = request != null && request.pair.oldFile === oldFile && request.pair.newFile === newFile
   const active = pairMatches ? request : null
+  // Exact ± counts for the header row, which Pierre's header used to carry.
+  const readyPatch = active?.status === 'ready' ? active.patch : null
+  const readyStats = useMemo(() => (readyPatch == null ? undefined : countDiffStats(readyPatch)), [readyPatch])
   useEffect(() => () => abortRef.current?.abort(), [])
   const startLineByLineDiff = () => {
     abortRef.current?.abort()
@@ -414,6 +396,7 @@ export const PierreFilePair = memo(function PierreFilePair({ oldFile, newFile, o
       renderHeaderMetadata={renderHeaderMetadata}
       renderHeaderPrefix={renderHeaderPrefix}
       renderHeaderFilenameSuffix={renderHeaderFilenameSuffix}
+      titleClickable={titleClickable}
       onShowLineByLineDiff={startLineByLineDiff}
       lineByLineState={active?.status === 'computing' ? 'computing' : active?.status === 'error' ? 'error' : 'idle'}
       onCancelLineByLineDiff={cancelLineByLineDiff}
@@ -422,10 +405,45 @@ export const PierreFilePair = memo(function PierreFilePair({ oldFile, newFile, o
   if (!withinBudget && active?.status !== 'ready') return plainFilePairFallback
 
   if (!withinBudget && active?.status === 'ready') {
+    // The caller's expand/collapse control lives in the header slots, and
+    // Pierre's own header exists only while its renderer has a highlight
+    // result to draw: `FileDiff.render` applies no header when
+    // `DiffHunksRenderer.renderDiff` returns nothing, which with a worker pool
+    // is every render until that pool's generation has initialised (its first
+    // generation, and each recovery after a failure — including one after the
+    // diff first painted), and `PierrePatchImpl` renders header-less plain text
+    // outright while it has no generation at all or the patch will not parse.
+    // Plain-diff mode prints the patch raw, with no header either. A slot in
+    // a header that is not there is a control the reader cannot reach, and a
+    // light-DOM mount of that slot proves nothing about the shadow header it
+    // is meant to project into — so the header is not Pierre's to draw here.
+    // The surface keeps the row the fallback was already showing, the same
+    // component before and after the swap, and Pierre draws the body beneath
+    // it (`patchOptions` disables its file header). One header in every
+    // state, by construction rather than by detection. Only the body moves.
+    const header = options?.disableFileHeader === false
+      ? (
+        <PlainFilePairHeader
+          filename={(newFile ?? oldFile)?.name ?? ''}
+          titleClickable={titleClickable}
+          stats={readyStats}
+          renderHeaderPrefix={renderHeaderPrefix}
+          renderHeaderFilenameSuffix={renderHeaderFilenameSuffix}
+          renderHeaderMetadata={renderHeaderMetadata}
+        />
+      )
+      : null
     // Plain-diff mode drops colour everywhere; the computed patch printed raw
     // keeps the ± markers, matching what the preference means on every other
     // patch surface (and preserving PatchImpl's colour-is-on invariant).
-    if (plain) return <PlainCodeFallback text={active.patch} className={className} />
+    if (plain) {
+      return (
+        <>
+          {header}
+          <PlainCodeFallback text={active.patch} className={className} />
+        </>
+      )
+    }
     // The impl renders ~zero height until the highlight worker answers, so the
     // plain view must hold the layout until real paint (same WarmSwap contract
     // as every other Pierre surface) — otherwise the card visibly collapses
@@ -441,6 +459,7 @@ export const PierreFilePair = memo(function PierreFilePair({ oldFile, newFile, o
         renderHeaderMetadata={renderHeaderMetadata}
         renderHeaderPrefix={renderHeaderPrefix}
         renderHeaderFilenameSuffix={renderHeaderFilenameSuffix}
+        titleClickable={titleClickable}
         onShowLineByLineDiff={startLineByLineDiff}
         lineByLineState="computing"
         onCancelLineByLineDiff={cancelLineByLineDiff}
@@ -452,36 +471,25 @@ export const PierreFilePair = memo(function PierreFilePair({ oldFile, newFile, o
     if (options?.collapsed) {
       return (
         <Suspense fallback={holdFallback}>
-          <PairPatchImpl
-            patch={active.patch}
-            options={options}
-            className={className}
-            renderHeaderMetadata={renderHeaderMetadata}
-            renderHeaderPrefix={renderHeaderPrefix}
-            renderHeaderFilenameSuffix={renderHeaderFilenameSuffix}
-          />
+          {header}
+          <PairPatchImpl patch={active.patch} options={patchOptions} className={className} />
         </Suspense>
       )
     }
-    // The Suspense fallback INSIDE the hold must be null: the hold measures
-    // its content box, and a visible fallback there would defeat the
-    // measurement exactly the way it defeated WarmSwap's. With null the box
-    // stays at zero height through the chunk load and the pre-highlight
-    // mount, so the held plain view owns the layout until the diff truly
-    // paints.
+    // The Suspense fallback INSIDE the hold must be null: WarmSwap measures
+    // the impl's own wrapper, and a visible fallback there would pass for a
+    // paint. With null the wrapper stays at zero height through the chunk
+    // load and the pre-highlight mount, so the held plain view owns the
+    // layout until the diff truly paints. The header goes to the hold as
+    // `header`, NOT as a child, for the same reason: inside the wrapper its
+    // own height would satisfy the paint measurement and release the hold
+    // before a single row exists.
     return (
-      <PatchPaintHold fallback={holdFallback} onVisible={onVisible}>
+      <WarmSwap fallback={holdFallback} header={header} onVisible={onVisible}>
         <Suspense fallback={null}>
-          <PairPatchImpl
-            patch={active.patch}
-            options={options}
-            className={className}
-            renderHeaderMetadata={renderHeaderMetadata}
-            renderHeaderPrefix={renderHeaderPrefix}
-            renderHeaderFilenameSuffix={renderHeaderFilenameSuffix}
-          />
+          <PairPatchImpl patch={active.patch} options={patchOptions} className={className} />
         </Suspense>
-      </PatchPaintHold>
+      </WarmSwap>
     )
   }
 

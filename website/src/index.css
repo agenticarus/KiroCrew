@@ -450,6 +450,15 @@ html:lang(ko) {
   --ctx-src-skillidx:color-mix(in srgb, #8f7bff 74%, var(--card));
   --ctx-src-tool:color-mix(in srgb, #b98cff 74%, var(--card));
   --ctx-src-mute:color-mix(in srgb, var(--text) 30%, var(--card));
+  /* The Context Breakdown chart stacks five plain-language categories; the
+     user's message rides the accent, memory reuses its source hue so the tree
+     and the chart agree, and rules / skills get hues of their own, mixed into
+     the surface like the sources above. */
+  --ctx-cat-message:var(--accent);
+  --ctx-cat-memory:var(--ctx-src-memory);
+  --ctx-cat-rules:color-mix(in srgb, #9266cc 74%, var(--card));
+  --ctx-cat-skills:color-mix(in srgb, #d9a12b 74%, var(--card));
+  --ctx-cat-other:var(--ctx-src-mute);
   /* Terminal ANSI hues with no semantic equivalent. The other fourteen entries
      are derived from --bg / --text / --danger / --ok / --warn / --info, which
      every theme already defines; only magenta and cyan need a value of their
@@ -1608,6 +1617,29 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
   100%{transform:rotate(360deg)}
 }
 
+/* ── Custom font ligatures ──
+   The "Custom" Font Family option sets --font-body to the user's installed
+   family app-wide (useZoom), so chat prose, the composer, and sidebar session
+   and folder names pick it up by inheritance — no per-surface font-family rule
+   is needed, and a Nerd Font's glyphs render from the family alone. This turns
+   on ligatures app-wide ONLY while Custom is active AND the "Enable ligatures"
+   toggle is on (html[data-font-family="custom"][data-custom-ligatures="on"], both
+   set by useZoom), so a programming font (Fira Code, Cascadia Code, …) shows its
+   ligatures on demand without changing how the built-in Sans/Mono presets render.
+   Code and diffs inside messages keep --mono via the more-specific rules below
+   AND reset ligatures to normal, so a custom font never turns on calt ligatures
+   in code that did not have them. */
+html[data-font-family="custom"][data-custom-ligatures="on"] body{font-variant-ligatures:common-ligatures contextual}
+/* OFF must be explicit `none`, not the absence of the rule above: contextual
+   (calt) and common (liga) ligatures are ON by default in CSS, so a font like
+   JetBrains Mono keeps rendering =>/!=/-> under the initial `normal` value —
+   only `none` actually turns them off. */
+html[data-font-family="custom"][data-custom-ligatures="off"] body{font-variant-ligatures:none}
+/* Also cover Pierre's .code-block / .diff-block hosts: their lines are not
+   always <pre>, so without these selectors the OFF rule's `none` would leak
+   into rendered code and diffs by inheritance. */
+.msg-content code,.msg-content pre,.msg-content .code-block,.msg-content .diff-block{font-variant-ligatures:normal}
+
 /* ── Code in messages ── */
 .msg-content code{font-family:var(--mono);font-size:.9em}
 .msg-content :not(pre)>code{background:rgba(0,0,0,.15);padding:.15em .4em;border-radius:4px;overflow-wrap:break-word;word-break:break-all}
@@ -1615,6 +1647,25 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
 /* Kiro theme: inline code = neutral elevated surface (Prey/750) + light-purple text (Figma 3906:185658) */
 [data-theme="kiro-dark"] .msg-content :not(pre)>code{background:#28242e;color:#c19aff}
 [data-theme="kiro-light"] .msg-content :not(pre)>code{background:var(--bg-hover);color:#723acc}
+/* Inline-code CHIPS (MarkdownRenderer): a chip's colour says what its click does. A chip whose
+   click navigates (`navigate`: a confirmed path, a session, an autolinked work item or a span
+   inside a link) wears the accent, the colour links wear; a chip that only copies (`copy`)
+   wears the NEUTRAL text colour, plus its dotted underline and copy cursor (set by the
+   component). Two values, because these two rules are the attribute's only consumer and two
+   kinds are all they tell apart. Neutral, not the Kiro inline-code purple above: on these
+   themes that purple and the accent are two near-identical purples, and a reader takes both
+   for the same kind of chip — "link-coloured = navigates, neutral = copies" has to hold on
+   every theme, and on the others inline code already inherits the text colour. The two Kiro
+   rules above set `color` at specificity (0,2,2), and the utilities are emitted unlayered, so
+   the `text-accent` utility (0,1,0) the actionable chips carry lost to them: every chip
+   painted in the code colour. Both chip states therefore get their own rule here, at (0,3,2),
+   keyed on the `data-chip-action` the renderer sets (raw HTML cannot: InlineCode drops any
+   inbound one). Kiro dark uses Purple/300, the same step-up message links take below. A span
+   that is no chip at all (an image-only raw span) keeps the theme's purple. */
+[data-theme="kiro-dark"] .msg-content :not(pre)>code[data-chip-action="copy"]{color:var(--text)}
+[data-theme="kiro-light"] .msg-content :not(pre)>code[data-chip-action="copy"]{color:var(--text)}
+[data-theme="kiro-dark"] .msg-content :not(pre)>code[data-chip-action="navigate"]{color:#b07fff}
+[data-theme="kiro-light"] .msg-content :not(pre)>code[data-chip-action="navigate"]{color:var(--accent)}
 /* Kiro dark: brighten message links — #8e48ff (=accent, same as the button fill) reads dull as thin
    text on the dark bg, so step up to Purple/300 for equal perceived vibrancy. Scoped to Kiro. */
 [data-theme="kiro-dark"] .msg-content a{color:#b07fff;text-decoration-color:rgba(176,127,255,.45)}
@@ -1779,6 +1830,45 @@ file-tree-container{
 .edit-grow>textarea,.edit-grow::after{grid-area:1/1;font:inherit;line-height:inherit;letter-spacing:inherit;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
 .edit-grow>textarea{width:100%;min-width:0}
 
+/* Pinned-prompt stand-in. While a user prompt is pinned, its transcript row is
+   `visibility: hidden` (ChatPage's row wrapper, VirtualTranscript, ChatMessageList)
+   and the PinnedPrompt card is drawn in its place — but the card copies only the
+   BUBBLE, and the row also carries the message's action strip (copy, copy link,
+   pin, edit, timestamp). Visibility is inherited, so a `visible` descendant of the
+   hidden row is drawn and clickable: this re-shows the strip in its own place,
+   directly under the card, which folds down the bubble's remaining height and so
+   never covers it. Shown outright rather than behind the strip's hover reveal
+   (`opacity-0` + `group-hover/msg:opacity-100`): the card lives in an overlay
+   that is a sibling of the scroller, so hovering it can never be a hover of this
+   row, and a hover-only strip under a card is one the reader has to find by
+   pointing at a blank gap. Before this rule a prompt taller than the viewport had
+   no action strip at all — its bottom is only on screen once its top is above the
+   fold, i.e. once the whole row is hidden. Pinned by
+   src/test/UserMessage.pinnedStandinActions.test.tsx, which reads this rule.
+   Keyed on the `folding` VALUE, not the bare marker. The hosts write that value
+   while the strip is still UNCOVERED — some of it below the card's resting
+   bottom, on screen (usePinnedPrompt measures the strip's own rect). That is the
+   whole fold and the strip's own height of scroll after it: the card reaches its
+   clamp while the strip, hanging under the bubble, is still sliding under it, so
+   a value keyed on the fold alone dropped the strip out from under the pointer
+   for those last pixels and left the band blank. Once the strip is under the
+   card or behind the header, a strip left `visible` would be invisible yet
+   focusable — Tab through the transcript stopping on controls nobody can see,
+   each stop scrolling the transcript away from the position the pin exists to
+   hold. With the marker empty the strip inherits the row's `hidden` again and is
+   neither drawn nor in the tab order.
+   Edit is the one control left out (`data-message-edit`), for any marker value:
+   it swaps the bubble for a textarea + Cancel/Send tree that is not part of the
+   strip, so it would open inside the hidden row where nothing can see, focus or
+   dismiss it. `display:none` rather than `visibility:hidden` so the strip closes
+   the gap; it returns as soon as the row is no longer the stand-in.
+   The re-show matches the strip only as a direct child of UserMessage's
+   `data-role="user"` root, the one place it is rendered: structural scoping, so
+   the sanitizer's `data-message-*` reservation (MarkdownRenderer) is not the only
+   guard keeping a marker minted inside a message body off this paint path. */
+[data-pinned-standin="folding"] [data-role="user"] > [data-message-actions]{visibility:visible;opacity:1}
+[data-pinned-standin] [data-message-edit]{display:none}
+
 /* ── Auto-hiding scrollbar for code/diff blocks ── */
 .scroll-fade::-webkit-scrollbar{height:6px}
 .scroll-fade::-webkit-scrollbar-thumb{background:transparent;border-radius:3px;transition:background .2s}
@@ -1809,6 +1899,8 @@ file-tree-container{
 .scrollbar-overlay::-webkit-scrollbar-thumb{background:transparent;border-radius:9999px;transition:background .2s}
 .scrollbar-overlay:hover::-webkit-scrollbar-thumb{background:var(--muted)}
 .scrollbar-overlay:hover::-webkit-scrollbar-thumb:hover{background:var(--text)}
+/* Thinner reveal for the side-panel nav rail: 5px rather than the overlay utility's 6px, so the hover/touch hint reads as a hint, not a bar. Colour is unchanged (--muted, the accessibility-floor token), only the width narrows. */
+.scrollbar-overlay-thin::-webkit-scrollbar{width:5px}
 /* On touch the overlay utility would stay perpetually transparent: a finger never
    produces the :hover that restores the thumb. A coarse pointer shows a persistent
    thin thumb instead, so a capped scroll surface keeps a real affordance. Fine

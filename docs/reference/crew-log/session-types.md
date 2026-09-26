@@ -3,7 +3,7 @@
 **Local page, not a mirror.** Part of the [crew log reference](README.md), which is
 marked as a named exception in [the Reference index](../README.md).
 
-Thirty types. Read [envelope.md](envelope.md) first for the fields every entry
+Thirty-two types. Read [envelope.md](envelope.md) first for the fields every entry
 carries; this page covers only each type's `data`.
 
 Session entries are written with `src` `gateway` or `acp` and nothing else. They
@@ -53,6 +53,7 @@ The **Emitter** column says whether this build writes the type. Every row below 
 | [`object/observed`](#objectobserved) | The state of an object outside the session, as a named producer observed it. | live | `gateway` | — |
 | [`radar/recorded`](#radarrecorded) | One Issue Radar crew-ledger update: the work-item fields it set and the event explaining them. | live | `gateway` | — |
 | [`work/recorded`](#workrecorded) | One work-board mutation: who acted, on which item, and the fields it set. | live | `gateway` | — |
+| [`panel/published`](#panelpublished) | One publish of a crew's own webview: the data, and the template that renders it. | live | `gateway` | — |
 
 ## Session and turn
 
@@ -82,6 +83,8 @@ entry's write is the point the interrupted-turn repair runs.
 | `resumed` | bool | required | `true` when this claim re-attached to an existing crew log. | |
 | `class` | object | when the gateway could read the slot's memory mode | What kind of session this log belongs to: `memory` (the slot's memory mode, required inside the object), `app` (the app that owns it, when one does), `channel` (`true` when its conversation is published to a messaging channel), `workspace` (the workspace it belongs to). | |
 | `previous` | object | | `{sid}` — the crew log the SAME slot was writing before this one. Present only on a crew log that was just created while the slot already had one, and only when that crew log's own header names this slot. Absent on the slot's first crew log, on every re-attach, when the gateway could not name the predecessor, and when the named crew log's header does not name this slot or cannot be read. | |
+| `previous_none` | bool | when the gateway determined the slot has NO earlier crew log | `true` only in that case: this crew log starts the slot's chain, and says so. The ABSENCE of every predecessor key cannot say it, because a crew log written before these keys existed also has none of them and ITS omission may equally be a predecessor the gateway of the day failed to name. A reader ranking a slot's crew logs may pass over a crew log that states this, and may not pass over one that merely omits everything. Absent when `previous` names one, when `previous_undecided` reports one it could not determine, and when a named predecessor was rejected for belonging to another slot. Also absent on a create whose opener DETERMINED nothing: one that hands over a captured id and no finding either way writes no key here, because an empty id from such an opener means only that it had nothing to give, and reading that as a conclusion would declare a slot with earlier crew logs to be its own first. Equally absent when the store read HANDED the question on instead of answering it -- units of the slot exist and could not be ranked -- because the next source coming back empty is not a finding about this slot either. | |
+| `previous_undecided` | bool | when a predecessor exists and could not be determined | `true` only in that case, and it is `previous_none` that states the opposite, so neither meaning rests on a key being absent. The two demand opposite treatment from a reader ranking a slot's crew logs: a stated first crew log may be passed over, an undetermined one may not, because passing over it elects the crew log before it and freezes a citation the gateway declined to guess. Absent when `previous` names one, and on a crew log that states it has none. | |
 | `parent` | object | when `session_create` made this session | The creating session, recorded on the child. | |
 | `parent.slot` | string | required inside `parent` | The creating session's slot key. | |
 | `parent.sid` | string | optional | The creator's ACP session id frozen at mint time; absent when no live handle was available or the retained id was unusable. | |
@@ -135,15 +138,22 @@ same-slot rule below rather than trusting it. It reports WHY it stopped, and onl
 `first` means it reached the slot's first crew log; no shipped route calls it yet.
 
 `previous` always names a crew log of the SAME slot, and that is verified rather
-than assumed. The id reaches the emitter from the slot-to-session mapping, read
-without pruning and latched by whichever allocation observes it first. One limit
-is recorded rather than worked around: an allocation whose replay is still pending
-does not publish its fresh id over the mapping, so for that window a mapping read
-names the crew log BEFORE the newest one — two successive crew logs then cite one
-predecessor and the crew log between them is cited by nobody, which a chain walker
-steps over without any sign that a crew log is missing. Closing that needs a
-deferral that resumes once the predecessor's own writes settle, and it is tracked
-with the rest of the supersede work in #12148. The mapping can also name a crew log
+than assumed. The id comes from three sources in order, latched by whichever
+allocation observes it first. The store this slot last handed to a
+`session/opened`, recorded on the slot as that edge is spent, is first: the create
+is queued to a writer thread, so it is the only source that can name a crew log
+whose unit is not on disk yet. The slot's own newest unit in the store — the unit
+whose header names this slot and that no other unit of the slot cites as
+`previous` — is next, and it is the durable one, read off the event loop because
+it is blocking; it answers "undecided" when the units cannot be read or do not say,
+and then no edge is written. The slot-to-session mapping, read without pruning, is
+last, for a slot the store says has no unit at all, and it cannot be
+higher: an allocation whose replay is still pending holds the prior resumable
+id in the mapping on purpose, so that a restart can still resume it, and the
+mapping is then a generation behind — two successive crew logs would cite one
+predecessor and the crew log between them would be cited by nobody, which a chain
+walker steps over without any sign that a crew log is missing. The mapping can also
+name a crew log
 the slot never wrote, since an entry can be stale or recycled by the time a
 successor cold-starts, so the emitter reads the named crew log's own header —
 written once at create, never rewritten — and records the edge only when that
@@ -1275,6 +1285,68 @@ bound worker slot's units. Fold them all, oldest unit first, and key items by
 not folded yet, not to a missing item.
 
 **Since** — the change that made the work ledger a projection of the crew log.
+
+## The member panel
+
+### `panel/published`
+
+One publish of a crew's own webview: the data, and the template that renders it.
+
+**Kind and `src`** — `session`; `src` is `gateway`.
+
+**When written** — One entry per publish, appended to the PUBLISHING member's own DM
+session log, beside the write of `crew-panels/<slug>.json`. That tool is mounted on
+nothing else, so the publishing session is always the member's own DM session and the
+slot a panel folds under is always that member's. This entry is the ADDITIONAL
+record: the file is the durable one, and it is what answers a reader when the crew
+log is off, when the crew published before this type existed, or when the session's
+unit has been collected by retention. What the entry adds is what one overwritable
+file cannot hold — a publish history, and one record per owner on a slug two crews
+resolve to. The append is best-effort for that reason: a refused entry costs a
+publish its history row, never the panel.
+
+**Pairing** — None.
+
+| Field | Type | Required | Meaning | Enum |
+|---|---|---|---|---|
+| `template` | string | required | Id of the human-authored template the data is rendered with. The pair is what renders, so a payload naming no template has no layout to fill; the store resolves the id at publish, so an unknown one never reaches a line. | |
+| `data` | object | required | The state the crew published, already scrubbed and depth-checked. The MEMBERS are the crew's own field names — a panel is deliberately generic — so they are undeclared and bounded by byte and depth ceilings instead. | |
+| `title` | string | optional | Short name for this panel, shown in the page's picker. | |
+| `crew` | string | optional | The publishing crew's name as DISPLAY text, redacted, so it is not an identity. Carried so a reader of one entry can say whose panel it is without resolving the slot. | |
+| `crew_key` | string | optional | Digest of the crew's EXACT name, which is what ownership is decided on. Separate from `crew` because redaction is many-to-one: a credential-shaped name redacts to a string matching no exact name, so display text cannot serve as an identity. | |
+
+**Invariants** — A whole record, never a delta: each publish REPLACES the panel, so
+the fold takes the newest entry whole and a partial update has no meaning. The fold
+retains one record per `crew_key` rather than one per slot, because a slot is keyed
+by the member slug and two crews can resolve to one slug when memory provisioning
+suffixes a persisted `member_id`; each crew then reads the record its own digest
+keys instead of a later crew's publish hiding an earlier one's panel. Superseded
+publishes are kept only as a short history of title and template, not as payloads.
+The fold re-applies the store's own ceilings to the bytes it reads (`title` 200,
+`template` 64, `crew_key` 64, history 50 rows, 4 owners), because a planted or
+damaged line is exactly the input that ignores the writer's clamp. `published_at`
+is derived from the entry's own `time` and is not repeated in `data`.
+
+```json
+{"type":"panel/published","seq":84,"time":1789000003100,"src":"gateway","data":{"template":"default","title":"fleet","crew":"fleet-crew","crew_key":"04b27504d7cf4733ace180d2bd7123c36aebb36fcfdb2aebc6525affd6383c02","data":{"cycle":47,"open_prs":3}}}
+```
+
+**Reader hint** — Read the fold for the member's own DM slot, then select the record
+under the asking crew's `crew_key`; an empty `template` is the fold's way of saying
+this crew has published nothing. Do not key on the slug alone — on a collided slug
+that serves whichever crew published last to both of them. Finding NO record under
+your own `crew_key` is the case to handle, because eviction deletes the owner's entry
+rather than emptying it. Absence is all there is to read, and it is the same absence
+whether the crew was evicted or never published here, so the per-owner shape does not
+answer which happened. No field on it can, because the entry that would have carried
+one is the entry eviction removed. What the fold does answer is on its top-level
+record: `owners_omitted` counts this slot's evictions, so `0` says this fold evicted
+nobody and a non-zero value says it truncated without naming whom. "Did this crew
+publish" is answered by the durable `crew-panels/<slug>.json`, not here: the append is
+best-effort, so a publish whose entry never landed leaves the fold with no record while
+the file still serves that crew's panel.
+
+**Since** — the change that gave the member panel a crew-log record beside its file.
 
 ## Removed types
 

@@ -33,7 +33,7 @@ import type { KiroCrewAgent } from '../components/AgentSelector'
 import type { MemoryRecord, MemoryRecordRef, MemoryRecordQuery, MemoryRecordSelection, MemoryEditOperation, MemoryEditPreview, MemoryRecordRevision } from '../types/memoryEditing'
 import type { AutoNudgeListResponse } from '../components/autoNudgeLoop'
 import type { TaskDetailResponse, TasksListResponse, TasksSummary } from './tasks'
-import { ApiError, friendlyErrText } from './apiError'
+import { ApiError, friendlyErrText, toApiError } from './apiError'
 import { SESSION_CONTROL_STATUS_PATH_RE } from '../lib/sessionControlStatusPath'
 import { refreshOnce, __resetRefreshOnceForTests } from './refreshOnce'
 import {
@@ -41,6 +41,7 @@ import {
   installStaleOwnerHandler,
   noteStaleOwnerResponse,
 } from './staleOwnerSignal'
+import { edgeChallengeMessage, noteEdgeAuthChallenge } from './edgeAuthChallenge'
 import { beginArtifactWrite, endArtifactWrite } from '../lib/artifactWrites'
 import { withDeadline } from '../lib/withDeadline'
 import { createVoiceRequestId } from '../lib/voicePlayback'
@@ -58,7 +59,11 @@ export const SKILLS_TIMEOUT_MS = 15_000
 export const SLASH_COMMANDS_TIMEOUT_MS = 15_000
 import { installApiTransport } from './apiTransport'
 import type { SessionSummary } from '../types/sessionSummary'
-import { queryClient, resolveDefaultMemoryMode } from './queryClient'
+import {
+  queryClient,
+  invalidateAcrossQueryClients,
+  resolveDefaultMemoryMode,
+} from './queryClient'
 import { getStoredConsent } from '../utils/themeConsent'
 import { recordError, parseErrorCode, requestPath } from '../utils/errorReport'
 import { i18nT } from '../i18n/t'
@@ -110,6 +115,12 @@ export interface SkillScriptValidation {
   ok: boolean
   report: Record<string, string[]>
 }
+
+/** Category of a welcome-screen suggestion; drives its icon tile. */
+export type SuggestionKind = 'code' | 'review' | 'ops' | 'tasks' | 'write' | 'research' | 'schedule' | 'general'
+
+/** One `/api/suggestions` item. `kind` is a string on the wire, so an unknown value is possible. */
+export type SuggestionItem = string | { text: string; kind?: string }
 
 export type McpShareReason = {
   code: string
@@ -395,6 +406,14 @@ export interface BrowserViewData {
   url: string | null
   port: number | null
   reason: string | null
+  /** Dashboard-origin relay path (`/browser-view/<token>/`) to FRAME the view
+   * through — same origin as the dashboard, so it works over an SSH forward or
+   * tunnel with no second port. The embedded per-instance capability token is
+   * the relay's auth (the panel frames it in an opaque-origin sandbox that
+   * sends no cookies). Null unless running; absent entirely from an older
+   * gateway, in which case the panel falls back to framing the absolute
+   * loopback `url`. */
+  path?: string | null
 }
 
 /** Answer of POST /api/browser/open: the Browser panel's address bar on the
@@ -462,6 +481,14 @@ export interface DecisionsConsentData {
    * conversation, so consent recorded against a message excerpt cannot stand for it.
    */
   memory_text?: boolean
+  /**
+   * Whether the owner consented to sending WAKE EVIDENCE — the transcript tail and
+   * pull-request readings the `nudge.wake` judge screens a tick against. Absent reads
+   * as not consented, on the same terms as the three above: this evidence comes from
+   * sessions the loop WATCHES rather than the one the owner is talking in, so none of
+   * the narrower yeses stands for it.
+   */
+  nudge_evidence?: boolean
   /**
    * One row per decision point this GATEWAY ships, projected from the seam's own
    * registry (`decisions/gate.py`). The card lists these rather than an array
@@ -1021,6 +1048,17 @@ export interface FileDeliveryConsentStatus {
   never_grantable: string[]
   labels: Record<string, string>
   grants: Record<string, FileDeliveryGrant | null>
+}
+
+/**
+ * The owner's credential-redaction switch (Settings > Security > Credential
+ * redaction). `enabled` is the position as RECORDED by the backend, which reads a
+ * missing or unreadable record as `true`; `changed_at` is empty until the owner
+ * has flipped it at least once.
+ */
+export interface CredentialRedactionState {
+  enabled: boolean
+  changed_at: string
 }
 
 /** The SPA-safe view of an armed grant request. The approval NONCE is never
@@ -1849,7 +1887,7 @@ function showSessionExpiredBanner(lead?: string): void {
         // `data === undefined` narrows it to queries that never carried a
         // successful value: exactly the ones the lapse broke, and the only ones
         // with nothing to overwrite a draft with.
-        void queryClient.invalidateQueries({
+        invalidateAcrossQueryClients({
           predicate: (q) => q.state.status === 'error' && q.state.data === undefined,
         })
       })
@@ -1989,7 +2027,7 @@ export { STALE_OWNER_SESSION_CODE }
  * every existing consumer, and every test that mocks `../api/client`, is
  * unchanged by the move.
  */
-export { ApiError, friendlyErrText }
+export { ApiError, friendlyErrText, toApiError }
 
 /**
  * Whether *e* is a failure the user can only clear by signing back in.
@@ -1999,9 +2037,15 @@ export { ApiError, friendlyErrText }
  * useless to a user: it neither says the session is what broke nor points at
  * the re-auth banner. Call sites use this to swap a futile retry for the one
  * action that recovers.
+ *
+ * An interposed proxy's challenge is deliberately NOT one of these, though it
+ * also sets `authRequired`: the gateway never saw that request, so its sign-in
+ * banner and token flow cannot clear it, and offering them names the wrong
+ * system. Those failures carry their own remedy in the message instead. Call
+ * sites that only want the retry withdrawal read `authRequired` directly.
  */
 export const isAuthExpiredError = (e: unknown): boolean =>
-  e instanceof ApiError && e.authRequired
+  e instanceof ApiError && e.authRequired && !e.edgeChallenge
 
 /**
  * Build the ApiError AND journal it.
@@ -2025,11 +2069,23 @@ const apiFailure = (r: Response, errText: string): ApiError => {
   // the BODY, which checkSessionExpired (a pre-body Response hook) cannot read;
   // the prompt itself is idempotent, so the factory raising it cannot spam.
   const staleOwnerSession = noteStaleOwnerResponse(r.status, errText)
+  // A third denial neither of the above can see: a proxy in front of the gateway
+  // answered with its own sign-in page, so the signals are status + type + body.
+  // Skipped when the gateway's own header is present: that header proves the request
+  // reached the gateway, so nothing interposed answered it.
+  const edgeOutcome = authRequired || staleOwnerSession
+    ? null
+    : noteEdgeAuthChallenge(r.status, r.headers.get('content-type'), errText)
+  // Every one of these needs a person: the gateway never saw the request, so a silent
+  // retry a second later reproduces it whether a session lapsed or a firewall refused.
+  const edgeAuthExpired = edgeOutcome !== null
   const message = staleOwnerSession
     ? i18nT('api.client.stale_owner_session_sign_in_again')
     : authRequired
       ? i18nT('api.client.session_expired_sign_in_again')
-      : friendlyErrText(r.status, errText) || `HTTP ${r.status}`
+      : edgeChallengeMessage(edgeOutcome)
+        || friendlyErrText(r.status, errText)
+        || `HTTP ${r.status}`
   recordError({
     source: 'api',
     message,
@@ -2040,7 +2096,11 @@ const apiFailure = (r: Response, errText: string): ApiError => {
   })
   // A stale-owner denial is authRequired in the sense call sites care about:
   // no retry can succeed until the user signs in again.
-  return new ApiError(r.status, message, errText, authRequired || staleOwnerSession)
+  return new ApiError(
+    r.status, message, errText,
+    authRequired || staleOwnerSession || edgeAuthExpired,
+    edgeAuthExpired,
+  )
 }
 
 /**
@@ -2525,13 +2585,8 @@ export interface KiroBonusCreditGrantPayload {
 export interface KiroUsagePayload {
   available?: boolean
   /**
-   * Why usage is unavailable when `available` is false (e.g. `api_key_auth`,
-   * `scrape_disabled`, `signin_required`).
-   *
-   * `signin_required` and `scrape_disabled` are deliberately distinct: the first
-   * is fixed by signing in again and costs nothing, the second by opting into a
-   * billed scrape. Reporting the second for the first told users to spend credits
-   * on a fetch that cannot authenticate.
+   * Why usage is unavailable when `available` is false (`api_key_auth` or
+   * `signin_required`); absent when the gateway simply holds no reading.
    */
   reason?: string
   credits_used?: number
@@ -2548,6 +2603,13 @@ export interface KiroUsagePayload {
   email?: string
   account_type?: string
   start_url?: string
+}
+
+/** `POST /api/sessions/usage/refresh` — the GET envelope plus the declined-scrape marker. */
+export interface KiroUsageRefreshResponse {
+  usage?: KiroUsagePayload
+  skipped?: 'scrape_parked'
+  retry_after?: number
 }
 
 export interface KiroBonusCreditGrant {
@@ -2837,6 +2899,9 @@ export interface MemberRosterRow {
   memory_version?: number
   memory_owner?: string
   model?: string
+  /** Optional presentation label shown in place of `name`. `name` stays the
+   *  identity every per-member route and binding is keyed on. */
+  display_name?: string
   /** Crew origin, NORMALIZED by the server to exactly 'kirocrew' (created in
    *  the crew manager), 'builtin', or 'package' (agent-sync-installed; the
    *  legacy 'aim' spelling and any unknown value collapse to this). */
@@ -3242,8 +3307,7 @@ export const api = {
   wakatimeExportDownload: async (start: string, end: string, format: 'csv' | 'json') => {
     const r = await get(api.wakatimeExportUrl(start, end, format))
     if (!r.ok) {
-      const t = await r.text()
-      throw new ApiError(r.status, t || `HTTP ${r.status}`)
+      throw await toApiError(r)
     }
     const blob = await r.blob()
     const cd = r.headers.get('Content-Disposition') || ''
@@ -3425,7 +3489,8 @@ export const api = {
   // Read-only governance policy viewer (Settings → Security). No write path —
   // the enterprise ceiling is file-authored and un-editable via the UI.
   governancePolicy: () => get('/api/governance/policy').then(j) as Promise<GovernancePolicyData>,
-  suggestions: (force?: boolean) => fetch(`/api/suggestions${force ? '?force=1' : ''}`).then(j) as Promise<{ suggestions: string[]; generated_at: number; stale: boolean }>,
+  // Items are a bare string (legacy / cached payloads) or `{ text, kind }`.
+  suggestions: (force?: boolean) => fetch(`/api/suggestions${force ? '?force=1' : ''}`).then(j) as Promise<{ suggestions: SuggestionItem[]; generated_at: number; stale: boolean }>,
   branding: () => fetch('/api/dashboard/branding').then(j) as Promise<{ bot_name: string; avatar: string; direct_local?: boolean }>,
   // Instances (multi-instance management) — owner-only, gated by instances.enabled.
   // listInstances throws ApiError(403) when the feature is disabled; callers
@@ -3473,15 +3538,7 @@ export const api = {
   exportSession: async (slot: string) => {
     const r = await get('/api/chat/slots/' + encodeURIComponent(slot) + '/export')
     if (!r.ok) {
-      let message = `HTTP ${r.status}`
-      try {
-        const body = await r.json()
-        if (body?.error) message = body.error
-      } catch {
-        // A non-JSON error body is not worth a second failure mode; the status
-        // line above is still a usable message.
-      }
-      throw new ApiError(r.status, message)
+      throw await toApiError(r)
     }
     const blob = await r.blob()
     const filename = filenameFromDisposition(
@@ -3747,6 +3804,16 @@ export const api = {
     history: { t: number; mb: number }[]
   }>,
   sessionsUsage: () => fetch('/api/sessions/usage').then(j) as Promise<{ usage?: KiroUsagePayload }>,
+  /**
+   * Refresh the credit reading now (the account modal's Refresh button). Same
+   * `{usage}` envelope as `sessionsUsage`, so `parseKiroUsagePayload` reads
+   * both. `skipped: 'scrape_parked'` (with `retry_after` seconds) means the
+   * free API returned no plan and the gateway has parked the `/usage` scrape
+   * after repeated failures, so no new reading was fetched: `usage` is a
+   * same-identity prior reading dimmed `stale`, or an unavailable marker. The
+   * one refusal is 409 `refresh_in_flight` while a refresh is already running.
+   */
+  sessionsUsageRefresh: () => post('/api/sessions/usage/refresh').then(j) as Promise<KiroUsageRefreshResponse>,
   providerUsage: () => fetch('/api/usage').then(j),
   mcpProbeCache: () => fetch('/api/mcp/probe').then(j),
   // Agents
@@ -3818,6 +3885,16 @@ export const api = {
       capped: boolean
       entries: MemberActivityEntry[]
     }>,
+  // The open member's folded projection views. The roster list carries only the
+  // `roster` view each list row paints; the drawer paints activity, wake and
+  // driving, and it is open for one member at a time, so it reads the whole block
+  // here rather than making every row in the list carry three views nothing on it
+  // reads. `member` is the exact crew name because the server checks it against
+  // the log's own header (slugs are lossy, so two crews can share one).
+  memberProjections: (slug: string, member: string) =>
+    fetch(
+      '/api/members/' + encodeURIComponent(slug) + '/projections?member=' + encodeURIComponent(member),
+    ).then(j) as Promise<ProjectionsBlock>,
   // The crew's published webview: metadata plus the composed document. Read
   // through this layer rather than a component-local `fetch`, like every sibling
   // above -- the members page's tests stub THIS module, so a hand-rolled fetch was
@@ -3911,6 +3988,14 @@ export const api = {
     }).then(j) as Promise<{ ok?: boolean; staged?: boolean; token?: string; error?: string }>
   },
   models: () => fetch('/api/models').then(j),
+  chatSlotSelectionCapabilities: (slot: string) =>
+    fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/selection-capabilities').then(j) as Promise<{
+      known: boolean
+      backend?: string
+      effort_supported?: boolean
+      effort_levels?: string[]
+      model_effort_pair_ids?: boolean
+    }>,
   effortLevels: (slot?: string) =>
     fetch('/api/effort-levels' + (slot ? '?slot=' + encodeURIComponent(slot) : '')).then(j) as Promise<string[]>,
   // Bounded HERE, not per initiator: react-query dedupes on the key, so the
@@ -3938,7 +4023,7 @@ export const api = {
   chatSlotsModel: (model: string, skip_running: boolean) =>
     post('/api/chat/slots/model', { model, skip_running }).then(j) as Promise<{ ok: boolean; model: string; switched: string[]; skipped_running: string[]; unchanged: string[]; failed: string[] }>,
   chatSlotReasoningEffort: (slot: string, reasoning_effort: string) =>
-    post('/api/chat/slots/' + encodeURIComponent(slot) + '/reasoning-effort', { reasoning_effort }).then(j) as Promise<{ ok?: boolean; reasoning_effort?: string; deferred?: boolean }>,
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/reasoning-effort', { reasoning_effort }).then(j) as Promise<{ ok?: boolean; reasoning_effort?: string; model?: string; deferred?: boolean }>,
   chatSlotWorkspace: (slot: string, workspace: string) =>
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/workspace', { workspace }).then(j),
   // Relaunch the slot's agent process in place (fresh agent spec, env, and MCP
@@ -3966,7 +4051,7 @@ export const api = {
   projectGit: (path: string) => fetch('/api/project/git?path=' + encodeURIComponent(path)).then(j) as Promise<{ path: string; repo: boolean; repoRoot?: string; branch?: string; detached?: boolean; head?: string }>,
   projectGitStatus: (path: string) => fetch('/api/project/git/status?path=' + encodeURIComponent(path)).then(j) as Promise<{ repo: boolean; repoRoot?: string; branch?: string; ahead?: number; behind?: number; truncated?: boolean; files: { path: string; status: string; staged: boolean; additions?: number; deletions?: number }[] }>,
   projectGitLog: (path: string, limit = 20) => fetch('/api/project/git/log?path=' + encodeURIComponent(path) + '&limit=' + limit).then(j) as Promise<{ repo: boolean; commits: { sha: string; message: string; author: string; date: string; isHead: boolean }[] }>,
-  projectTree: (path: string) => fetch('/api/project/tree?path=' + encodeURIComponent(path)).then(j) as Promise<{ root: string; paths: string[]; directories?: string[]; repo: boolean; truncated?: boolean; truncatedDirectories?: string[] }>,
+  projectTree: (path: string) => fetch('/api/project/tree?path=' + encodeURIComponent(path)).then(j) as Promise<{ root: string; paths: string[]; directories?: string[]; repo: boolean; truncated?: boolean; truncatedDirectories?: string[]; hiddenOnlyDirectories?: string[]; unreadableDirectories?: string[] }>,
   workspaces: () => fetch('/api/workspaces').then(j),
   createWorkspace: (body: object) => post('/api/workspaces', body).then(j),
   updateWorkspace: (name: string, body: object) =>
@@ -4573,7 +4658,7 @@ export const api = {
   chatFolders: () => fetch('/api/chat/folders', { headers: { ..._sk } }).then(j),
   /** `config` carries the folder settings the create modal collects. Each is
    *  omitted when empty so the backend applies its own default. */
-  createChatFolder: (name: string, parentId?: string, config?: { project_dir?: string; default_agent?: string; color?: string; icon?: string; tags?: string[] }) =>
+  createChatFolder: (name: string, parentId?: string, config?: { project_dir?: string; default_agent?: string; color?: string; icon?: string; tags?: string[]; steering_dirs?: string[] }) =>
     post('/api/chat/folders', { name, parent_id: parentId || '', ...(config ?? {}) }).then(j),
   updateChatFolder: (id: string, body: object) => patch('/api/chat/folders/' + encodeURIComponent(id), body).then(j),
   /** Set several folders' `order` in ONE atomic request. The sidebar drag
@@ -4854,8 +4939,7 @@ export const api = {
   exportPlanYaml: async (taskId: string) => {
     const r = await get('/api/taskrunner/' + encodeURIComponent(taskId) + '/plan.yaml')
     if (!r.ok) {
-      const t = await r.text()
-      throw new ApiError(r.status, t || `HTTP ${r.status}`)
+      throw await toApiError(r)
     }
     const blob = await r.blob()
     const cd = r.headers.get('Content-Disposition') || ''
@@ -5014,6 +5098,8 @@ export const api = {
     import_onboarded?: boolean
     /** Gates the gateway's first heartbeat; see `beacon.telemetry_permitted`. */
     privacy_acked?: boolean
+    /** Set once the first-run Meet CrewMates flow was finished or dismissed. */
+    crewmates_onboarded?: boolean
   }) =>
     put('/api/config/theme', body).then(j),
   // Voice
@@ -5063,6 +5149,14 @@ export const api = {
   revokeFileDeliveryConsent: (destinationClass: string) =>
     del('/api/file-delivery/consent?destination_class=' + encodeURIComponent(destinationClass))
       .then(j) as Promise<{ ok?: boolean; removed?: boolean }>,
+  // Credential-redaction switch (Settings > Security > Credential redaction).
+  // Two explicit verbs for the same reason the consent helpers above keep
+  // theirs: the handler applies the owner gate to the read and the write
+  // separately, and the write is the ONLY writer of the keystone.
+  credentialRedaction: () =>
+    fetch('/api/security/credential-redaction').then(j) as Promise<CredentialRedactionState>,
+  setCredentialRedaction: (enabled: boolean) =>
+    put('/api/security/credential-redaction', { enabled }).then(j) as Promise<CredentialRedactionState>,
   voiceSynthesize: (slot: string, text: string, opts?: { voice?: string; engine?: string; rate?: string; pitch?: string; request_id?: string }) => {
     const request_id = opts?.request_id || createVoiceRequestId()
     window.dispatchEvent(new CustomEvent('voice-synthesis-start', { detail: { slot, request_id } }))
@@ -5608,8 +5702,7 @@ export const api = {
     const r = await post(item.endpoint, { item_id: item.id, ...ctx }, sessionKey, undefined, 'error')
     checkSessionExpired(r)
     if (r.ok) { removeAuthBanner(); return r.json() }
-    const errText = await r.text()
-    throw new ApiError(r.status, errText || `HTTP ${r.status}`)
+    throw await toApiError(r)
   },
 
   artifactTeardown: (slug: string) => post(`/api/deploy/teardown/${slug}`, { confirm: true }).then(j),
@@ -5652,8 +5745,7 @@ export const api = {
     if (r.ok) { removeAuthBanner(); return r.json() }
     // 409 = scan blocked — parse body so PublishHub can render findings panel
     if (r.status === 409) { return r.json() }
-    const errText = await r.text()
-    throw new ApiError(r.status, errText || `HTTP ${r.status}`)
+    throw await toApiError(r)
   },
 
   // Tips

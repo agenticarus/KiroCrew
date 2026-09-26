@@ -12,6 +12,7 @@ import SegmentedControl from '../components/SegmentedControl'
 import { SettingRef } from '../components/settingRef/SettingRef'
 import { Btn, Card, CardTitle, EmptyState } from '../components/ui'
 import { useSortableTable } from '../hooks/useSortableTable'
+import { usePersistedBool } from '../hooks/usePersistedBool'
 import { usePersistedString } from '../hooks/usePersistedString'
 import { compareText, fmtBytes, fmtDateNumeric, fmtNumber, fmtPercent, fmtTimeNumeric, fmtUnit } from '../i18n/format'
 import { i18nT } from '../i18n/t'
@@ -95,6 +96,18 @@ type Other = {
   other_generations?: number
   total_count?: number
   total?: number
+  // A histogram whose values are NOT milliseconds carries this family instead of
+  // the `*_ms` one, plus the `unit` its values are in ("By" for a byte count,
+  // "1" for a dimensionless ratio). The backend keeps the two families apart
+  // because a resident set reported as `p50_ms` is a unit lie; the panel must
+  // therefore read WHICHEVER family a row carries, or the distribution is
+  // collected and then dropped at the render.
+  unit?: string
+  p50?: number
+  p90?: number
+  min?: number
+  max?: number
+  mean?: number
   // Present on gauge instruments only: the newest point-in-time sample.
   // Summing a gauge across export cycles would misreport process state, so
   // the API keeps the latest value and the panel must read THIS field.
@@ -292,6 +305,13 @@ type Col<R> = {
   color?: (r: R) => string | undefined
   /** Responsive drop class, applied to the header and its cells together. */
   hide?: string
+  /**
+   * Hover text on the column head, for a column whose VALUES cannot say where
+   * they came from. Two tabs of this page each carry a session-origin column
+   * derived a different way, and a bare noun in the head leaves a reader no way
+   * to tell which question a column answers.
+   */
+  tip?: string
 }
 
 /**
@@ -309,6 +329,7 @@ function HeadCell({
   active,
   desc,
   onToggle,
+  tip,
 }: {
   label: string
   left?: boolean
@@ -316,12 +337,17 @@ function HeadCell({
   active: boolean
   desc: boolean
   onToggle: () => void
+  tip?: string
 }) {
   return (
     <th
       className={`${HEAD_BASE} ${left ? 'text-left' : 'text-right'} ${hide ?? ''}`}
       aria-sort={active ? (desc ? 'descending' : 'ascending') : 'none'}
     >
+      {/* One line, whatever the column width: the tip is a 16px circle after a
+          short label, and letting it wrap put the glyph on a row of its own and
+          made every tipped header two lines tall. */}
+      <span className="inline-flex items-center gap-1 whitespace-nowrap align-middle">
       <Btn
         type="button"
         onClick={onToggle}
@@ -345,6 +371,12 @@ function HeadCell({
             <ChevronUp size={12} aria-hidden="true" className="lucide-inline" />
           ))}
       </Btn>
+      {/* Outside the Btn, never inside it: nesting the tip's own control in the
+          sort button would make one click both sort the table and open the tip,
+          and a button inside a button is invalid markup a screen reader cannot
+          announce as two actions. */}
+      {tip ? <InfoTip text={tip} placement="top" /> : null}
+      </span>
     </th>
   )
 }
@@ -446,6 +478,7 @@ function DataTable<R>({
                     active={c.key === activeKey}
                     desc={desc}
                     onToggle={() => toggle(c.key)}
+                    tip={c.tip}
                   />
                 ))}
               </tr>
@@ -548,14 +581,36 @@ function Sums({ items }: { items: Sum[] }) {
  * slowest. Each bar therefore answers "how long is THIS one's tail"; the numbers
  * beside it stay comparable across rows.
  *
- * A zero minimum has no logarithm, so the axis starts at a sub-millisecond floor
- * rather than at zero. That is a floor on the AXIS, not a claim about the data —
- * the real min is printed next to the bar.
+ * A zero minimum has no logarithm, so the axis starts at a floor below the
+ * smallest reading worth plotting rather than at zero. That is a floor on the
+ * AXIS, not a claim about the data — the real min is printed next to the bar.
+ * The floor arrives with the row because it belongs to the row's own scale: 0.5
+ * sits below any millisecond worth plotting and ABOVE most of a CPU share, where
+ * it would clamp every point onto the left edge and flatten the bar.
  */
 const _LOG_FLOOR_MS = 0.5
 
-function RangeBar({ min, p50, p90, max }: { min: number; p50: number; p90: number; max: number }) {
-  const lo = Math.max(min, _LOG_FLOOR_MS)
+function RangeBar({
+  min,
+  p50,
+  p90,
+  max,
+  fmt = fmtMs,
+  floor = _LOG_FLOOR_MS,
+}: {
+  min: number
+  p50: number
+  p90: number
+  max: number
+  // The row's own formatter and axis floor. Defaulted to the millisecond family
+  // because that is what every duration caller means, and a byte or ratio row
+  // reading out as milliseconds in its accessible label is the same unit lie the
+  // visible cells avoid -- a screen reader would be the only surface still told
+  // that a resident set is a duration.
+  fmt?: (v: number) => string
+  floor?: number
+}) {
+  const lo = Math.max(min, floor)
   const hi = Math.max(max, lo * 1.001)
   const span = Math.log10(hi) - Math.log10(lo)
   const at = (v: number) =>
@@ -567,10 +622,10 @@ function RangeBar({ min, p50, p90, max }: { min: number; p50: number; p90: numbe
       className="relative h-1.5 w-full rounded-full bg-[var(--bg)]"
       role="img"
       aria-label={i18nT('pages.telemetryPanel.range_bar_label', {
-        min: fmtMs(min),
-        p50: fmtMs(p50),
-        p90: fmtMs(p90),
-        max: fmtMs(max),
+        min: fmt(min),
+        p50: fmt(p50),
+        p90: fmt(p90),
+        max: fmt(max),
       })}
     >
       {/* p50→p90: where the bulk of the samples land. */}
@@ -596,21 +651,44 @@ function RangeBar({ min, p50, p90, max }: { min: number; p50: number; p90: numbe
  * which is exactly what a distribution needs — unlike the sortable bucket table
  * this replaces, where sorting by count destroyed the bound order that IS the
  * shape.
+ *
+ * `label` is a node so a caller can style or link it; the widths either side of
+ * the bar are the caller's because they set how much track is left, and a track
+ * squeezed to nothing is a row that has stopped saying anything.
+ *
+ * `barDecorative` hides the bar from assistive technology, for a caller whose
+ * label and figure already carry the row's facts as text — reading the bar too
+ * announces the row twice. It is opt-in because muting a bar is a change to what
+ * a reader is told, and that belongs to the caller that wants it rather than to
+ * every caller of this function.
  */
-function Histogram({ rows }: { rows: { label: string; count: number }[] }) {
+function Histogram({
+  rows,
+  labelClass = 'w-20 text-right font-mono text-muted',
+  valueClass = 'w-12',
+  barDecorative = false,
+}: {
+  rows: { key: string; label: React.ReactNode; count: number; title?: string }[]
+  labelClass?: string
+  valueClass?: string
+  barDecorative?: boolean
+}) {
   const peak = Math.max(1, ...rows.map(r => r.count))
   return (
     <div className="flex flex-col gap-1">
       {rows.map(r => (
-        <div key={r.label} className="flex items-center gap-2.5 text-[11px]">
-          <span className="w-20 shrink-0 text-right font-mono text-muted">{r.label}</span>
-          <div className="h-2 min-w-0 flex-1 overflow-hidden rounded-sm bg-[var(--bg)]">
+        <div key={r.key} className="flex items-center gap-2.5 text-[11px]" title={r.title}>
+          <span className={`${labelClass} shrink-0 min-w-0`}>{r.label}</span>
+          <div
+            aria-hidden={barDecorative || undefined}
+            className="h-2 min-w-0 flex-1 overflow-hidden rounded-sm bg-[var(--bg)]"
+          >
             <span
               className="block h-full rounded-sm"
               style={{ width: `${(r.count / peak) * 100}%`, background: 'var(--muted-strong)' }}
             />
           </div>
-          <span className="w-12 shrink-0 text-right font-mono tabular-nums">{fmtNumber(r.count)}</span>
+          <span className={`${valueClass} shrink-0 text-right font-mono tabular-nums`}>{fmtNumber(r.count)}</span>
         </div>
       ))}
     </div>
@@ -810,6 +888,12 @@ function convoCols(navigable: string): Col<CostConvo>[] {
     {
       key: 'category',
       label: i18nT('pages.telemetryPanel.category_col'),
+      // Names which surface OWNS the session, from the session key. The Context
+      // tab's own origin column reads the token row's `surface` field instead,
+      // which answers a different question — which code path RAN one turn — so
+      // the same session can legitimately read `bg` here and `heartbeat` there.
+      // The tip is what carries that, because the values alone cannot.
+      tip: i18nT('pages.telemetryPanel.category_col_tip'),
       left: true,
       // Rendered verbatim: these are backend enum values (`dashboard`, `bg`,
       // `telegram`, `slack`), i.e. data, not copy to translate — the same
@@ -897,9 +981,19 @@ function categoryLabel(name: string): string {
   return name === 'bg' ? i18nT('pages.telemetryPanel.category_bg') : name
 }
 
-function shareCols(first: string, total: number): Col<CostRow>[] {
+function shareCols(first: string, total: number, firstTip?: string): Col<CostRow>[] {
   return [
-    { key: 'name', label: first, left: true, sort: r => r.name, render: r => categoryLabel(r.name) },
+    {
+      key: 'name',
+      label: first,
+      // The grouped view asks the same question of the same values as the
+      // session table's column, so it earns the same tip when that is the
+      // grouping in force; grouping by model leaves it unset.
+      tip: firstTip,
+      left: true,
+      sort: r => r.name,
+      render: r => categoryLabel(r.name),
+    },
     {
       key: 'credits',
       label: i18nT('pages.telemetryPanel.credits_col'),
@@ -929,13 +1023,162 @@ function shareCols(first: string, total: number): Col<CostRow>[] {
 
 const SPEND_GROUPS = ['session', 'category', 'model'] as const
 
+/**
+ * How many rows a spend block plots before the remainder folds into one row.
+ *
+ * Five keeps the two grouping blocks the same height beside each other. The
+ * session list gets eight because it is the block a reader scans for a name,
+ * and five names is too few to find one in.
+ */
+const SPEND_GROUP_ROWS = 5
+const SPEND_SESSION_ROWS = 8
+
+type SpendBar = { label: React.ReactNode; credits: number; title?: string }
+
+/**
+ * A titled bar block: heading, its own empty state, and an optional footnote.
+ *
+ * Credits render as bars on one shared scale, longest first, so the block answers
+ * "how much of the window landed here" by shape rather than by reading five
+ * numbers and dividing. The figure stays beside the bar because a bar cannot be
+ * quoted. The scale is per block: session totals and grouping totals are
+ * different populations — one session against every session's origin — so a
+ * shared axis would flatten whichever block holds the smaller numbers.
+ *
+ * The heading is a flex row because `InfoTip` renders a `display: flex` button.
+ * In a normal-flow block that button is a block-level box, so it drops onto a
+ * line of its own and the bare "?" reads as a stray control.
+ *
+ * `note` describes the rows, so it renders only when there are rows; under an
+ * empty state it is a caption for nothing.
+ */
+function SpendBlock({
+  title,
+  tip,
+  rows,
+  labelClass,
+  note,
+}: {
+  title: string
+  tip?: string
+  rows: SpendBar[]
+  labelClass: string
+  note?: string
+}) {
+  return (
+    <div className="min-w-0">
+      <div className="flex items-center gap-1 text-[10px] text-muted uppercase tracking-wide mb-1.5">
+        {title}
+        {tip && <InfoTip text={tip} />}
+      </div>
+      {rows.length > 0 ? (
+        <>
+          <Histogram
+            rows={rows.map((r, i) => ({ key: String(i), label: r.label, count: r.credits, title: r.title }))}
+            labelClass={labelClass}
+            valueClass="w-14"
+            barDecorative
+          />
+          {note && <div className="text-[10px] text-muted mt-1.5">{note}</div>}
+        </>
+      ) : (
+        <EmptyState
+          icon={<Coins className="lucide-inline" />}
+          title={i18nT('pages.telemetryPanel.no_spend_recorded')}
+        />
+      )}
+    </div>
+  )
+}
+
+/**
+ * One grouping's rows as bars, with everything past `limit` summed into a single
+ * trailing row.
+ *
+ * A grouping carries as many names as the window saw, most of them a bar a pixel
+ * wide. Folding the tail keeps the block scannable while every credit stays on
+ * screen, so the block and the table below it account for the same total.
+ */
+function groupBars(rows: CostRow[], limit: number): SpendBar[] {
+  const sorted = [...rows].sort((a, b) => b.credits - a.credits)
+  const bars: SpendBar[] = sorted.slice(0, limit).map(r => ({
+    credits: r.credits,
+    // Monospace for the same reason the table's cells use it: a model id and a
+    // session-origin enum are tokens to compare character by character. The
+    // title reveals the raw value behind a translated label.
+    label: (
+      <span className="block truncate font-mono text-muted" title={r.name}>
+        {categoryLabel(r.name)}
+      </span>
+    ),
+  }))
+  const rest = sorted.slice(limit)
+  if (rest.length > 0) {
+    bars.push({
+      credits: rest.reduce((sum, r) => sum + r.credits, 0),
+      // The folded names themselves, so the row says WHAT it folded. The row is
+      // inert, and a fold that names nothing reads as something to click.
+      title: rest.map(r => categoryLabel(r.name)).join(', '),
+      label: (
+        <span className="block truncate text-muted">
+          {i18nT('pages.telemetryPanel.other_group', { n: fmtNumber(rest.length) })}
+        </span>
+      ),
+    })
+  }
+  return bars
+}
+
+/**
+ * The biggest-spending sessions as bars.
+ *
+ * Named and linked through `sessionLabel` and `linksToConversation`, the same two
+ * rules the table's own session column uses, so the block and the table cannot
+ * disagree about what a row is called or whether it can be opened.
+ */
+function sessionBars(convos: CostConvo[], navigable: string, limit: number): SpendBar[] {
+  return [...convos]
+    .sort((a, b) => b.credits - a.credits)
+    .slice(0, limit)
+    .map(v => ({
+      credits: v.credits,
+      label: linksToConversation(v, navigable) ? (
+        <Link
+          to={`/chat?sid=${encodeURIComponent(v.slot)}`}
+          className="block truncate text-[var(--accent)] hover:underline"
+          title={v.title}
+        >
+          {v.title}
+        </Link>
+      ) : (
+        // The title attribute holds the slot, which this block has no column to
+        // show: an inert row still has to be identifiable.
+        <span className="block truncate text-muted" title={v.slot}>
+          {sessionLabel(v, v.slot)}
+        </span>
+      ),
+    }))
+}
+
 function SpendTab({ c }: { c: Cost }) {
   const [group, setGroup] = usePersistedChoice<SpendGroup>(
     'telemetry:spend-group',
     SPEND_GROUPS,
     'session',
   )
+  // Closed on first paint. The table answers "which row exactly", which is a
+  // second question: the blocks above it already say where the credits went, and
+  // opening on 45 rows puts the answer below the fold.
+  const [tableOpen, setTableOpen] = usePersistedBool('telemetry:spend-table-open', false)
   const bands = c.context_bands
+  // Shown as "8 / 252" when the payload clamps the list. With the count alone, a
+  // reader who looks for a conversation outside the slice reads "no rows match"
+  // as "it spent nothing"; the ratio states the truncation. The pair is equal on
+  // a full payload, where the plain count is the honest form.
+  const sessionsValue =
+    c.conversations.length === c.conversation_count
+      ? fmtNumber(c.conversation_count)
+      : `${fmtNumber(c.conversations.length)} / ${fmtNumber(c.conversation_count)}`
   return (
     <Card className="mb-4">
       <CardTitle>
@@ -953,63 +1196,36 @@ function SpendTab({ c }: { c: Cost }) {
       <div className="text-[10px] text-muted -mt-2 mb-2.5">
         {i18nT('pages.telemetryPanel.measured_from_token_records', { days: fmtNumber(c.window_days) })}
       </div>
-      <div className="flex flex-wrap items-center gap-2 mb-2">
-        <span className="text-[10px] text-muted uppercase tracking-wide">
-          {i18nT('pages.telemetryPanel.group_by')}
-        </span>
-        <SegmentedControl<SpendGroup>
-          collapse={false}
-          value={group}
-          onChange={setGroup}
-          segments={[
-            { key: 'session', label: i18nT('pages.telemetryPanel.session_col') },
-            { key: 'category', label: i18nT('pages.telemetryPanel.category_col') },
-            { key: 'model', label: i18nT('pages.telemetryPanel.model_col') },
-          ]}
-        />
-      </div>
-      {group === 'session' ? (
-        <DataTable<CostConvo>
-          rows={c.conversations}
-          key="telemetry-spend-conversation"
-          tableId="telemetry-spend-conversation"
-          cols={convoCols(c.navigable_category)}
-          rowKey={v => v.slot}
-          defaultSort="credits"
-          emptyTitle={i18nT('pages.telemetryPanel.no_spend_recorded')}
-          renderExpanded={v => <SessionTurnsDrilldown slot={v.slot} />}
-        />
-      ) : (
-        <DataTable<CostRow>
-          rows={group === 'model' ? c.by_model : c.by_category}
-          key="telemetry-spend-share"
-          tableId="telemetry-spend-share"
-          cols={shareCols(
-            group === 'model'
-              ? i18nT('pages.telemetryPanel.model_col')
-              : i18nT('pages.telemetryPanel.category_col'),
-            c.credits,
-          )}
-          rowKey={r => r.name}
-          defaultSort="credits"
-          emptyTitle={i18nT('pages.telemetryPanel.no_spend_recorded')}
-        />
-      )}
       <Sums
         items={[
           {
             label: i18nT('pages.telemetryPanel.credits_col'),
             value: fmtNumber(c.credits),
             color: 'var(--accent)',
-            sub: i18nT('pages.telemetryPanel.turns_measured', { count: c.turns, n: fmtNumber(c.turns) }),
-          },
-          {
-            label: i18nT('pages.telemetryPanel.vs_previous_period'),
-            value: fmtDelta(c.delta_pct),
-            sub: i18nT('pages.telemetryPanel.prior_credits_turns', {
-              credits: fmtNumber(c.prior_credits),
-              turns: fmtNumber(c.prior_turns),
-            }),
+            // The change rides on the total it describes. A percentage standing
+            // on its own cannot say whether it moved 12 credits or 1,200, and
+            // the label comes first so the "no prior spend" case reads as a
+            // sentence rather than as a number's unit.
+            //
+            // Both lines live in `note`, in this order, so "vs previous period"
+            // introduces the pair below it. This tile's label is "Credits", which
+            // lends the prior pair no period sense of its own: sitting directly
+            // under the current total, an unqualified "credits 9,400" reads as a
+            // component of it rather than as the window before.
+            note: (
+              <>
+                <div className="text-[10px] text-muted mt-0.5">
+                  {c.delta_pct != null && <>{i18nT('pages.telemetryPanel.vs_previous_period')} </>}
+                  <span className="text-text tabular-nums">{fmtDelta(c.delta_pct)}</span>
+                </div>
+                <div className="text-[10px] text-muted">
+                  {i18nT('pages.telemetryPanel.prior_credits_turns', {
+                    credits: fmtNumber(c.prior_credits),
+                    turns: fmtNumber(c.prior_turns),
+                  })}
+                </div>
+              </>
+            ),
           },
           {
             label: i18nT('pages.telemetryPanel.per_turn_col'),
@@ -1017,26 +1233,118 @@ function SpendTab({ c }: { c: Cost }) {
             sub: i18nT('pages.telemetryPanel.was_value', { value: fmtNumber(c.prior_per_turn) }),
           },
           {
-            label: i18nT('pages.telemetryPanel.priciest_turn'),
-            value: fmtNumber(c.priciest.credits),
+            label: i18nT('pages.telemetryPanel.turns_col'),
+            value: fmtNumber(c.turns),
           },
           {
-            // Shown as "8 / 252", not a bare 252: the table carries only the top
-            // spenders, and with the count alone a reader who filtered for a
-            // conversation outside that slice got "no rows match" and could
-            // reasonably conclude it had spent nothing. The ratio states the
-            // truncation without inventing new copy for it.
-            label: i18nT('pages.telemetryPanel.sessions_col'),
-            // The list is no longer truncated, so the pair is now equal on every
-            // real payload and "45 / 45" spends a stat slot saying nothing. The
-            // ratio still appears if the payload backstop ever does clamp.
-            value: c.conversations.length === c.conversation_count
-              ? fmtNumber(c.conversation_count)
-              : `${fmtNumber(c.conversations.length)} / ${fmtNumber(c.conversation_count)}`,
-            sub: i18nT('pages.telemetryPanel.top_spenders_link_to_chat'),
+            label: i18nT('pages.telemetryPanel.priciest_turn'),
+            value: fmtNumber(c.priciest.credits),
+            // The unit, because a bare number under "Priciest turn" reads as a
+            // turn's ordinal just as readily as its cost.
+            sub: i18nT('pages.telemetryPanel.credits_col'),
           },
         ]}
       />
+      {/* Both groupings at once. As a group-by over one table they were mutually
+          exclusive: seeing which origin spent the credits meant giving up the
+          model split, so no single screen answered where the window went.
+
+          Side by side only from `xl`. Each row spends a fixed label column plus a
+          fixed figure column, and in a half-width column below that the bar track
+          is what absorbs the shortfall — it reaches nearly zero, which removes the
+          compare-by-shape these blocks exist for. Below `xl` they stack, so both
+          still answer without a click and both keep their bars. */}
+      <div className="grid gap-x-8 gap-y-4 mt-4 xl:grid-cols-2">
+        <SpendBlock
+          title={i18nT('pages.telemetryPanel.credits_by_origin')}
+          tip={i18nT('pages.telemetryPanel.category_col_tip')}
+          rows={groupBars(c.by_category, SPEND_GROUP_ROWS)}
+          labelClass="w-32"
+        />
+        <SpendBlock
+          title={i18nT('pages.telemetryPanel.credits_by_model')}
+          rows={groupBars(c.by_model, SPEND_GROUP_ROWS)}
+          labelClass="w-32"
+        />
+      </div>
+      <div className="mt-4">
+        <SpendBlock
+          title={i18nT('pages.telemetryPanel.top_sessions')}
+          rows={sessionBars(c.conversations, c.navigable_category, SPEND_SESSION_ROWS)}
+          labelClass="w-[46%]"
+          note={i18nT('pages.telemetryPanel.top_spenders_link_to_chat')}
+        />
+      </div>
+      <div className="border-t border-border mt-4 pt-3">
+        <Btn
+          type="button"
+          className="flex items-center gap-2 px-1 py-0.5 border-none text-muted hover:text-text rounded"
+          aria-expanded={tableOpen}
+          onClick={() => setTableOpen(!tableOpen)}
+        >
+          {tableOpen ? (
+            <ChevronDown className="lucide-inline" size={14} />
+          ) : (
+            <ChevronRight className="lucide-inline" size={14} />
+          )}
+          <span className="text-[10px] uppercase tracking-wide">
+            {i18nT('pages.telemetryPanel.full_table')}
+          </span>
+          {/* The row count belongs on the closed header: it is what tells a
+              reader whether opening the table is worth it. */}
+          <span className="text-[10px] uppercase tracking-wide">
+            {i18nT('pages.telemetryPanel.sessions_col')}{' '}
+            <span className="font-mono tabular-nums text-text normal-case">{sessionsValue}</span>
+          </span>
+        </Btn>
+        {tableOpen && (
+          <div className="mt-2.5">
+            <div className="flex flex-wrap items-center gap-2 mb-2">
+              <span className="text-[10px] text-muted uppercase tracking-wide">
+                {i18nT('pages.telemetryPanel.group_by')}
+              </span>
+              <SegmentedControl<SpendGroup>
+                collapse={false}
+                value={group}
+                onChange={setGroup}
+                segments={[
+                  { key: 'session', label: i18nT('pages.telemetryPanel.session_col') },
+                  { key: 'category', label: i18nT('pages.telemetryPanel.category_col') },
+                  { key: 'model', label: i18nT('pages.telemetryPanel.model_col') },
+                ]}
+              />
+            </div>
+            {group === 'session' ? (
+              <DataTable<CostConvo>
+                rows={c.conversations}
+                key="telemetry-spend-conversation"
+                tableId="telemetry-spend-conversation"
+                cols={convoCols(c.navigable_category)}
+                rowKey={v => v.slot}
+                defaultSort="credits"
+                emptyTitle={i18nT('pages.telemetryPanel.no_spend_recorded')}
+                renderExpanded={v => <SessionTurnsDrilldown slot={v.slot} />}
+              />
+            ) : (
+              <DataTable<CostRow>
+                rows={group === 'model' ? c.by_model : c.by_category}
+                key="telemetry-spend-share"
+                tableId="telemetry-spend-share"
+                cols={shareCols(
+                  group === 'model'
+                    ? i18nT('pages.telemetryPanel.model_col')
+                    : i18nT('pages.telemetryPanel.category_col'),
+                  c.credits,
+                  group === 'model' ? undefined : i18nT('pages.telemetryPanel.category_col_tip'),
+                )}
+                rowKey={r => r.name}
+                defaultSort="credits"
+                emptyTitle={i18nT('pages.telemetryPanel.no_spend_recorded')}
+              />
+            )}
+          </div>
+        )}
+      </div>
       {bands.length > 0 && (
         // The former "cost by context size" section, which was five rows of bar
         // to carry five numbers. Occupancy is already a column on the rows
@@ -1216,6 +1524,11 @@ function sessionCols(
     {
       key: 'surface',
       label: i18nT('pages.telemetryPanel.surface_col'),
+      // Read from the turn's own row, so it names the code path that RAN the
+      // turn. A monitor nudge or a webhook turn says so here while its credits
+      // stay booked to the conversation that owns the session, which is what
+      // the Spend tab's own origin column reports.
+      tip: i18nT('pages.telemetryPanel.surface_col_tip'),
       left: true,
       hide: 'max-[1100px]:hidden',
       sort: s => s.surface,
@@ -1306,11 +1619,15 @@ function ContextTab({
  */
 
 function LatencyTab({ other, days }: { other: Other[]; days: number }) {
+  // Split on the KIND the API states, not on whether `p50_ms` is present. A
+  // histogram in a unit other than milliseconds carries `p50`/`max` instead, so
+  // the presence test sent it to the counter list, which renders its count and
+  // throws the distribution away. Reading the kind means a future non-ms
+  // instrument lands here without anyone remembering to add a field test.
+  const isHist = (o: Other) => o.kind === 'histogram'
   // Histograms first and by volume: a counter has no percentiles to shape, so it
   // cannot carry a profile bar and belongs after the things that can.
-  const hist = other
-    .filter(o => o.p50_ms != null && o.max_ms != null)
-    .sort((a, b) => (b.count ?? 0) - (a.count ?? 0))
+  const hist = other.filter(isHist).sort((a, b) => (b.count ?? 0) - (a.count ?? 0))
   // Gauges are point-in-time readings (thread count, RSS): their number is
   // `latest`, and folding them under Counters would render the one field a
   // gauge never carries.
@@ -1318,8 +1635,37 @@ function LatencyTab({ other, days }: { other: Other[]; days: number }) {
   // ~4.4 GB; byte-unit gauges get human units (exact value stays in `title`).
   const fmtGaugeValue = (name: string, v: number): string =>
     name.endsWith('_bytes') ? fmtBytes(v) : fmtNumber(v)
-  const gauges = other.filter(o => o.p50_ms == null && o.kind === 'gauge')
-  const counters = other.filter(o => o.p50_ms == null && o.kind !== 'gauge')
+  const gauges = other.filter(o => !isHist(o) && o.kind === 'gauge')
+  // The residual, so a kind this panel does not know still appears somewhere
+  // rather than vanishing from the page.
+  const counters = other.filter(o => !isHist(o) && o.kind !== 'gauge')
+
+  // One row shape for both families. The unit picks the formatter and the axis
+  // floor, because the number alone cannot say whether 0.0625 is a ratio or 62
+  // milliseconds: a resident set reads in GiB and a CPU share as a percentage,
+  // and a row with no unit is the millisecond family this table was built for.
+  const scaleFor = (unit?: string): { fmt: (v: number) => string; floor: number } => {
+    if (unit === 'By') return { fmt: fmtBytes, floor: 1 }
+    // A share of one machine's cores, shown as a percentage: 0.0625 reads as a
+    // rounding artefact where 6.3% reads as a share. The floor is a tenth of a
+    // percent of one core, under the smallest share worth plotting.
+    if (unit === '1') return { fmt: v => fmtPercent(v, { maximumFractionDigits: 1 }), floor: 0.001 }
+    return { fmt: fmtMs, floor: _LOG_FLOOR_MS }
+  }
+  const histRow = (o: Other) => {
+    // The UNIT decides the family, not whether a percentile arrived. A non-ms
+    // histogram with no samples in the window reports only count and unit, so a
+    // presence test on `p50` routes that row to fmtMs and prints a byte count as
+    // "0ms" -- the unit lie this split exists to prevent.
+    const neutral = o.p50_ms == null && o.unit != null
+    return {
+      min: (neutral ? o.min : o.min_ms) ?? 0,
+      p50: (neutral ? o.p50 : o.p50_ms) ?? 0,
+      p90: (neutral ? o.p90 : o.p90_ms) ?? 0,
+      max: (neutral ? o.max : o.max_ms) ?? 0,
+      ...scaleFor(neutral ? o.unit : undefined),
+    }
+  }
 
   return (
     <Card className="mb-4">
@@ -1352,7 +1698,9 @@ function LatencyTab({ other, days }: { other: Other[]; days: number }) {
             <span className="w-16 shrink-0 text-right">{i18nT('pages.telemetryPanel.samples_col')}</span>
           </div>
           <div className="flex min-w-max flex-col gap-2">
-            {hist.map(o => (
+            {hist.map(o => {
+              const r = histRow(o)
+              return (
               <div key={o.name} className="flex items-center gap-3 text-[11.5px]">
                 <span className="w-[260px] shrink-0 truncate font-mono text-[11px]" title={o.name}>
                   {o.name}
@@ -1360,21 +1708,16 @@ function LatencyTab({ other, days }: { other: Other[]; days: number }) {
                 {/* The endpoints flank the bar so each row is visibly its own
                     scale, rather than a position on a shared axis it never had. */}
                 <span className="w-14 shrink-0 text-right font-mono tabular-nums text-muted">
-                  {fmtMs(o.min_ms)}
+                  {r.fmt(r.min)}
                 </span>
                 <div className="min-w-0 flex-1">
-                  <RangeBar
-                    min={o.min_ms ?? 0}
-                    p50={o.p50_ms ?? 0}
-                    p90={o.p90_ms ?? 0}
-                    max={o.max_ms ?? 0}
-                  />
+                  <RangeBar min={r.min} p50={r.p50} p90={r.p90} max={r.max} fmt={r.fmt} floor={r.floor} />
                 </div>
                 <span className="w-14 shrink-0 font-mono tabular-nums text-muted">
-                  {fmtMs(o.max_ms)}
+                  {r.fmt(r.max)}
                 </span>
-                <span className="w-16 shrink-0 text-right font-mono tabular-nums">{fmtMs(o.p50_ms)}</span>
-                <span className="w-16 shrink-0 text-right font-mono tabular-nums">{fmtMs(o.p90_ms)}</span>
+                <span className="w-16 shrink-0 text-right font-mono tabular-nums">{r.fmt(r.p50)}</span>
+                <span className="w-16 shrink-0 text-right font-mono tabular-nums">{r.fmt(r.p90)}</span>
                 <span className="flex w-16 shrink-0 items-center justify-end gap-1 text-right font-mono tabular-nums text-muted">
                   {fmtNumber(o.count ?? 0)}
                   {/* The window can span a boundary change, and stats() then describe
@@ -1383,7 +1726,8 @@ function LatencyTab({ other, days }: { other: Other[]; days: number }) {
                   <GenNote shown={o.count} total={o.total_count} compact />
                 </span>
               </div>
-            ))}
+              )
+            })}
           </div>
           </div>
           {/* The marker says WHICH rows are partial; this says what the marker
@@ -1566,7 +1910,7 @@ function StartupTab({ s, faults, total, days }: { s: Startup; faults: number; to
             title={i18nT('pages.telemetryPanel.no_startups_recorded')}
           />
         ) : (
-          <Histogram rows={buckets} />
+          <Histogram rows={buckets.map(b => ({ key: String(b.idx), label: b.label, count: b.count }))} />
         )
       ) : (
         <DataTable<Stat & { name: string }>

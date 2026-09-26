@@ -169,7 +169,6 @@ src/kiro_crew/dashboard/handlers/ask_question.py
 src/kiro_crew/dashboard/handlers/files.py
 src/kiro_crew/dashboard/handlers/kiro_usage_api.py
 src/kiro_crew/dashboard/handlers/knowledge.py
-src/kiro_crew/dashboard/handlers/mcp_apps.py
 src/kiro_crew/dashboard/handlers/mcp_custom.py
 src/kiro_crew/dashboard/handlers/notifications_push.py
 src/kiro_crew/dashboard/handlers/security.py
@@ -185,7 +184,6 @@ src/kiro_crew/dashboard/port_reclaim.py
 src/kiro_crew/dashboard/routes/skills.py
 src/kiro_crew/dashboard/slowloris.py
 src/kiro_crew/dashboard/stale_asset_watchdog.py
-src/kiro_crew/dashboard/system_notices.py
 src/kiro_crew/dashboard/tailnet_serve.py
 src/kiro_crew/dashboard/terminal_commands.py
 src/kiro_crew/dashboard/theme_validate.py
@@ -282,10 +280,8 @@ src/kiro_crew/slack/blocks.py
 src/kiro_crew/slack/client.py
 src/kiro_crew/slack/enterprise.py
 src/kiro_crew/slack/events.py
-src/kiro_crew/slack/interactions.py
 src/kiro_crew/slack/sessions_view.py
 src/kiro_crew/subagent_scale.py
-src/kiro_crew/suggestions.py
 src/kiro_crew/testing/channel_fixtures.py
 src/kiro_crew/webhooks.py
 src/kiro_crew/weixin/client.py
@@ -300,7 +296,6 @@ test/metrics/test_mcp_gateway_metrics.py
 test/metrics/test_schema.py
 test/metrics/test_telemetry_titles.py
 test/metrics/test_watchdog_metrics.py
-test/test_acp_dynamic_config.py
 test/test_acp_error_surface.py
 test/test_acp_liveness.py
 test/test_acp_metadata_fields.py
@@ -446,8 +441,6 @@ test/test_connections_l0_probe.py
 test/test_connections_registry.py
 test/test_connections_tool_aliases.py
 test/test_consolidate_cmd.py
-test/test_context_marker_neutralization.py
-test/test_context_ui_language.py
 test/test_continuable_followups.py
 test/test_crash_dump_store.py
 test/test_crash_guard.py
@@ -551,7 +544,6 @@ test/test_dev_fleet_node_toolchain.py
 test/test_dev_fleet_repo_accessor.py
 test/test_dev_fleet_server_more_coverage.py
 test/test_diagnostics.py
-test/test_discord_client_coverage.py
 test/test_display_time_redaction.py
 test/test_doc_parser.py
 test/test_docker_entrypoint.py
@@ -654,7 +646,6 @@ test/test_lesson_contradiction.py
 test/test_lesson_ranking.py
 test/test_lifecycle_hooks.py
 test/test_link_dashboard.py
-test/test_llm_pool.py
 test/test_local_gate.py
 test/test_loopback_proxy.py
 test/test_manifest_hooks.py
@@ -747,7 +738,6 @@ test/test_open_dm_retry.py
 test/test_open_slots_persistence.py
 test/test_options_click_validation.py
 test/test_options_submit.py
-test/test_outbox_binary.py
 test/test_override_expiry_notice.py
 test/test_papyrus_gitops.py
 test/test_papyrus_latex.py
@@ -757,7 +747,6 @@ test/test_papyrus_tectonic.py
 test/test_parse_options.py
 test/test_parse_time_string_tz.py
 test/test_pending_skill_notification_content.py
-test/test_perf_boot_path.py
 test/test_perf_memory_quickwins.py
 test/test_perf_sampler.py
 test/test_persist_off_loop.py
@@ -791,7 +780,6 @@ test/test_provider_dispatch.py
 test/test_publish_providers.py
 test/test_publish_sync.py
 test/test_queue_during_subagents.py
-test/test_queue_receipt.py
 test/test_quick_send.py
 test/test_read_bounded_json.py
 test/test_recovery_card_parity.py
@@ -870,7 +858,6 @@ test/test_slack_dashboard_live_sync.py
 test/test_slack_handler_coverage_branches.py
 test/test_slack_home_tab.py
 test/test_slack_inline_stop.py
-test/test_slack_interactions_coverage.py
 test/test_slack_linked_approval.py
 test/test_slack_mirror_unlink.py
 test/test_slack_options_lifecycle.py

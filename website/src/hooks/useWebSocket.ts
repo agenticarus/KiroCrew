@@ -1,4 +1,43 @@
 import { useEffect, useRef, useCallback } from 'react'
+import { purgeDocumentBodiesForRedactionChange } from './usePanelTabs'
+
+/** After a reconnect, re-read the owner's credential-redaction switch and purge
+ *  this document's file bodies when that could matter (the
+ *  `credential_redaction_changed` push has no replay):
+ *   - the document had read the switch and its position CHANGED while the
+ *     socket was down; or
+ *   - the document had NOT read the switch (never visited Settings) and it is
+ *     now ON -- a file opened raw while OFF may be on screen, and nothing else
+ *     would ever re-read it.
+ *  Unmoved, or unknown-and-still-OFF, costs nothing: a transient drop must not
+ *  close every diff tab and empty every clean file body. A non-owner's 403 is
+ *  swallowed: the card handles that; the socket has nothing to purge for. */
+let redactionSwitchUnreadable = false
+/** Test seam: forget a latched refusal. */
+export function __resetRedactionHealForTests(): void { redactionSwitchUnreadable = false }
+
+export async function healRedactionSwitchAfterReconnect(qc: QueryClient): Promise<void> {
+  // A document the owner gate refused once (a Slack allow-listed non-owner's
+  // `!dashboard`) is refused on every reconnect too, and each ask writes an
+  // audited refusal for a subject that took no action: ask once, then stop.
+  if (redactionSwitchUnreadable) return
+  const before = qc.getQueryData<{ enabled: boolean }>(['credential-redaction'])
+  let after: { enabled: boolean; changed_at?: string } | undefined
+  try {
+    after = await qc.fetchQuery({ queryKey: ['credential-redaction'], queryFn: () => api.credentialRedaction(), staleTime: 0 })
+  } catch (e) {
+    if (e instanceof ApiError && (e.status === 403 || e.status === 401)) redactionSwitchUnreadable = true
+    return
+  }
+  if (!after) return
+  const moved = before !== undefined && after.enabled !== before.enabled
+  // Unknown position and ON: purge only if the switch has EVER been flipped
+  // (`changed_at` set). In the shipped default -- ON, never flipped, Settings
+  // never opened -- no raw body can exist, and a transient drop must not close
+  // every diff tab and empty every clean file body for nothing.
+  const unknownAndNowOn = before === undefined && after.enabled && !!after.changed_at
+  if (moved || unknownAndNowOn) purgeDocumentBodiesForRedactionChange(qc)
+}
 import { useQueryClient, type QueryClient } from '@tanstack/react-query'
 import { isArtifactEditing } from '../utils/artifactEditGuard'
 import { isReconcileNote } from '../lib/noteContract'
@@ -21,16 +60,22 @@ import { reportVoiceFailure } from '../lib/voiceFailure'
 import {
   fetchHistory, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, clearSlotCache, setVoicePlaying, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setAutomations, sseAutomation, removeAutomation, sseSideQueue, reconcileWorkflowRuns,
 } from '../store/chatSlice'
-import { selectSidebarSubagentCounts, selectSidebarWorkflowActive, selectSidebarAutomationRunningKeys } from '../store/chatSlice'
+import { selectSidebarSubagentCounts, selectSidebarWorkflowActive, selectSidebarAutomationRunningKeys, queueEntryAttachments } from '../store/chatSlice'
 import { normalizeRunSessionKey } from '../apps/workflows/runModel'
 import { anchorForSlot, loadLayout, sessionSlots } from './splitLayoutStore'
 import { TAB_ID } from '../api/tabId'
 import { api } from '../api/client'
+// From the leaf module, not `api/client`: the many tests that mock the client
+// do not export ApiError, and an `instanceof` against a missing mock export
+// throws inside the reconnect heal's own catch.
+import { ApiError } from '../api/apiError'
 import { AUTONUDGE_LOOPS_QUERY_KEY } from '../components/autoNudgeLoop'
 import { forgetUnobservedMemberThreads } from '../api/membersQuery'
 import { observedPaneSlots } from '../api/slotMessagesQuery'
-import { MEMBERS_ROSTER_QUERY_KEY } from '../api/membersQuery'
+import { MEMBERS_ROSTER_QUERY_KEY, MEMBER_PROJECTIONS_QUERY_PREFIX } from '../api/membersQuery'
 import { memberProjectionStore } from '../state/memberProjectionStore'
+import { threadLiveStore, type ThreadReplyFrame } from '../state/threadLiveStore'
+import { threadQueryKey, threadsQueryKey } from '../api/threads'
 import { sanitizeLlmOutput } from '../utils/sanitize'
 import { deriveToolCallTitle } from '../utils/toolCallTitle'
 import { applyStatusDelta, parseStatusDelta } from '../utils/pullRequestStatusDelta'
@@ -124,6 +169,13 @@ function invalidateRefreshQueries(qc: QueryClient): void {
   qc.invalidateQueries({ queryKey: ['default-agent'] })
   qc.invalidateQueries({ queryKey: ['workspaces'] })
   qc.invalidateQueries({ queryKey: ['kirocrewConfig'] })
+  // These answers derive from the config AND, for an `auto` default, the
+  // installed agent spec rebuilt by the server's config applier. A refresh
+  // frame is emitted only after that applier completes, so invalidate the
+  // infinite-stale caches here rather than relying solely on a changed config
+  // value to mint a new key. This also covers external/CLI config writes.
+  qc.invalidateQueries({ queryKey: ['resolved-model'] })
+  qc.invalidateQueries({ queryKey: ['agent-resolved-model'] })
   // Prefix match on purpose: covers the filtered library list
   // (['artifacts', {tag, kind}]) and the tag-options read
   // (['artifacts', 'all-tags']) in one shot. The `artifact_update` frame
@@ -1252,6 +1304,25 @@ export function useWebSocket() {
         // comes back with its folders missing.
         queryClient.invalidateQueries({ queryKey: ['artifacts'] })
         queryClient.invalidateQueries({ queryKey: ['artifact-folders'] })
+        // `credential_redaction_changed` is pushed to CONNECTED owner sockets
+        // with no replay, so a flip made from another window while this socket
+        // was down never reached this document. Re-read the switch and, ONLY if
+        // its position differs from the one this document last held, drop every
+        // file body (react-query and open tabs) exactly as the frame would have.
+        // Not unconditionally: a transient drop (sleep/wake, Wi-Fi change,
+        // gateway restart) must not close every diff tab and empty every clean
+        // file body when the switch never moved. A document that never read the
+        // switch has nothing to compare and nothing raw to drop.
+        void healRedactionSwitchAfterReconnect(queryClient).catch(() => { /* a heal that cannot run leaves the document as it was */ })
+        // Same one-shot problem for a reply thread on a crewmate chat message:
+        // the terminal `chat.thread_reply` frame of a reply that finished while
+        // the socket was down was never delivered, so the live store would show
+        // a partial reply forever and the stored row would never be refetched.
+        // Drop every live row (streamed text only; the stored replies are the
+        // truth) and refetch every observed thread and footer count.
+        threadLiveStore.reset()
+        queryClient.invalidateQueries({ queryKey: ['chat-thread'] })
+        queryClient.invalidateQueries({ queryKey: ['chat-threads'] })
         // A dropped socket is the one client-visible sign the gateway may have
         // restarted — and a restart drops an unmessaged member slot while its
         // binding survives. The Crew Members page mounts a cached thread key
@@ -1519,6 +1590,25 @@ export function useWebSocket() {
                 queryClient.invalidateQueries({ queryKey: ['dashboardConfig'] })
               }
             }
+            break
+          }
+          case 'credential_redaction_changed': {
+            // The owner flipped the credential-redaction switch, possibly in
+            // ANOTHER browser tab: this document must drop every file body it
+            // holds too (a file read while the switch was off is raw in the
+            // react-query caches and in open side-panel tabs) and re-read the
+            // switch, so no dashboard document keeps showing raw credentials
+            // after redaction is back on. Owner sockets only receive this frame.
+            // Seed the switch entry from the frame's own payload FIRST, so a
+            // document that never mounted the Settings card still knows the
+            // position it now runs under (the reconnect heal compares against
+            // it); the invalidate then re-reads the authoritative record.
+            const d = msg.data as { enabled?: unknown; changed_at?: unknown } | undefined
+            if (d && typeof d.enabled === 'boolean') {
+              queryClient.setQueryData(['credential-redaction'], { enabled: d.enabled, changed_at: typeof d.changed_at === 'string' ? d.changed_at : '' })
+            }
+            queryClient.invalidateQueries({ queryKey: ['credential-redaction'] })
+            purgeDocumentBodiesForRedactionChange(queryClient)
             break
           }
           case 'skills.pending_changed': {
@@ -1801,10 +1891,36 @@ export function useWebSocket() {
                 // recorded something that did not happen, and removing it leaves the
                 // card with no value where the truth is whatever the server holds at
                 // its own seq. The store is a cache and cannot produce that, so the
-                // roster is refetched -- its rows carry each slug's baseline, and
-                // seeding is higher-seq-wins, so this restores the authoritative
-                // value without overwriting anything newer that arrives meanwhile.
-                queryClient.invalidateQueries({ queryKey: MEMBERS_ROSTER_QUERY_KEY })
+                // reads that own those values are refetched -- seeding is
+                // higher-seq-wins, so this restores the authoritative value without
+                // overwriting anything newer that arrives meanwhile.
+                //
+                // BOTH reads, because the truncation drops every key a slug holds
+                // while each read owns only some of them: a roster row carries the
+                // `roster` view, and the open member's activity, wake and driving
+                // views come from its own per-member projections read. Invalidating
+                // the roster alone would leave the drawer blank until something else
+                // happened to refetch it.
+                //
+                // RESET, not invalidate, for BOTH reads. Invalidating a query with
+                // no enabled observer only marks it stale: its pre-rollback block
+                // stays in cache, and the next mount runs `select` over that block
+                // before any refetch lands, seeding the store at the sequence the
+                // server just rolled back. Higher-seq-wins then REJECTS the
+                // authoritative lower-seq baseline the refetch returns, so the
+                // rolled-back values repaint as live with no self-correcting path.
+                // Resetting drops the cached block, so there is nothing stale to
+                // seed from, and an active query still refetches.
+                //
+                // Neither read is exempt. The per-member one is disabled while no
+                // member is open. The roster's own observer outside the members page
+                // is the crewmates gate, which holds it `enabled: eligible`, so the
+                // roster query has no enabled observer either once that page
+                // unmounts. The cost is a fetch where a fresh cache would have
+                // served, and only on a torn tail -- a gateway restart -- against a
+                // wrong value that would otherwise win permanently.
+                queryClient.resetQueries({ queryKey: MEMBERS_ROSTER_QUERY_KEY })
+                queryClient.resetQueries({ queryKey: MEMBER_PROJECTIONS_QUERY_PREFIX })
               }
             }
             break
@@ -1942,7 +2058,10 @@ export function useWebSocket() {
             syncPendingQuestions()
             break
           case 'queue_edit':
-            dispatch(editQueuedMessage(data))
+            // The frame's `meta` is the entry's post-edit attachment lists;
+            // `attachments` (present even when empty) tells the reducer this
+            // is the server's word on them, not an optimistic local edit.
+            dispatch(editQueuedMessage({ ...data, attachments: queueEntryAttachments((data as { meta?: unknown }).meta) }))
             break
           case 'queue_reorder':
             dispatch(reorderQueuedMessages(data))
@@ -2173,7 +2292,9 @@ export function useWebSocket() {
             dispatch(sseSubagentSpawn(data as { slot: string; id: string; task: string; agent: string; model?: string; requested_model?: string }))
             break
           case 'subagent_queued':
-            dispatch(sseSubagentQueued(data as { slot: string; queued: number }))
+            // The count plus the gate's optional `reason` label (absent from an
+            // older gateway); the reducer parses the label.
+            dispatch(sseSubagentQueued(data as { slot: string; queued: number; reason?: string; available_gb?: number; required_gb?: number }))
             break
           case 'subagent_chunk': {
             // Buffer and flush per-frame, mirroring chat_chunk.
@@ -2278,6 +2399,20 @@ export function useWebSocket() {
           case 'chat.side_result':
             dispatch(sseSideResult(data as { slot: string; run_id: string; role: 'user' | 'assistant'; content: string; ts?: number; final?: boolean; is_error?: boolean; steer?: boolean }))
             break
+          case 'chat.thread_reply': {
+            // A reply landing in a thread on a crewmate chat message. Streamed
+            // deltas go to the live store the thread panel reads; a stored row
+            // (the user's reply, or the crewmate's terminal frame) refreshes the
+            // thread and the per-slot footer counts through React Query.
+            const frame = data as ThreadReplyFrame
+            if (typeof frame.slot !== 'string' || typeof frame.mid !== 'string') break
+            threadLiveStore.apply(frame)
+            if (frame.role === 'user' || frame.final) {
+              queryClient.invalidateQueries({ queryKey: threadQueryKey(frame.slot, frame.mid) })
+              queryClient.invalidateQueries({ queryKey: threadsQueryKey(frame.slot) })
+            }
+            break
+          }
           case 'chat.side_queue': {
             // `raw` marks content the LOCAL client typed; broadcast payloads are scrubbed by
             // definition. Stripped rather than merely left out of the cast, so a future

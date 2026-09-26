@@ -21,6 +21,38 @@ from kiro_crew.cli_doctor import _doctor
 from kiro_crew.cli_server import _update
 
 
+def _add_job_kwargs(**overrides):
+    """The FULL kwarg set ``kirocrew cron add`` hands to ``CronService.add_job``.
+
+    Every create field rides in the ONE locked ``add_job`` call -- there is no
+    second unlocked ``_save()`` after it -- so a test that pins the call pins
+    the whole set. Defaults here are an agent job on ``--every`` with nothing
+    else given; a test overrides the fields its flags change.
+    """
+    kwargs = dict(
+        every_secs=None,
+        cron_expr=None,
+        at_ts=None,
+        delete_after_run=False,
+        channel=None,
+        approval_mode="",
+        agent_id="",
+        model="",
+        silent=False,
+        timezone="",
+        hide_in_chat=False,
+        folder_id="",
+        command="",
+        script="",
+        persistent_session=True,
+        minimal_context=False,
+        timeout=0,
+        timeout_secs=0,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
 async def _noop_probe_server(server):
     """Default probe stub for tests that call ``_doctor()`` but aren't
     specifically exercising the MCP handshake. Marks the target healthy
@@ -338,9 +370,24 @@ class TestDoctor:
         assert "composition failed" in out
         assert "KIROCREW_PROFILE=standalone" in out
 
-    def test_doctor_without_kiro(self, tmp_path):
+    def test_doctor_without_kiro(self, tmp_path, monkeypatch):
+        """A host with no kiro-cli: ``which`` finds nothing, and neither do the
+        trusted-directory resolvers the credentials, memory-pressure and
+        source-checkout sections spawn through. Left unpinned, those sections ran
+        the REAL ``aws configure list-profiles``, ``systemctl is-active`` and
+        ``git -C <this checkout>`` on the developer's host; ``None`` from each
+        resolver is the product's own "cannot ask" arm, so no binary is reached.
+        The one spawn that resolves through no seam -- the runtime section's
+        ``<venv>/bin/python3 --version`` -- is mocked like every sibling here."""
+        import kiro_crew.cli_doctor as _doc
+
+        monkeypatch.setattr(_doc.platform_compat, "trusted_aws_bin", lambda: None)
+        monkeypatch.setattr(_doc.platform_compat, "trusted_system_bin", lambda _name: None)
+        monkeypatch.setattr(_doc.platform_compat, "trusted_git_bin", lambda: None)
+        mock_run = MagicMock(returncode=0, stdout="Python 3.10.0", stderr="")
         with (
             patch("kiro_crew.cli_doctor.shutil.which", return_value=None),
+            patch("kiro_crew.cli_doctor.subprocess.run", return_value=mock_run),
             patch("urllib.request.urlopen", side_effect=urllib.error.URLError("no gateway")),
             patch("kiro_crew.cli_doctor.is_local_only", return_value=True),
             patch("kiro_crew.cli_doctor.config_dir", return_value=tmp_path),
@@ -639,10 +686,7 @@ class TestCronCli:
             mock_svc.add_job.assert_called_once_with(
                 name="ops",
                 message="check",
-                every_secs=300,
-                channel="C0AP77JJSN6",
-                approval_mode="",
-                folder_id="",
+                **_add_job_kwargs(every_secs=300, channel="C0AP77JJSN6"),
             )
 
     def test_cron_add_with_cron_expr_and_channel(self, tmp_path):
@@ -674,10 +718,7 @@ class TestCronCli:
             mock_svc.add_job.assert_called_once_with(
                 name="daily",
                 message="brief",
-                cron_expr="0 9 * * 1-5",
-                channel="C0APAPQ5GSY",
-                approval_mode="",
-                folder_id="",
+                **_add_job_kwargs(cron_expr="0 9 * * 1-5", channel="C0APAPQ5GSY"),
             )
 
     @pytest.mark.parametrize(
@@ -742,17 +783,14 @@ class TestCronCli:
             mock_svc.add_job.assert_called_once_with(
                 name="auto-job",
                 message="run unattended",
-                every_secs=600,
-                channel=None,
-                approval_mode="auto",
-                folder_id="",
+                **_add_job_kwargs(every_secs=600, approval_mode="auto"),
             )
             mock_sel.return_value.log_api_access.assert_called_once_with(
                 caller="cli",
                 operation="cron.add",
                 outcome="allowed",
                 source="cli",
-                resources="job_id=ghi approval_mode=auto agent=default silent=False",
+                resources="job_id=ghi kind=agent approval_mode=auto agent=default silent=False",
             )
 
     def test_cron_add_with_silent(self):
@@ -781,17 +819,14 @@ class TestCronCli:
                 silent=True,
             )
             _cron(args)
+            # silent rides in the ONE locked add_job call -- never a
+            # post-create mutation followed by a second, unlocked _save().
             mock_svc.add_job.assert_called_once_with(
                 name="quiet-job",
                 message="shh",
-                every_secs=300,
-                channel=None,
-                approval_mode="",
-                folder_id="",
+                **_add_job_kwargs(every_secs=300, silent=True),
             )
-            # silent is set via post-create mutation, mirroring agent_id
-            assert mock_job.silent is True
-            mock_svc._save.assert_called_once()
+            mock_svc._save.assert_not_called()
 
     def test_cron_update_approval_mode(self, tmp_path):
         with (
@@ -919,16 +954,14 @@ class TestCronCli:
                 agent="customer360-code-agent",
             )
             _cron(args)
+            # agent_id rides in the ONE locked add_job call; the old
+            # mutate-then-unlocked-_save() second write is gone.
             mock_svc.add_job.assert_called_once_with(
                 name="c360",
                 message="check pipeline",
-                every_secs=600,
-                channel=None,
-                approval_mode="",
-                folder_id="",
+                **_add_job_kwargs(every_secs=600, agent_id="customer360-code-agent"),
             )
-            assert mock_job.agent_id == "customer360-code-agent"
-            mock_svc._save.assert_called_once()
+            mock_svc._save.assert_not_called()
             # Audit log includes agent (permission-relevant: picks
             # which sandboxed subprocess executes the job).
             mock_sel.return_value.log_api_access.assert_called_once_with(
@@ -936,7 +969,10 @@ class TestCronCli:
                 operation="cron.add",
                 outcome="allowed",
                 source="cli",
-                resources="job_id=ag1 approval_mode=default agent=customer360-code-agent silent=False",
+                resources=(
+                    "job_id=ag1 kind=agent approval_mode=default "
+                    "agent=customer360-code-agent silent=False"
+                ),
             )
 
     def test_cron_add_with_agent_cron_expr(self, tmp_path):
@@ -964,13 +1000,9 @@ class TestCronCli:
             mock_svc.add_job.assert_called_once_with(
                 name="briefing",
                 message="run briefing",
-                cron_expr="0 9 * * 1-5",
-                channel=None,
-                approval_mode="",
-                folder_id="",
+                **_add_job_kwargs(cron_expr="0 9 * * 1-5", agent_id="ea-briefing"),
             )
-            assert mock_job.agent_id == "ea-briefing"
-            mock_svc._save.assert_called_once()
+            mock_svc._save.assert_not_called()
 
     def test_cron_add_without_agent_does_not_save(self, tmp_path):
         """Empty/omitted --agent leaves job.agent_id untouched, no extra _save."""
@@ -1015,7 +1047,7 @@ class TestCronCli:
                 agent="   ",
             )
             _cron(args)
-            assert mock_job.agent_id == ""
+            assert mock_svc.add_job.call_args.kwargs["agent_id"] == ""
             mock_svc._save.assert_not_called()
 
     def test_cron_update_with_agent(self, tmp_path):
@@ -3535,8 +3567,9 @@ class TestRestart:
         self, tmp_path, monkeypatch, nonbundled_python_without_user_site
     ):
         # Dev/Brazil-workspace installs may not have ``kirocrew`` on
-        # PATH globally. Fall back to ``python -s -m kiro_crew`` so the
-        # command works regardless of install layout without loading user site.
+        # PATH globally. Fall back to ``python -s -P -m kiro_crew`` so the
+        # command works regardless of install layout without loading user site
+        # and without the spawn cwd (the home directory) ahead of the stdlib.
         from kiro_crew.cli_server import _spawn_detached_gateway
 
         monkeypatch.setattr("kiro_crew.cli_server.config_dir", lambda: tmp_path)
@@ -3549,7 +3582,7 @@ class TestRestart:
         argv = mock_popen.call_args.args[0]
         # First arg is sys.executable (path to current Python). Just check
         # the invocation form, not the absolute path.
-        assert argv[1:] == ["-s", "-m", "kiro_crew", "gateway"]
+        assert argv[1:] == ["-s", "-P", "-m", "kiro_crew", "gateway"]
 
     def test_explicit_port_bypasses_service_short_circuit(self, capsys):
         # When cli_port is not None, bypass systemd: the service unit is not
@@ -7840,6 +7873,20 @@ class TestChatPermissionRequest:
         # Its own code: the gate did not reject this, we refused to ask.
         assert sels[0]["error"] == "unverified_shell"
         assert "could not be verified" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_an_unclassified_request_is_not_said_to_run_a_command(self, monkeypatch, capsys):
+        """A request nothing classified claimed no command, so the notice must not
+        say it did -- that sends the reader after the wrong defect."""
+        provider, sels, _ = await self._drive(
+            monkeypatch,
+            event=self._event(title="Sub-agent: my-research", tool_kind="", shell_classified=False),
+        )
+        assert provider.calls == [("reject", 7, False)]
+        assert sels[0]["error"] == "unverified_shell"
+        err = capsys.readouterr().err
+        assert "claims to run a command" not in err
+        assert "could not be identified" in err
 
     @pytest.mark.asyncio
     async def test_a_cosmetic_kind_variant_still_refuses(self, monkeypatch):

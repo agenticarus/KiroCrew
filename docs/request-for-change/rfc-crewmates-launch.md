@@ -248,6 +248,14 @@ shell, not a single card.
 4. **<Name> is ready** — one line saying when it starts. Action: Open
    <name>'s chat.
 
+Amended at implementation (PR #12927): on step 3, "Slack DM" is a status row,
+not a switch. The runtime offers no per-job Slack choice -- a connected Slack
+always receives a scheduled run through the owner-DM leg, a disconnected one
+cannot -- so the row reads "Active" or "Off" with the reason under it, and the
+only delivery choice the flow offers is "Its own chat" (`hide_in_chat`). Step 2
+calls the base agent "Starting setup" ("Standard (built in)" for the default),
+and the crewmate name is held to the roster's agent-name grammar before Next.
+
 Already shipped and shown in the review as evidence, not re-decided here:
 crewmates are out of the ordinary session list; the ghost icon marks a
 crewmate's session; each crewmate has one memory of its own; the sidebar

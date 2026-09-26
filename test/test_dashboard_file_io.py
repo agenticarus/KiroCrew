@@ -14,6 +14,7 @@ from urllib.parse import quote
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew.dashboard.handlers import (
     _sanitize_blocks,
@@ -27,7 +28,9 @@ def _make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/api/file-read", api_file_read)
     app.router.add_post("/api/file-write", api_file_write)
-    return app
+    # /api/file-write is owner-gated; the identity is plumbing so these tests stay on
+    # the branch each one names (the gate itself: test_file_write_owner_gate.py).
+    return as_owner(app)
 
 
 @pytest.fixture
@@ -1041,7 +1044,7 @@ class TestSendMessage:
             seen.append(threading.get_ident())
             # messages=None means "nothing persisted", so the handler falls back to
             # the notification path -- keeping this test about the read's location.
-            return ({}, True, None, {}, None, None)
+            return ({}, True, None, {}, None, None, False)
 
         with patch.object(chat_persistence, "_prefetch_rehydrate_inputs", _prefetch):
             async with TestClient(TestServer(app)) as client:

@@ -17,6 +17,7 @@ import os
 import secrets
 import time as _time
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, AbstractSet, Any, Literal, overload
@@ -28,8 +29,13 @@ from kiro_crew.chat_attachments import (
     restore_staged_attachments,
     stage_attachments_removal,
 )
-from kiro_crew.history_cache import _FileChangeCacheEntry
-from kiro_crew.jsonl_util import bounded_raw_records
+from kiro_crew.history_cache import FileStamp, _FileChangeCacheEntry, _TranscriptRowIndexEntry
+from kiro_crew.jsonl_util import (
+    bounded_raw_records,
+    raise_if_splitlines_boundary,
+    strict_raw_records_with_offsets,
+)
+from kiro_crew.preview_text import speech_preview
 
 if TYPE_CHECKING:
     from kiro_crew.history import ConversationLog
@@ -58,9 +64,31 @@ def _facade_flock_acquire_timeout() -> float:
     return float(_history_facade()._FLOCK_ACQUIRE_TIMEOUT_S)
 
 
-def _facade_strip_markdown_preview(text: str) -> str:
-    """Honor post-construction patches of the facade preview helper."""
-    return _history_facade().strip_markdown_preview(text)
+_TRANSCRIPT_PAGE_INDEX_STRIDE = 128
+#: Ceiling on retained ``(row, offset)`` checkpoints per index entry. Past it the
+#: stride doubles, so a transcript of any length costs at most this many pairs
+#: (about 100 KiB) and a warm page decodes at most one stride of extra rows,
+#: where the stride is the smallest power-of-two multiple of the base that fits.
+_TRANSCRIPT_PAGE_INDEX_MAX_CHECKPOINTS = 1024
+_TRANSCRIPT_PAGE_READ_ATTEMPTS = 2
+
+#: ``(key, file stamp or None when the file does not exist, generation)`` per chain member.
+ChainRevision = tuple[tuple[str, FileStamp | None, int], ...]
+
+
+class TranscriptRevisionChanged(RuntimeError):
+    """A chained transcript changed between reads composing one response."""
+
+
+@dataclass(frozen=True)
+class TranscriptPage:
+    """One exact page in chained durable-message index space."""
+
+    messages: list[dict]
+    total: int
+    next_before: int
+    has_more: bool
+    revision: ChainRevision
 
 
 def drop_persisted_tail_prefix(
@@ -308,6 +336,19 @@ class TranscriptReadProjection:
                 gen=generation,
             )
         return messages
+
+    def _chain_keys(self, key: str) -> list[str]:
+        """Return the established chronological tab chain for *key*."""
+        metadata = self._log.get_metadata(key)
+        tab_id = metadata.get("tab_id")
+        if not tab_id:
+            return [key]
+        with self._log._lock:
+            if self._log._tab_id_index is None:
+                self._log._rebuild_tab_id_index()
+            index = self._log._tab_id_index or {}
+            keys = list(index.get(tab_id, []))
+        return keys or [key]
 
     def read_messages_chained(self, key: str) -> list[dict]:
         """Concatenate chronologically ordered files sharing the same tab id."""
@@ -652,6 +693,244 @@ class TranscriptReadProjection:
                 ) from exc
         return False
 
+    @staticmethod
+    def _message_record(raw: bytes) -> dict | None:
+        """Decode one record using the full-reader's skip semantics.
+
+        Malformed JSON is skipped exactly as the full reader skips it. Bytes that
+        are not valid UTF-8 are NOT skipped: the full reader's strict text-mode
+        read fails closed on them, and a skipped row here would undercount
+        ``total`` and shift every cursor above it. The strict ``decode`` below raises
+        ``UnicodeDecodeError`` before any JSON parsing. Decoding explicitly, rather than
+        letting ``json.loads(bytes)`` sniff a BOM or accept ``surrogatepass``
+        escapes, keeps this reader's notion of a valid row identical to the strict
+        text-mode full reader's. A record the full reader's ``splitlines()``
+        would break into several fragments is refused outright
+        (:class:`SplitlinesBoundaryRecord`): the caller hands the read to that
+        reader instead of building an index that disagrees with it.
+        """
+        text = raw.decode("utf-8")
+        raise_if_splitlines_boundary(text)
+        # ``str.strip`` removes Unicode whitespace (NBSP, ideographic space)
+        # that ``json.loads`` does not treat as JSON whitespace; the full
+        # reader strips each line the same way, so a padded row counts
+        # identically in both.
+        #
+        # Only ``json.JSONDecodeError`` is a skip, because that is the only
+        # exception the full reader skips. Any other ``ValueError`` from
+        # ``json.loads`` (an integer literal past
+        # ``sys.get_int_max_str_digits()``) makes the full reader fail closed,
+        # so it propagates here too; swallowing it would drop a row this reader
+        # counts and the authoritative one refuses, shifting every cursor above.
+        try:
+            data = json.loads(text.strip())
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict) or data.get("_type") == "metadata":
+            return None
+        return data
+
+    @staticmethod
+    def _file_stamp(path: Path) -> FileStamp | None:
+        """Stat ``path``; ``None`` only when it does not exist.
+
+        Only a missing file is the empty transcript. Any other ``OSError`` (a
+        permission denial, an I/O error) propagates so the caller retries or
+        answers unreadable, instead of serving ``total=0`` for history that is
+        there but could not be stat'ed.
+
+        ``st_ctime_ns`` is part of the stamp because a writer outside this
+        process can restore ``mtime`` after a same-size in-place rewrite, and
+        such a writer never bumps the invalidation generation; on POSIX
+        ``ctime`` cannot be set from user space, so that rewrite still misses
+        the cache. (Windows reports creation time here, so the component is
+        inert there and the generation remains the in-process guard.)
+        """
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return None
+        return (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino, stat.st_dev)
+
+    def _row_index(self, key: str) -> _TranscriptRowIndexEntry:
+        """Return a sparse valid-message-row index for one file revision."""
+        path = self._log._path(key)
+        generation = self._log._cache_gen(key)
+        stamp = self._file_stamp(path)
+        if stamp is None:
+            # No file yet (a slot that has not flushed): report a stable empty
+            # revision. ``None`` is what the stability re-stat also returns.
+            self._log._page_index_cache.pop(key, None)
+            return _TranscriptRowIndexEntry(None, generation, 0, ())
+        cached = self._log._page_index_cache.get(key)
+        if cached is not None and cached.stamp == stamp and cached.generation == generation:
+            return cached
+
+        row_count = 0
+        stride = _TRANSCRIPT_PAGE_INDEX_STRIDE
+        checkpoints: list[tuple[int, int]] = []
+        with open(path, "rb") as handle:
+            records = strict_raw_records_with_offsets(handle, path)
+            for start, _end, raw in records:
+                if self._message_record(raw) is None:
+                    continue
+                if row_count % stride == 0:
+                    checkpoints.append((row_count, start))
+                    if len(checkpoints) > _TRANSCRIPT_PAGE_INDEX_MAX_CHECKPOINTS:
+                        # Bound the retained index: keep every other checkpoint and
+                        # double the stride. Kept rows are multiples of the old
+                        # stride at even positions, hence of the new stride too.
+                        checkpoints = checkpoints[::2]
+                        stride *= 2
+                row_count += 1
+
+        entry = _TranscriptRowIndexEntry(
+            stamp,
+            generation,
+            row_count,
+            tuple(checkpoints),
+        )
+        if self._file_stamp(path) == stamp:
+            self._log._publish_if_current(
+                self._log._page_index_cache,
+                key,
+                entry,
+                key=key,
+                gen=generation,
+            )
+        return entry
+
+    def _read_message_range(
+        self,
+        key: str,
+        start: int,
+        end: int,
+        index: _TranscriptRowIndexEntry,
+    ) -> list[dict]:
+        """Read ``[start, end)`` while decoding at most one extra index stride."""
+        if start >= end or index.row_count == 0:
+            return []
+        checkpoint_row = 0
+        checkpoint_offset = 0
+        for row, offset in index.checkpoints:
+            if row > start:
+                break
+            checkpoint_row, checkpoint_offset = row, offset
+
+        path = self._log._path(key)
+        messages: list[dict] = []
+        logical_row = checkpoint_row
+        with open(path, "rb") as handle:
+            handle.seek(checkpoint_offset)
+            records = strict_raw_records_with_offsets(handle, path)
+            for _record_start, _record_end, raw in records:
+                message = self._message_record(raw)
+                if message is None:
+                    continue
+                if logical_row >= end:
+                    break
+                if logical_row >= start:
+                    messages.append(message)
+                logical_row += 1
+        return messages
+
+    def _read_messages_chained_page_once(
+        self,
+        key: str,
+        *,
+        limit: int,
+        before: int | None,
+    ) -> tuple[TranscriptPage, list[tuple[str, _TranscriptRowIndexEntry]], list[str]]:
+        keys = self._chain_keys(key)
+        indexed = [(chained_key, self._row_index(chained_key)) for chained_key in keys]
+        total = sum(index.row_count for _chained_key, index in indexed)
+        if total == 0 and keys != [key]:
+            # Mirror ``read_messages_chained``'s terminal fallback: a chain whose
+            # members yield no rows is served from *key*'s own file.
+            indexed = [(key, self._row_index(key))]
+            total = indexed[0][1].row_count
+        end = total if before is None else max(0, min(before, total))
+        start = max(0, end - limit)
+
+        messages: list[dict] = []
+        base = 0
+        for chained_key, index in indexed:
+            file_end = base + index.row_count
+            overlap_start = max(start, base)
+            overlap_end = min(end, file_end)
+            if overlap_start < overlap_end:
+                messages.extend(
+                    self._read_message_range(
+                        chained_key,
+                        overlap_start - base,
+                        overlap_end - base,
+                        index,
+                    )
+                )
+            base = file_end
+            if base >= end:
+                break
+        revision: ChainRevision = tuple(
+            (chained_key, index.stamp, index.generation) for chained_key, index in indexed
+        )
+        return TranscriptPage(messages, total, start, start > 0, revision), indexed, keys
+
+    def read_messages_chained_page(
+        self,
+        key: str,
+        *,
+        limit: int,
+        before: int | None = None,
+        expected_revision: ChainRevision | None = None,
+    ) -> TranscriptPage:
+        """Read one exact chained page without materialising complete transcripts.
+
+        A stable revision decodes the requested page plus at most one sparse-index
+        stride per intersecting file. A file changing during the read is retried.
+        ``expected_revision`` pins the several range reads composing one HTTP
+        response to the same chain membership, file stamps, and generations.
+        ``limit=0`` is the total/revision probe: it composes the indexes and
+        decodes no rows.
+        """
+        if limit < 0:
+            raise ValueError("limit must be >= 0")
+        # A pinned read cannot succeed on a second attempt: the file stamp that
+        # broke the pin includes mtime_ns and size, so the expected revision is
+        # gone for good. One attempt, then the caller's retry policy decides.
+        attempts = 1 if expected_revision is not None else _TRANSCRIPT_PAGE_READ_ATTEMPTS
+        for _attempt in range(attempts):
+            page, indexed, keys = self._read_messages_chained_page_once(
+                key, limit=limit, before=before
+            )
+            stable = self._chain_keys(key) == keys and all(
+                self._file_stamp(self._log._path(chained_key)) == index.stamp
+                and self._log._cache_gen(chained_key) == index.generation
+                for chained_key, index in indexed
+            )
+            if stable and (expected_revision is None or page.revision == expected_revision):
+                return page
+        if expected_revision is not None:
+            raise TranscriptRevisionChanged("chained transcript changed during page composition")
+
+        for _attempt in range(_TRANSCRIPT_PAGE_READ_ATTEMPTS):
+            keys = self._chain_keys(key)
+            indexed = [(chained_key, self._row_index(chained_key)) for chained_key in keys]
+            revision: ChainRevision = tuple(
+                (chained_key, index.stamp, index.generation) for chained_key, index in indexed
+            )
+            messages = self.read_messages_chained(key)
+            stable = self._chain_keys(key) == keys and all(
+                self._file_stamp(self._log._path(chained_key)) == index.stamp
+                and self._log._cache_gen(chained_key) == index.generation
+                for chained_key, index in indexed
+            )
+            if stable:
+                total = len(messages)
+                end = total if before is None else max(0, min(before, total))
+                start = max(0, end - limit)
+                return TranscriptPage(messages[start:end], total, start, start > 0, revision)
+        raise TranscriptRevisionChanged("chained transcript changed during full-read fallback")
+
     def _rebuild_tab_id_index(self) -> None:
         """Rebuild the tab-id chain index while the owner lock is held."""
         index: dict[str, list[str]] = {}
@@ -714,12 +993,12 @@ class TranscriptReadProjection:
         """
         path = self._log._path(key)
         try:
-            mtime = path.stat().st_mtime
+            identity = self._log._cache_identity(path.stat())
         except OSError:
-            mtime = None
-        if mtime is not None:
+            identity = None
+        if identity is not None:
             cached = self._log._msg_cache.get(key)
-            if cached and cached[0] == mtime and cached[1] == self._log._cache_gen(key):
+            if cached and cached[0] == identity and cached[1] == self._log._cache_gen(key):
                 return cached[2]
 
         generation = self._log._cache_gen(key)
@@ -781,9 +1060,9 @@ class TranscriptReadProjection:
         attempts = _history_facade()._METADATA_READ_ATTEMPTS
         for attempt in range(attempts):
             try:
-                mtime = path.stat().st_mtime
+                identity = self._log._cache_identity(path.stat())
                 cached = self._log._msg_cache.get(key)
-                if cached and cached[0] == mtime and cached[1] == self._log._cache_gen(key):
+                if cached and cached[0] == identity and cached[1] == self._log._cache_gen(key):
                     return cached[2]
                 with open(path, encoding="utf-8") as handle:
                     raw = handle.read()
@@ -825,7 +1104,7 @@ class TranscriptReadProjection:
                 and flock_witness is not None
                 and flock_witness == self._log._flock_hold_witness(key)
             ):
-                self._log._msg_cache[key] = (mtime, entry_generation, messages)
+                self._log._msg_cache[key] = (identity, entry_generation, messages)
             return messages
         return []
 
@@ -839,22 +1118,22 @@ class TranscriptReadProjection:
         path = self._log._path(key)
         generation = self._log._cache_gen(key)
         try:
-            mtime = path.stat().st_mtime
+            identity = self._log._cache_identity(path.stat())
         except OSError:
             return None
         cached = self._log._msg_cache.get(key)
-        if cached and cached[0] == mtime and cached[1] == self._log._cache_gen(key):
+        if cached and cached[0] == identity and cached[1] == self._log._cache_gen(key):
             return None
         recent_key = self._log._recent_cache_key(key, max_messages, roles)
         recent = self._log._recent_cache.get(recent_key)
-        if recent is not None and recent[0] == mtime:
-            return [dict(message) for message in recent[1]]
+        if recent is not None and recent[0] == identity and recent[1] == self._log._cache_gen(key):
+            return [dict(message) for message in recent[2]]
         tail = self._log._read_tail_messages(path, max_messages, roles)
         formatted = [{"role": message["role"], "content": message["content"]} for message in tail]
         self._log._publish_if_current(
             self._log._recent_cache,
             recent_key,
-            (mtime, formatted),
+            (identity, generation, formatted),
             key=key,
             gen=generation,
         )
@@ -947,8 +1226,42 @@ class TranscriptReadProjection:
     ) -> tuple[str, float, bool]:
         """Return the newest preview, the recency epoch, and a stop flag.
 
-        Three values from the tail walk, because the preview text and the two
-        facts about it can come from different rows:
+        Every previewable row counts (the sessions sidebar's read). Three of the
+        four values the tail walk yields; :meth:`last_speech_info` documents it.
+        """
+        preview, epoch, stopped, _exhaustive = self._tail_walk(key, sanitize, speech_only=False)
+        return preview, epoch, stopped
+
+    def last_speech_info(
+        self,
+        key: str,
+        sanitize: Callable[[str], str] | None = None,
+    ) -> tuple[str, float, bool, bool]:
+        """Return the newest SPEECH preview, the recency epoch, a stop flag, and
+        whether the read was EXHAUSTIVE.
+
+        Speech only: rows ``is_speech_row`` accepts (user / assistant, minus
+        system notices and the workflow / sub-agent envelopes). The Crew
+        Members roster is the reader: a member's chat draws only what the
+        member says (``crew-mode.md``, "A crewmate's chat"), so its row's
+        one-line preview must quote the same thing, or a patroller whose chat
+        is empty sits beside a row quoting a shell command. The recency epoch
+        is unchanged by it -- it still reads the newest row, because a patrol
+        IS activity and the roster orders by it.
+        """
+        return self._tail_walk(key, sanitize, speech_only=True)
+
+    def _tail_walk(
+        self,
+        key: str,
+        sanitize: Callable[[str], str] | None,
+        *,
+        speech_only: bool,
+    ) -> tuple[str, float, bool, bool]:
+        """The one tail walk behind both reads above.
+
+        Four values, because the preview text and the facts about it can come
+        from different rows:
 
         - ``preview`` — the newest CONVERSATIONAL row's text, with the trailing
           stop card (and other non-previewable rows) skipped.
@@ -967,17 +1280,28 @@ class TranscriptReadProjection:
           event is a stop": a bare resume that only re-arms the same stop card
           leaves the stop newest, so the flag holds until the member says
           something again.
+        - ``exhaustive`` — True when the walk reached the START of the log, so
+          an empty ``preview`` means the member has never said anything (or
+          nothing previewable). False when both tail windows were spent
+          without finding a previewable row while older rows remain unread: a
+          patroller that has written more than the widest window of machinery
+          since it last spoke reads as "" here although its speech exists
+          further back. The Crew Members roster reconcile writes an empty
+          speech-only answer into the append-only member log as the
+          authority, so it MUST NOT do so on a non-exhaustive read -- that
+          would durably erase a quote the transcript still holds.
         """
         # Function-local: dashboard.state imports kiro_crew.history at module
         # scope, which lands back here, so a top-level import would be a
         # cycle. By preview time the dashboard module is long since loaded.
         from kiro_crew.dashboard.state import is_stop_event_row
+        from kiro_crew.dashboard.system_notices import is_speech_row
 
         path = self._log._path(key)
         try:
             size = path.stat().st_size
         except OSError:
-            return "", 0.0, False
+            return "", 0.0, False, False
         windows = (
             self._log._PREVIEW_TAIL_BYTES,
             self._log._PREVIEW_TAIL_BYTES * 16,
@@ -994,15 +1318,16 @@ class TranscriptReadProjection:
                     pass
             return 0.0
 
-        # Recency carried over from a SKIPPED STOP row only. The stop-row skip
-        # below moves the preview TEXT to an earlier row, but a stop IS
+        # Recency carried over from a SKIPPED row: a stop row in both walks,
+        # and every machinery row the speech-only walk skips. The skip moves
+        # the preview TEXT to an earlier row, but a stop or a tool turn IS
         # activity — callers order by this epoch (members.py: "Order by the
         # newest MESSAGE"), and returning the previewed row's timestamp would
-        # sink a just-stopped thread below genuinely older ones. Scoped to
-        # stop rows deliberately: every OTHER non-previewable row (a
-        # zero-width-space-only quiet monitor reply, an empty content row)
-        # keeps the long-standing contract that the timestamp travels with
-        # the row the preview came from (test_preview_text.py pins it).
+        # sink a just-active thread below genuinely older ones. In the plain
+        # walk every OTHER non-previewable row (a zero-width-space-only quiet
+        # monitor reply, an empty content row) keeps the long-standing
+        # contract that the timestamp travels with the row the preview came
+        # from (test_preview_text.py pins it).
         newest_epoch = 0.0
         # Whether the NEWEST real row (first non-metadata row walking back) is
         # a stop card. `None` until the first real row is seen, so the
@@ -1018,7 +1343,7 @@ class TranscriptReadProjection:
                         handle.readline()
                     tail = handle.read().decode("utf-8", errors="replace")
             except OSError:
-                return "", 0.0, False
+                return "", 0.0, False, False
             for line in reversed(tail.splitlines()):
                 line = line.strip()
                 if not line:
@@ -1047,22 +1372,30 @@ class TranscriptReadProjection:
                     if not newest_epoch:
                         newest_epoch = _row_epoch(data)
                     continue
+                # Normalised FIRST: a structured (list) content row is speech if
+                # its text blocks say something, exactly as the slot detail
+                # renders it; handing the raw list to the predicate would read
+                # legacy structured speech as machinery and blank the roster.
                 text = self._log._content_text(data.get("content"))
+                if speech_only and not is_speech_row(data.get("role"), text, data.get("meta")):
+                    # Machinery: skipped for the TEXT, kept for the recency.
+                    if not newest_epoch:
+                        newest_epoch = _row_epoch(data)
+                    continue
                 if not text:
                     continue
-                preview = _facade_strip_markdown_preview(text)
+                # The ONE spelling of a roster preview (strip -> sanitize -> cap),
+                # shared with the live `member/message` writer in state.py so the
+                # roster read never disagrees with what the live path folded.
+                preview = speech_preview(text, sanitize, self._log._PREVIEW_MAX_CHARS)
                 if not preview:
                     continue
-                # Sanitization precedes truncation so a boundary cannot hide a
-                # credential fragment from a caller's pattern-based redactor.
-                if sanitize is not None:
-                    preview = sanitize(preview)
-                if len(preview) > self._log._PREVIEW_MAX_CHARS:
-                    preview = preview[: self._log._PREVIEW_MAX_CHARS].rstrip() + "…"
-                return preview, newest_epoch or _row_epoch(data), bool(newest_is_stop)
+                return preview, newest_epoch or _row_epoch(data), bool(newest_is_stop), True
             if size <= window:
-                break
-        return "", newest_epoch, bool(newest_is_stop)
+                # The window held the whole file: nothing previewable exists.
+                return "", newest_epoch, bool(newest_is_stop), True
+        # Both windows spent, older rows unread: "" is not an answer.
+        return "", newest_epoch, bool(newest_is_stop), False
 
     @staticmethod
     def _content_text(content: object) -> str:
@@ -1113,9 +1446,9 @@ class TranscriptReadProjection:
         for attempt in range(attempts):
             generation = self._log._cache_gen(key)
             try:
-                mtime = path.stat().st_mtime
+                identity = self._log._cache_identity(path.stat())
                 cached = self._log._meta_cache.get(key)
-                if cached and cached[0] == mtime and cached[1] == self._log._cache_gen(key):
+                if cached and cached[0] == identity and cached[1] == self._log._cache_gen(key):
                     return cached[2], True
                 with open(path, encoding="utf-8") as handle:
                     first = handle.readline().strip()
@@ -1146,7 +1479,7 @@ class TranscriptReadProjection:
             self._log._publish_if_current(
                 self._log._meta_cache,
                 key,
-                (mtime, generation, metadata),
+                (identity, generation, metadata),
                 key=key,
                 gen=generation,
             )
@@ -1513,7 +1846,6 @@ class SessionMetadataProjection:
 
         # This hot one-line edit remains crash-atomic without paying for an
         # fsync while every other writer of the session is excluded.
-        import os
         import tempfile
 
         data = "".join(lines).encode("utf-8")

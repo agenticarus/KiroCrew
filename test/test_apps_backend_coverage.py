@@ -22,6 +22,7 @@ and ``loopback_urlopen`` are stubbed, and the spawn body is frozen at the
 from __future__ import annotations
 
 import ast
+import builtins
 import importlib
 import json
 import logging
@@ -2067,6 +2068,80 @@ class TestDependencyInstall:
         assert target.read_text(encoding="utf-8") == "keep this content"
         assert lock.is_symlink()
 
+    def _stub_pip(self, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        """Record each --target pip is pointed at, and populate it.
+
+        ``wrap_argv`` is stubbed for the same reason the ``spawn_root`` fixture
+        stubs it: it fail-closes where no OS sandbox backend is available, which
+        is a property of the host rather than of the paths under test.
+        """
+        targets: list[str] = []
+        monkeypatch.setattr(bmod, "wrap_argv", lambda argv, **_kw: (list(argv), None))
+
+        def _fake_pip(argv: Any, **kwargs: Any) -> Any:
+            if "install" in argv:
+                argv = list(argv)
+                target = argv[argv.index("--target") + 1]
+                targets.append(target)
+                (Path(target) / "pkg.py").write_text("x = 1\n", encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="")
+
+        monkeypatch.setattr(bmod, "run_limited", _fake_pip)
+        return targets
+
+    def test_provisioning_through_a_linked_home_reaches_the_staging_pin(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The whole transaction has to survive a linked ancestor, not just the data pin.
+
+        Provisioning pins twice - the data directory and, one level deeper, the
+        staging tree pip installs into. Both walks refuse any link they meet, so
+        a home reached through one fails at whichever pin the caller did not
+        canonicalise for. Driving the real transaction is what covers the second.
+        """
+        if not bmod.pinned_fs.supports_pinned_walk():
+            pytest.skip("requires O_NOFOLLOW + dir_fd support; the pinned walk is the subject")
+        real_home = tmp_path / "real-home"
+        app_root = real_home / "crew" / "apps" / "demo"
+        app_root.mkdir(parents=True)
+        (app_root / "requirements.txt").write_bytes(b"requests\n")
+        linked_home = tmp_path / "linked-home"
+        linked_home.symlink_to(real_home)
+        targets = self._stub_pip(monkeypatch)
+
+        error = bmod.provision_app_deps("demo", linked_home / "crew" / "apps" / "demo")
+
+        assert error == "", error
+        assert targets, "pip never ran, so the staging pin was never reached"
+        assert (bmod.app_deps_dir(app_root) / "pkg.py").is_file()
+
+    def test_provisioning_refuses_a_link_at_the_app_directory(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A link at the app's own name must be refused, at every pin in the run.
+
+        ``apps/<name>`` is app-writable, so canonicalising it would let a link
+        planted there redirect the gateway's own staging writes into another
+        app's tree. The refusal has to hold for the staging pin too, which sits
+        a level deeper than the data pin and so splits the path differently.
+        """
+        if not bmod.pinned_fs.supports_pinned_walk():
+            pytest.skip("requires O_NOFOLLOW + dir_fd support; the pinned walk is the subject")
+        apps = tmp_path / "crew" / "apps"
+        victim = apps / "victim"
+        (victim / "data").mkdir(parents=True)
+        (victim / "requirements.txt").write_bytes(b"requests\n")
+        (apps / "attacker").symlink_to(victim)
+        targets = self._stub_pip(monkeypatch)
+
+        error = bmod.provision_app_deps("attacker", apps / "attacker")
+
+        assert error, "provisioning through a linked app directory must be refused"
+        assert not targets, "pip ran, so a write was already aimed through the link"
+        assert not list(
+            (victim / "data").glob(".kirocrew-deps*")
+        ), "the refusal came too late: the victim tree already carries staging"
+
     def test_concurrent_provisioning_is_serialized_by_the_deps_lock(
         self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2147,6 +2222,102 @@ class TestDependencyInstall:
                 pin.verify()
         finally:
             pin.close()
+
+    def test_a_data_dir_under_a_linked_ancestor_is_pinned_not_refused(self, tmp_path: Any) -> None:
+        """A home directory reached through a symlink is ordinary, not an attack.
+
+        pin_parent walks every component with O_NOFOLLOW and refuses a link,
+        which is why its contract makes the CALLER resolve the path once. An
+        ancestor that has always been a link is indistinguishable from a
+        swapped one to that walk, so an unresolved path turns every install
+        and uninstall into a refusal for anyone whose home contains one.
+        """
+        if not bmod.pinned_fs.supports_pinned_walk():
+            pytest.skip("requires O_NOFOLLOW + dir_fd support; the pinned walk is the subject")
+        real_home = tmp_path / "real-home"
+        data = real_home / "crew" / "apps" / "demo" / "data"
+        data.mkdir(parents=True)
+        linked_home = tmp_path / "linked-home"
+        linked_home.symlink_to(real_home)
+        app_root = linked_home / "crew" / "apps" / "demo"
+
+        pin = bmod._PinnedDir(bmod._pinned_ancestors(app_root) / "data")
+        try:
+            assert pin.fd is not None, "POSIX must pin by descriptor"
+            pinned = os.fstat(pin.fd)
+            target = os.stat(str(data))
+            assert (pinned.st_dev, pinned.st_ino) == (target.st_dev, target.st_ino)
+            pin.verify()
+        finally:
+            pin.close()
+
+    def test_a_data_dir_swapped_after_resolution_is_still_refused(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Resolving on the caller side must not retire the guard.
+
+        The swap is performed at the pin_parent seam - after the path was
+        resolved, before the walk reads it - which is the check-to-use window
+        made deterministic. O_NOFOLLOW on the final component has to refuse
+        it, and the refusal has to say a swap happened, because here one did.
+        """
+        if not bmod.pinned_fs.supports_pinned_walk():
+            pytest.skip("requires O_NOFOLLOW + dir_fd support; the pinned walk is the subject")
+        holder = tmp_path / "holder"
+        data = holder / "data"
+        data.mkdir(parents=True)
+        victim = tmp_path / "victim"
+        victim.mkdir()
+
+        real_pin_parent = bmod.pinned_fs.pin_parent
+
+        def swap_then_pin(parent: str, **kwargs: Any) -> int:
+            data.rmdir()
+            data.symlink_to(victim)
+            return real_pin_parent(parent, **kwargs)
+
+        monkeypatch.setattr(bmod.pinned_fs, "pin_parent", swap_then_pin)
+        with pytest.raises(OSError, match="became a symbolic link after the path was checked"):
+            bmod._PinnedDir(data)
+
+    def test_a_link_at_the_app_directory_itself_is_still_refused(self, tmp_path: Any) -> None:
+        """The canonical prefix must stop above the app's own directory.
+
+        ``apps/<name>`` is written by the app, so canonicalising that component
+        would hand the walk whatever a link planted there points at - another
+        app's tree - and the O_NOFOLLOW refusal would never fire. Only the
+        operator-controlled part above it may be made canonical.
+        """
+        if not bmod.pinned_fs.supports_pinned_walk():
+            pytest.skip("requires O_NOFOLLOW + dir_fd support; the pinned walk is the subject")
+        apps = tmp_path / "apps"
+        victim = apps / "victim"
+        (victim / "data").mkdir(parents=True)
+        (apps / "attacker").symlink_to(victim)
+
+        with pytest.raises(OSError):
+            bmod._PinnedDir(bmod._pinned_ancestors(apps / "attacker") / "data")
+
+    def test_an_ancestor_cycle_is_refused_as_an_oserror_not_a_runtimeerror(
+        self, tmp_path: Any
+    ) -> None:
+        """Canonicalising the ancestors must not raise past the refusal type.
+
+        Every caller of this class treats OSError as "refused" and lets nothing
+        else through, so a helper that raises another type on a hostile tree
+        turns a refusal into an unhandled crash. ``Path.resolve`` raises
+        RuntimeError on a cycle; realpath hands the unresolved path to the walk,
+        which refuses it as the configured OSError like any other link.
+        """
+        if not bmod.pinned_fs.supports_pinned_walk():
+            pytest.skip("requires O_NOFOLLOW + dir_fd support; the pinned walk is the subject")
+        first = tmp_path / "ring-a"
+        second = tmp_path / "ring-b"
+        first.symlink_to(second)
+        second.symlink_to(first)
+
+        with pytest.raises(OSError):
+            bmod._PinnedDir(bmod._pinned_ancestors(first / "data"))
 
     def test_provisioning_refuses_a_linked_data_directory(
         self, spawn_root: Any, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
@@ -2507,6 +2678,68 @@ class TestDependencyInstall:
         log_text = (spawn_root / "data" / "logs" / "backend.log").read_text()
         assert "Failed to install requirements.txt dependencies" in log_text
         assert "No matching distribution found" in log_text
+
+    def test_a_non_ascii_provisioning_failure_is_written_under_a_narrow_locale_codec(
+        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A text handle opened without ``encoding=`` takes the platform default,
+        which on Windows is cp1252. The provision-error line can carry a
+        Unicode traceback glyph or an accented path; under cp1252 that write
+        raises UnicodeEncodeError and the spawn aborts on the branch meant to
+        record the failure. The open must name UTF-8 so the line always lands.
+
+        The narrow default is simulated by giving every text-mode open that
+        omits ``encoding=`` the cp1252 codec, which is what Windows does."""
+        (spawn_root / "server.py").write_text("x = 1\n")
+        (spawn_root / "requirements.txt").write_bytes(b"requests\n")
+        glyphs = "\u2192 C:\\Users\\Ren\u00e9\\pkg \u2014 \u2019quoted\u2019"
+        err = subprocess.CalledProcessError(
+            1, ["pip"], stderr=f"ERROR: build failed {glyphs}".encode("utf-8")
+        )
+        _record_runs(monkeypatch, exc=err)
+        _capture_popen(monkeypatch)
+
+        real_open = builtins.open
+
+        def _windows_default_open(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+            if "b" not in mode and "encoding" not in kwargs and len(args) < 4:
+                kwargs["encoding"] = "cp1252"
+            return real_open(file, mode, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", _windows_default_open)
+        with pytest.raises(_StopSpawn):
+            bmod._start_app_backend_body("deps-utf8", _manifest("server.py"))
+        raw = (spawn_root / "data" / "logs" / "backend.log").read_bytes()
+        assert b"[kiro-crew] " in raw
+        assert glyphs.encode("utf-8") in raw, "the non-ASCII text must round-trip as UTF-8"
+
+    def test_the_crash_tail_decodes_the_childs_bytes_with_replacement(
+        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The child appends raw bytes after the UTF-8 header. A stray byte in
+        its output must not turn the whole tail into "(no output)"; the read
+        decodes with replacement and the error still names what the child said."""
+        (spawn_root / "server.py").write_text("x = 1\n")
+        log_path = spawn_root / "data" / "logs" / "backend.log"
+
+        def _popen(*_a: Any, **kwargs: Any) -> Any:
+            kwargs["stdout"].write("[kiro-crew] header\n")
+            kwargs["stdout"].flush()
+            with open(log_path, "ab") as raw:
+                raw.write(b"Error: address already in use \xff\xfe on bind\n")
+            # A pid no platform allocates (the ``_UNALLOCATABLE_PID`` spelling in
+            # test/test_update_provider.py): the crash branch may signal it.
+            return SimpleNamespace(pid=99_999_999_999, returncode=1, poll=lambda: 1)
+
+        monkeypatch.setattr(bmod, "popen_limited", _popen)
+        monkeypatch.setattr(bmod, "_survived_spawn", lambda _proc, _port=None: False)
+        with caplog.at_level(logging.ERROR):
+            result = bmod._start_app_backend_body("tail-bytes", _manifest("server.py"))
+        assert result is None
+        message = next(r.message for r in caplog.records if "exited immediately" in r.message)
+        assert "(no output)" not in message
+        assert "address already in use" in message
+        assert "[PORT COLLISION]" in message
 
     def test_tokenized_url_query_strings_are_stripped_from_pip_stderr(
         self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch

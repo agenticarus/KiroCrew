@@ -1,10 +1,13 @@
-import { CheckCircle2, MicOff } from 'lucide-react'
+import { CheckCircle2, Loader2, MicOff, X } from 'lucide-react'
+import { useId } from 'react'
+
 import ErrorNotice from './ErrorNotice'
 
 import MicSourceMenu from './MicSourceMenu'
 
 import { i18nT } from '../i18n/t'
 import { downloadLabel } from '../lib/sttProviders'
+import type { SttModelProgress } from '../lib/sttProviders'
 interface Props {
   /** True while actively capturing audio. */
   recording: boolean
@@ -22,8 +25,22 @@ interface Props {
   onSelectDevice: (deviceId: string) => void
   /** True when a switch applies immediately rather than to the next recording. */
   deviceSwitchIsLive?: boolean
-  /** Byte progress of the one-time speech-model download this session waits on. */
-  download?: { done: number; total: number } | null
+  /** What the speech model this session waits on is doing: fetching, or loading. */
+  download?: SttModelProgress | null
+  /**
+   * True while a released utterance sits in the STREAMING drain: capture is over,
+   * the socket is held open, and `onCancelDrain` discards the whole session.
+   *
+   * Streaming only, and that restriction is the affordance's honesty. A batch
+   * transcription's audio is already handed to the transcriber over HTTP, so a
+   * discard there cannot stop the transcript from landing; a control offered for
+   * it would change the strip and leave the work running. The caller passes this
+   * true only where the discard really ends the session.
+   */
+  draining?: boolean
+  /** Discard the drained utterance. Rendered as a pressable control, so the exit
+   *  is reachable by a finger and not only by a key. */
+  onCancelDrain?: () => void
   /**
    * A visible, non-error status line shown while idle — the reason the mic is
    * blocked ("Microphone in use in another chat"), or that a held dictation just
@@ -38,8 +55,10 @@ interface Props {
 /**
  * Thin status strip at the top of the chat input. Shows a dismissible error
  * when the mic fails to start, otherwise a live recording indicator (pulsing
- * dot + input-level meter + active microphone name) while capturing. Renders
- * nothing when idle and error-free.
+ * dot + input-level meter + active microphone name) while capturing. Once
+ * capture ends it shows what the speech model is doing while the retained
+ * audio waits on it. Renders nothing when idle, error-free and with no model
+ * work outstanding.
  */
 /** The notice text with `action.label` rendered as a button, when the label
  *  occurs in the text (it is interpolated into it, so word order per locale
@@ -76,7 +95,12 @@ function renderNoticeText(notice: NonNullable<Props['notice']>) {
   )
 }
 
-export default function VoiceStatusBar({ recording, level, deviceLabel, deviceId, error, onDismissError, onSelectDevice, deviceSwitchIsLive, download, notice }: Props) {
+export default function VoiceStatusBar({ recording, level, deviceLabel, deviceId, error, onDismissError, onSelectDevice, deviceSwitchIsLive, download, draining, onCancelDrain, notice }: Props) {
+  /* Addresses the one visible sentence that says what a discard costs, so the
+     discard button can point at it. Above the early returns because it is a
+     hook, and generated rather than fixed because two panes can each mount a
+     strip and a duplicate id would aim both buttons at the first one. */
+  const consequenceId = useId()
   if (error) {
     return (
       <div className="flex items-center px-3 py-1.5 text-[12px] bg-danger-subtle border-b border-danger-subtle">
@@ -97,6 +121,126 @@ export default function VoiceStatusBar({ recording, level, deviceLabel, deviceId
   }
 
   if (!recording) {
+    // Capture ends the moment the key is released, but the model this session
+    // waits on may still be fetching or loading, and the retained audio is
+    // held for it. That wait is the longest thing the user experiences here,
+    // so the line explaining it outlives the recorder rather than vanishing
+    // with it and leaving a composer that simply does nothing.
+    //
+    // `drainCancel` is null unless the session is genuinely discardable, which
+    // keeps the control and the mechanism in step: the strip offers an exit
+    // exactly when pressing it ends the session, and offers none when the wait
+    // cannot be ended. A control that changed the strip without stopping the
+    // work would read as a stop that had happened.
+    const drainCancel = draining && onCancelDrain ? onCancelDrain : null
+    /* The reassurance names the exit only where the exit is on screen. Alone,
+       "your dictation is kept" beside a Discard button reads as a contradiction —
+       a reader told their words are safe will not press a control that sounds like
+       losing them — so the two become one sentence that offers the choice. Where
+       no control is rendered the plain line stays, because a sentence inviting a
+       press the strip does not show is the same mismatch in the other direction. */
+    const keptLine = drainCancel
+      ? 'components.voiceStatusBar.dictation_kept_or_discard'
+      : 'components.voiceStatusBar.dictation_kept_for_model'
+    const cancelButton = drainCancel
+      ? (
+        <button
+          type="button"
+          data-testid="voice-drain-cancel"
+          onClick={drainCancel}
+          aria-label={i18nT('components.voiceStatusBar.discard_dictation')}
+          /* The name says what the control does; this says what pressing it
+             costs, which is the question a reader has to answer before pressing
+             and cannot answer from "Discard dictation" alone. Carried as a
+             description rather than folded into the name so the accessible name
+             still matches the visible label, and pointed at the visible sentence
+             so a reader who can see the strip and one who hears it are told the
+             same thing once. A confirm step would answer it too, and would make
+             a wait the control exists to cut short take longer. */
+          aria-describedby={consequenceId}
+          /* A real target, not a 12px glyph: this row is the only exit on a
+             device with no Escape key, so it is sized for a fingertip and keeps
+             its label rather than relying on an icon the user must decode. */
+          className="shrink-0 inline-flex items-center gap-1 self-start min-h-[28px] px-2 py-1 rounded-md text-[12px] text-muted hover:text-text hover:bg-bg-hover focus-visible:outline focus-visible:outline-1 focus-visible:outline-accent"
+        >
+          <X size={12} aria-hidden="true" />
+          {i18nT('components.voiceStatusBar.discard_dictation')}
+        </button>
+      )
+      : null
+    /* What the press costs and what it spares, in one line, rendered only where
+       the control is. Both halves are load-bearing and both are true of
+       `cancelVoice`: no final is committed and the dictated region is taken back
+       out of the draft, so the spoken words are gone for good; the text the user
+       typed themselves is restored verbatim, and where the region cannot be
+       verified exactly the composer is left untouched rather than trimmed. The
+       reassuring half is the half that gets the button pressed. */
+    const consequenceLine = drainCancel
+      ? <span className="block" id={consequenceId}>{i18nT('components.voiceStatusBar.discard_dictation_consequence')}</span>
+      : null
+    if (download) {
+      return (
+        <div
+          role="status"
+          data-testid="voice-status-download"
+          className="flex items-start gap-2 px-3 py-1.5 text-[12px] leading-snug border-b border-border bg-chrome/50 text-muted"
+        >
+          <Loader2 size={13} className="shrink-0 mt-0.5 animate-spin" aria-hidden="true" />
+          <span className="flex-1 min-w-0 break-words">
+            {downloadLabel(download)}
+            {/* Only after release, and only here. The words are already recorded
+                and the composer is empty, so without this the wait is
+                indistinguishable from having lost the sentence, and the sensible
+                response to that is to give up and retype it. The recording strip
+                has no room for it and does not need it: the mic is still live
+                there, so nothing looks lost yet.
+
+                Its OWN line, not appended to the stage text: the download
+                variant ends on a byte figure with no terminal punctuation, so
+                side by side the two read as a single sentence — "(612MB of
+                1.5GB) Your dictation is kept". Separating them here rather than
+                adding a full stop to that string, which the settings panel also
+                shows on its own in thirteen catalogs. Not dimmed either: this is
+                the sentence that stops the user retyping a dictation that is
+                still on its way. */}
+            <span className="block">{i18nT(keptLine)}</span>
+            {/* Only alongside a real download figure, where it is a fact: the
+                fetch is a shared, caller-independent job on the gateway, so
+                closing this session's socket cannot call it back and the bytes
+                already paid for are not paid for twice. Without it the reader has
+                to guess whether leaving also abandons a gigabyte, and the guess
+                is what stops them pressing. Withheld from the silent strip, which
+                has no announced stage to be truthful about. */}
+            {drainCancel ? <span className="block">{i18nT('components.voiceStatusBar.download_continues_after_discard')}</span> : null}
+            {consequenceLine}
+          </span>
+          {cancelButton}
+        </div>
+      )
+    }
+    if (drainCancel) {
+      // The drain before the backend has announced a stage. There is no figure
+      // to report and no stage to name, so the line says only the true thing —
+      // something is being waited on and the words are safe — and the exit sits
+      // beside it. Without this the strip renders nothing at all, and a composer
+      // that accepts no dictation while showing no reason is the shape a user
+      // reads as broken.
+      return (
+        <div
+          role="status"
+          data-testid="voice-status-draining"
+          className="flex items-start gap-2 px-3 py-1.5 text-[12px] leading-snug border-b border-border bg-chrome/50 text-muted"
+        >
+          <Loader2 size={13} className="shrink-0 mt-0.5 animate-spin" aria-hidden="true" />
+          <span className="flex-1 min-w-0 break-words">
+            {i18nT('components.voiceStatusBar.waiting_for_speech_model')}
+            <span className="block">{i18nT(keptLine)}</span>
+            {consequenceLine}
+          </span>
+          {cancelButton}
+        </div>
+      )
+    }
     if (!notice) return null
     return (
       <div

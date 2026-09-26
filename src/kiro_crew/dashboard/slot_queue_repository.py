@@ -16,6 +16,16 @@ logger = logging.getLogger(__name__)
 # bounds orphaned bookkeeping; an evicted agent remains recoverable on restart.
 MAX_PENDING_SUBAGENT_DELIVERIES = 128
 
+#: Cap on a slot's LIVE in-memory queue, shared by every producer that guards
+#: an append against a full queue. One named constant because two bare
+#: literals bounding the same population drift: the cron origin-injection path
+#: (handlers/messaging.py) evicts the OLDEST entry at this cap, while the
+#: MCP-App message path (handlers/mcp_apps.py) refuses the NEWEST — different
+#: overflow semantics on purpose (a cron notification is periodic and
+#: regenerates; an app message is a one-shot user action whose producer can be
+#: told 429) — but the SIZE they guard is the same queue.
+MAX_LIVE_QUEUE_ENTRIES = 50
+
 #: How many queued user prompts one session's metadata line carries, and how
 #: many a restore admits back. Front-first, because the front is what runs
 #: first: an over-cap queue keeps the entries closest to delivery.
@@ -315,7 +325,10 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
     # Local import: session_control reaches this module through state, so taking
     # the key at module level would close an import cycle.
     from kiro_crew.dashboard.chat_delivery import TURN_ACTOR_META_KEY
-    from kiro_crew.dashboard.session_control import QUEUED_CONTAINMENT_META_KEY
+    from kiro_crew.dashboard.session_control import (
+        QUEUED_CONTAINMENT_META_KEY,
+        SEND_ORIGIN_META_KEY,
+    )
 
     entries: list[dict[str, Any]] = []
     budget = MAX_DURABLE_QUEUE_BYTES
@@ -379,10 +392,30 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
             # the drain re-derives what it can from the entry's `kind`, which the
             # writer never emits either. A restored app entry therefore carries no
             # actor at all -- the same fail-closed baseline the flags above get.
+            #
+            # The SENDING SLOT goes with them, and it is the sharpest of the
+            # three because the value is not merely read, it names a WRITE
+            # TARGET: the drain resolves the recipient of its drop notice from
+            # this key alone and appends the entry's own text there
+            # (`session_control.notify_send_origin_dropped`). Carried back off
+            # the line verbatim, an edited stamp turns a file write into a
+            # transcript row in a session the editor does not own, with the
+            # entry's content as its body. Nothing in the entry can attest to
+            # who sent it, so the key is worth exactly what the file is worth
+            # and is dropped. The cost is one notice: a relay that outlives a
+            # restart and is then dropped reports to nobody, while the RELAY
+            # itself still survives -- which is what putting the stamp in
+            # ``meta`` rather than a consumption callback buys, since a
+            # callback-carrying entry is not persisted at all.
             entry["meta"] = {
                 k: v
                 for k, v in meta.items()
-                if k not in (QUEUED_CONTAINMENT_META_KEY, TURN_ACTOR_META_KEY)
+                if k
+                not in (
+                    QUEUED_CONTAINMENT_META_KEY,
+                    TURN_ACTOR_META_KEY,
+                    SEND_ORIGIN_META_KEY,
+                )
             }
         try:
             # Costed against the same key projection the WRITER admits
@@ -661,6 +694,22 @@ class SlotQueueRepository:
             # Retry callbacks settle the exact automatic payload that failed;
             # moving them to replacement text would acknowledge the wrong work.
             if "_on_consumed" in item or "_on_irreversibly_consumed" in item:
+                return False
+            # A system-injection entry's kind decides how the drain writes the
+            # row (role, provenance meta, mirror suppression) — rewriting only
+            # its content would drain the USER'S OWN replacement words as
+            # machine-authored: an edited MCP-App entry, for example, would
+            # land as an `inject` row labelled with the app, actor `app`, and
+            # the linked-thread mirror suppressed, so a human on the mirrored
+            # channel never sees what the user typed. Refused, not re-kinded:
+            # the entry is not a user prompt to begin with. Scoped to the app
+            # kind alone: other system kinds (queued cron text among them)
+            # were editable before this endpoint existed, and taking that
+            # away is not this feature's call. The frontend pencil gate
+            # (`isAppMessageQueued`) withholds exactly this same set.
+            from kiro_crew.dashboard.chat_utils import MCP_APP_MESSAGE_KIND
+
+            if item.get("kind") == MCP_APP_MESSAGE_KIND:
                 return False
             # The lists index the OLD text's markers; drop only what this edit
             # removed (named before, unnamed now) and renumber the survivors
